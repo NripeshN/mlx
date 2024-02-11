@@ -1,7 +1,6 @@
-// Copyright © 2023 Apple Inc.
+// Copyright © 2023-2024 Apple Inc.
 #include <algorithm>
 #include <future>
-#include <map>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -35,171 +34,8 @@ class Synchronizer : public Primitive {
 // are currently under a function transformation.
 int detail::InTracing::tracing_counter{0};
 
-void simplify(const std::vector<array>& outputs) {
-  // Some notes about how this function works
-  //
-  // Step 1: Traverse the graph and build a tape. During the graph
-  // traversal we:
-  //      - Build a map of inputs to their parents.
-  //      - Record scalar inputs in a map in order to fuse them.
-  // Step 2: Process the tape. A node in the tape has inputs and outputs.
-  //      - Scalar inputs are replaced with their canonical scalar
-  //      - We check each inputs output nodes. Every output node that matches
-  //        the current node gets fused into the current node.
-  std::function<void(const array&)> recurse;
-  std::queue<array> tape;
-  std::unordered_set<std::uintptr_t> cache;
-  std::unordered_map<std::uintptr_t, std::vector<std::pair<array, int>>>
-      parents_map;
-
-  // Helpers to identify identical scalars
-  std::map<std::pair<uint64_t, Dtype::Val>, array> scalars;
-  auto is_scalar = [](const array& a) {
-    return a.is_evaled() && a.ndim() == 0;
-  };
-  auto get_scalar_rep = [](const array& a) {
-    uint64_t v = 0;
-    int dtype;
-    switch (a.dtype().size) {
-      case 1:
-        v = *a.data<uint8_t>();
-        break;
-      case 4:
-        v = *a.data<uint32_t>();
-        break;
-      case 8:
-        v = *a.data<uint64_t>();
-        break;
-    }
-    return std::make_pair(v, a.dtype().val);
-  };
-
-  // DFS the graph to build the tape, and log parents and scalars
-  recurse = [&](const array& a) {
-    auto id = a.id();
-    if (cache.find(id) != cache.end()) {
-      return;
-    }
-    for (int i = 0; i < a.inputs().size(); i++) {
-      auto& in = a.inputs()[i];
-      parents_map[in.id()].push_back({a, i});
-      for (auto& s : a.siblings()) {
-        parents_map[in.id()].push_back({s, i});
-      }
-      recurse(in);
-    }
-    cache.insert(id);
-    for (auto& s : a.siblings()) {
-      cache.insert(s.id());
-    }
-
-    tape.push(a);
-    if (is_scalar(a)) {
-      scalars.insert({get_scalar_rep(a), a});
-    }
-  };
-  for (auto& a : outputs) {
-    recurse(a);
-  }
-
-  // Helper that fuses two arrays in the graph by setting the parents of the
-  // source to point to the destination
-  auto fuse = [&](array& dst, array& src) {
-    // Canonicalize the order of the primitives outputs
-    auto sources = src.outputs();
-    auto dests = dst.outputs();
-    // For each src parent, point it to the corresponding dest
-    for (int i = 0; i < sources.size(); ++i) {
-      auto src_parents = parents_map.find(sources[i].id());
-      if (src_parents == parents_map.end()) {
-        continue;
-      }
-      auto& pairs = parents_map[dests[i].id()];
-      for (auto& parent : src_parents->second) {
-        parent.first.inputs()[parent.second] = dests[i];
-        pairs.push_back(parent);
-      }
-      // Remove the source from the map to avoid fusing with it again
-      parents_map.erase(src_parents);
-    }
-  };
-
-  // Depth-1 array equivalence check.
-  auto array_equivalent = [](const array& a, const array& b) {
-    if (!a.has_primitive() || !b.has_primitive()) {
-      return false;
-    }
-    if (a.primitive_id() == b.primitive_id()) {
-      return false;
-    }
-    const auto& pa = a.primitive();
-    const auto& pb = b.primitive();
-    if (typeid(pa) != typeid(pb)) {
-      return false;
-    }
-
-    if (a.inputs().size() != b.inputs().size()) {
-      return false;
-    }
-
-    for (int i = 0; i < a.inputs().size(); i++) {
-      if (a.inputs()[i].id() != b.inputs()[i].id()) {
-        return false;
-      }
-    }
-
-    return pa.is_equivalent(pb);
-  };
-
-  // Walk the graph
-  while (!tape.empty()) {
-    auto arr = std::move(tape.front());
-    tape.pop();
-
-    // Check if we can fuse scalars
-    if (is_scalar(arr)) {
-      auto scalar = scalars.find(get_scalar_rep(arr));
-      if (scalar->second.id() != arr.id()) {
-        fuse(scalar->second, arr);
-        arr = scalar->second;
-      }
-    }
-
-    // Helper to check if we can fuse the parents of the
-    // given array
-    auto maybe_fuse_parents = [&](auto& a) {
-      auto parents = parents_map.find(a.id());
-      if (parents != parents_map.end()) {
-        auto N = parents->second.size();
-        std::vector<bool> mask(N, false);
-        for (int i = 0; i < N; i++) {
-          if (mask[i]) {
-            continue;
-          }
-          for (int j = i + 1; j < N; j++) {
-            if (mask[j]) {
-              continue;
-            }
-            auto& src = parents->second[j].first;
-            auto& dst = parents->second[i].first;
-            if (src.id() != dst.id() && array_equivalent(src, dst)) {
-              fuse(dst, src);
-              mask[j] = true;
-            }
-          }
-        }
-      }
-    };
-
-    maybe_fuse_parents(arr);
-    for (auto& s : arr.siblings()) {
-      maybe_fuse_parents(s);
-    }
-  }
-}
-
 void eval(const std::vector<array>& outputs) {
-  std::function<void(const array&)> recurse;
+  std::function<void(const array&, bool)> recurse;
   std::queue<array> tape;
   std::unordered_set<std::uintptr_t> cache;
   std::unordered_map<std::uintptr_t, std::shared_future<void>> deps;
@@ -216,21 +52,57 @@ void eval(const std::vector<array>& outputs) {
   auto synchronizer =
       array({}, bool_, std::make_unique<Synchronizer>(stream), outputs);
 
-  recurse = [&](const array& a) {
+  recurse = [&](const array& a, bool largest_branch_first) {
     auto id = a.id();
     if (cache.find(id) != cache.end()) {
       return;
     }
-    for (auto in : a.inputs()) {
-      recurse(in);
-      // If one of the inputs is being computed on a different
-      // stream, we need to manage the dependency.
+
+    // If the input is being computed on a different stream, we need to manage
+    // the dependency.
+    auto check_dependency = [&](const array& in) {
       if (!in.is_evaled()) {
         if (a.primitive().stream() != in.primitive().stream()) {
           deps.insert({in.primitive_id(), std::shared_future<void>{}});
         }
       }
+    };
+
+    // Recurse to the largest or smallest branch first.
+    size_t num_inputs = a.inputs().size();
+    if (num_inputs == 1) {
+      auto& in = a.inputs()[0];
+      recurse(in, true);
+      check_dependency(in);
+    } else if (num_inputs == 2) {
+      auto depth_1 = a.inputs()[0].graph_depth();
+      auto depth_2 = a.inputs()[1].graph_depth();
+      auto& in1 = a.inputs()[static_cast<int>(
+          !((depth_1 > depth_2) == largest_branch_first))];
+      auto& in2 = a.inputs()[static_cast<int>(
+          ((depth_1 > depth_2) == largest_branch_first))];
+      recurse(in1, true);
+      check_dependency(in1);
+      recurse(in2, true);
+      check_dependency(in2);
+    } else if (num_inputs > 2) {
+      std::vector<int> recursion_order(a.inputs().size());
+      std::iota(recursion_order.begin(), recursion_order.end(), 0);
+      std::sort(
+          recursion_order.begin(),
+          recursion_order.end(),
+          [&a, largest_branch_first](int i, int j) {
+            auto depth_i = a.inputs()[i].graph_depth();
+            auto depth_j = a.inputs()[j].graph_depth();
+            return largest_branch_first ? depth_i > depth_j : depth_j < depth_i;
+          });
+      for (int idx : recursion_order) {
+        auto& in = a.inputs()[idx];
+        recurse(in, true);
+        check_dependency(in);
+      }
     }
+
     cache.insert(id);
     for (auto& s : a.siblings()) {
       cache.insert(s.id());
@@ -244,7 +116,7 @@ void eval(const std::vector<array>& outputs) {
     }
   };
 
-  recurse(synchronizer);
+  recurse(synchronizer, false);
   uintptr_t synch_id = synchronizer.primitive_id();
   deps.insert({synch_id, std::shared_future<void>{}});
 
@@ -262,6 +134,7 @@ void eval(const std::vector<array>& outputs) {
     auto stream = arr.primitive().stream();
     std::vector<std::shared_future<void>> arr_deps;
     for (auto& in : arr.inputs()) {
+      // TODO that's a bug
       if (auto it = deps.find(in.primitive_id()); it != deps.end()) {
         arr_deps.push_back(it->second);
       }
@@ -337,12 +210,21 @@ std::pair<std::vector<array>, std::vector<array>> vjp(
       }
     }
     if (cotan_index >= cotans.size()) {
-      throw std::invalid_argument(
-          "[vjp] Number of outputs with gradient does not match number of cotangents.");
+      std::ostringstream msg;
+      msg << "[vjp] Number of outputs to compute gradients for ("
+          << outputs.size() << ") does not match number of cotangents ("
+          << cotans.size() << ").";
+      throw std::invalid_argument(msg.str());
     }
     if (out.shape() != cotans[cotan_index].shape()) {
-      throw std::invalid_argument(
-          "[vjp] Output shape does not match shape of cotangent.");
+      std::ostringstream msg;
+      msg << "[vjp] Output shape " << out.shape()
+          << " does not match cotangent shape " << cotans[cotan_index].shape()
+          << ".";
+      if (outputs.size() == 1 && out.size() == 1) {
+        msg << " If you are using grad your function must return a scalar.";
+      }
+      throw std::invalid_argument(msg.str());
     }
     output_cotan_pairs.emplace_back(i, cotan_index++);
   }
@@ -666,9 +548,8 @@ std::pair<std::vector<array>, std::vector<array>> vmap_trace(
         "[vmap] The number of in axes must match the number of inputs.");
   }
 
-  // Run the function on placeholder inputs
-  // to get the original graph
-  std::vector<array> s_inputs;
+  // Some error checking and get the vmap axis size
+  size_t vmap_ax_size;
   for (int i = 0; i < inputs.size(); ++i) {
     if (in_axes[i] != -1) {
       if (inputs[i].ndim() == 0) {
@@ -681,7 +562,26 @@ std::pair<std::vector<array>, std::vector<array>> vmap_trace(
             << inputs[i].ndim() << " dimensions.";
         throw std::invalid_argument(msg.str());
       }
+      vmap_ax_size = inputs[i].shape(in_axes[i]);
+    }
+  }
+  // Check that all vmapped axes have the same size
+  for (int i = 0; i < inputs.size(); ++i) {
+    if (in_axes[i] != -1) {
+      if (size_t in_ax = inputs[i].shape(in_axes[i]); vmap_ax_size != in_ax) {
+        std::ostringstream msg;
+        msg << "[vmap] Inconsistent axis sizes: " << in_ax << " and "
+            << vmap_ax_size << ".";
+        throw std::invalid_argument(msg.str());
+      }
+    }
+  }
 
+  // Run the function on placeholder inputs
+  // to get the original graph
+  std::vector<array> s_inputs;
+  for (int i = 0; i < inputs.size(); ++i) {
+    if (in_axes[i] != -1) {
       std::vector<int> shape = inputs[i].shape();
       shape.erase(shape.begin() + in_axes[i]);
       array in(shape, inputs[i].dtype(), nullptr, {});
@@ -865,6 +765,60 @@ std::function<array(const array&)> vmap(
       {in_axis},
       {out_axis});
   return [vfun](const array& a) { return vfun({a})[0]; };
+}
+
+std::function<std::vector<array>(const std::vector<array>&)> custom_vjp(
+    std::function<std::vector<array>(const std::vector<array>&)> fun,
+    std::function<std::vector<array>(
+        const std::vector<array>&,
+        const std::vector<array>&,
+        const std::vector<array>&)> fun_vjp) {
+  return [fun = std::move(fun),
+          fun_vjp = std::move(fun_vjp)](const std::vector<array>& args) {
+    // Compute the outputs
+    auto outputs = fun(args);
+    for (auto& out : outputs) {
+      out = stop_gradient(out);
+    }
+
+    // Prepare the inputs to the primitive
+    // We also add the outputs to the primitive so that it can "run" the forward
+    // pass.
+    std::vector<array> inputs = args;
+    inputs.insert(inputs.end(), outputs.begin(), outputs.end());
+
+    // Compute the stream. Maybe do it in a smarter way at some point in the
+    // future.
+    Stream s = (outputs[0].has_primitive()) ? outputs[0].primitive().stream()
+                                            : default_stream(default_device());
+
+    // Make the output info
+    std::vector<std::vector<int>> shapes;
+    std::vector<Dtype> dtypes;
+    for (const auto& out : outputs) {
+      shapes.emplace_back(out.shape());
+      dtypes.emplace_back(out.dtype());
+    }
+
+    return array::make_arrays(
+        shapes,
+        dtypes,
+        std::make_shared<CustomVJP>(to_stream(s), fun_vjp),
+        inputs);
+  };
+}
+
+std::function<std::vector<array>(const std::vector<array>&)> checkpoint(
+    std::function<std::vector<array>(const std::vector<array>&)> fun) {
+  auto vjp_fun = [fun](
+                     const std::vector<array>& primals,
+                     const std::vector<array>& cotangents,
+                     const std::vector<array>& outputs) -> std::vector<array> {
+    auto [__, vjps] = vjp(fun, depends(primals, outputs), cotangents);
+    return vjps;
+  };
+
+  return custom_vjp(fun, vjp_fun);
 }
 
 } // namespace mlx::core

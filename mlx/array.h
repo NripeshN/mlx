@@ -121,6 +121,9 @@ class array {
   template <typename T>
   T item();
 
+  template <typename T>
+  T item() const;
+
   struct ArrayIterator {
     using iterator_category = std::random_access_iterator_tag;
     using difference_type = size_t;
@@ -172,6 +175,12 @@ class array {
       std::shared_ptr<Primitive> primitive,
       const std::vector<array>& inputs);
 
+  array(
+      std::vector<int> shape,
+      Dtype dtype,
+      std::shared_ptr<Primitive> primitive,
+      std::vector<array>&& inputs);
+
   static std::vector<array> make_arrays(
       const std::vector<std::vector<int>>& shapes,
       const std::vector<Dtype>& dtypes,
@@ -215,6 +224,11 @@ class array {
     return *(array_desc_->primitive);
   };
 
+  /** A shared pointer to the array's primitive. */
+  std::shared_ptr<Primitive>& primitive_ptr() const {
+    return array_desc_->primitive;
+  };
+
   /** Check if the array has an attached primitive or is a leaf node. */
   bool has_primitive() const {
     return array_desc_->primitive != nullptr;
@@ -227,6 +241,11 @@ class array {
 
   std::vector<array>& inputs() {
     return array_desc_->inputs;
+  }
+
+  /** True indicates the arrays buffer is safe to reuse */
+  bool is_donatable() const {
+    return array_desc_.use_count() == 1 && (array_desc_->data.use_count() == 1);
   }
 
   /** The array's siblings. */
@@ -251,6 +270,11 @@ class array {
     return outputs;
   };
 
+  /** The depth of the array in the graph. Evaluated arrays have depth 0. */
+  uint16_t graph_depth() const {
+    return array_desc_->depth;
+  }
+
   /** Detach the array from the graph. */
   void detach();
 
@@ -271,6 +295,12 @@ class array {
     return array_desc_->data->buffer;
   };
 
+  // Return a copy of the shared pointer
+  // to the array::Data struct
+  std::shared_ptr<Data> data_shared_ptr() const {
+    return array_desc_->data;
+  }
+  // Return a raw pointer to the arrays data
   template <typename T>
   T* data() {
     return static_cast<T*>(array_desc_->data_ptr);
@@ -310,6 +340,8 @@ class array {
       size_t offset = 0);
 
   void copy_shared_buffer(const array& other);
+
+  void move_shared_buffer(array other);
 
   void overwrite_descriptor(const array& other) {
     array_desc_ = other.array_desc_;
@@ -353,6 +385,9 @@ class array {
     // The arrays position in the output list
     uint32_t position{0};
 
+    // The depth of the array in the graph.
+    uint16_t depth{0};
+
     explicit ArrayDesc(const std::vector<int>& shape, Dtype dtype);
 
     explicit ArrayDesc(
@@ -360,12 +395,18 @@ class array {
         Dtype dtype,
         std::shared_ptr<Primitive> primitive,
         const std::vector<array>& inputs);
+
+    explicit ArrayDesc(
+        std::vector<int>&& shape,
+        Dtype dtype,
+        std::shared_ptr<Primitive> primitive,
+        std::vector<array>&& inputs);
   };
 
   // The ArrayDesc contains the details of the materialized array including the
   // shape, strides, the data type. It also includes
   // the primitive which knows how to compute the array's data from its inputs
-  // and a the list of array's inputs for the primitive.
+  // and the list of array's inputs for the primitive.
   std::shared_ptr<ArrayDesc> array_desc_{nullptr};
 };
 
@@ -413,6 +454,18 @@ T array::item() {
     throw std::invalid_argument("item can only be called on arrays of size 1.");
   }
   eval();
+  return *data<T>();
+}
+
+template <typename T>
+T array::item() const {
+  if (size() != 1) {
+    throw std::invalid_argument("item can only be called on arrays of size 1.");
+  }
+  if (!is_evaled()) {
+    throw std::invalid_argument(
+        "item() const can only be called on evaled arrays");
+  }
   return *data<T>();
 }
 

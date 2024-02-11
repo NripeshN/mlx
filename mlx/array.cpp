@@ -1,4 +1,4 @@
-// Copyright © 2023 Apple Inc.
+// Copyright © 2023-2024 Apple Inc.
 
 #include <functional>
 
@@ -47,6 +47,17 @@ array::array(
           std::move(primitive),
           inputs)) {}
 
+array::array(
+    std::vector<int> shape,
+    Dtype dtype,
+    std::shared_ptr<Primitive> primitive,
+    std::vector<array>&& inputs)
+    : array_desc_(std::make_shared<ArrayDesc>(
+          std::move(shape),
+          dtype,
+          std::move(primitive),
+          std::move(inputs))) {}
+
 std::vector<array> array::make_arrays(
     const std::vector<std::vector<int>>& shapes,
     const std::vector<Dtype>& dtypes,
@@ -86,11 +97,13 @@ void array::detach() {
     s.array_desc_->inputs.clear();
     s.array_desc_->siblings.clear();
     s.array_desc_->position = 0;
+    s.array_desc_->depth = 0;
     s.array_desc_->primitive = nullptr;
   }
   array_desc_->inputs.clear();
   array_desc_->siblings.clear();
   array_desc_->position = 0;
+  array_desc_->depth = 0;
   array_desc_->primitive = nullptr;
 }
 
@@ -144,6 +157,14 @@ void array::copy_shared_buffer(const array& other) {
   copy_shared_buffer(other, other.strides(), other.flags(), other.data_size());
 }
 
+void array::move_shared_buffer(array other) {
+  array_desc_->data = std::move(other.array_desc_->data);
+  array_desc_->strides = other.strides();
+  array_desc_->flags = other.flags();
+  array_desc_->data_size = other.data_size();
+  array_desc_->data_ptr = other.array_desc_->data_ptr;
+}
+
 array::ArrayDesc::ArrayDesc(const std::vector<int>& shape, Dtype dtype)
     : shape(shape), dtype(dtype) {
   std::tie(size, strides) = cum_prod(shape);
@@ -158,10 +179,29 @@ array::ArrayDesc::ArrayDesc(
       dtype(dtype),
       primitive(std::move(primitive)),
       inputs(inputs) {
-  std::tie(size, strides) = cum_prod(shape);
-  for (auto& in : inputs) {
+  std::tie(size, strides) = cum_prod(this->shape);
+  for (auto& in : this->inputs) {
     is_tracer |= in.is_tracer();
+    depth = std::max(in.graph_depth(), depth);
   }
+  depth++;
+}
+
+array::ArrayDesc::ArrayDesc(
+    std::vector<int>&& shape,
+    Dtype dtype,
+    std::shared_ptr<Primitive> primitive,
+    std::vector<array>&& inputs)
+    : shape(std::move(shape)),
+      dtype(dtype),
+      primitive(std::move(primitive)),
+      inputs(std::move(inputs)) {
+  std::tie(size, strides) = cum_prod(this->shape);
+  for (auto& in : this->inputs) {
+    is_tracer |= in.is_tracer();
+    depth = std::max(in.graph_depth(), depth);
+  }
+  depth++;
 }
 
 array::ArrayIterator::ArrayIterator(const array& arr, int idx)

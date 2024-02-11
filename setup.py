@@ -148,11 +148,11 @@ if __name__ == "__main__":
         where="python", exclude=["src", "tests", "tests.*"]
     )
     package_dir = {"": "python"}
-    package_data = {"mlx": ["lib/*", "include/*", "share/*"]}
+    package_data = {"mlx": ["lib/*", "include/*", "share/*"], "mlx.core": ["*.pyi"]}
 
     setup(
         name="mlx",
-        version=get_version("0.0.10"),
+        version=get_version("0.2.0"),
         author="MLX Contributors",
         author_email="mlx@group.apple.com",
         description="A framework for machine learning on Apple silicon.",

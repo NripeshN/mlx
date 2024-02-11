@@ -1,17 +1,10 @@
-// Copyright © 2023 Apple Inc.
+// Copyright © 2023-2024 Apple Inc.
 
 #include <cstdint>
 #include <cstring>
 #include <numeric>
 
-#include "mlx/io.h"
-#include "mlx/primitives.h"
-#include "mlx/transforms.h"
-#include "mlx/utils.h"
-
-extern "C" {
-#include <gguflib.h>
-}
+#include <mlx/io/gguf.h>
 
 namespace mlx::core {
 
@@ -52,7 +45,16 @@ std::optional<Dtype> gguf_type_to_dtype(const uint32_t& gguf_type) {
   }
 }
 
-std::pair<allocator::Buffer, Dtype> extract_tensor_data(gguf_tensor* tensor) {
+std::vector<int> get_shape(const gguf_tensor& tensor) {
+  std::vector<int> shape;
+  // The dimension order in GGML is the reverse of the order used in MLX.
+  for (int i = tensor.ndim - 1; i >= 0; i--) {
+    shape.push_back(tensor.dim[i]);
+  }
+  return shape;
+}
+
+std::tuple<allocator::Buffer, Dtype> extract_tensor_data(gguf_tensor* tensor) {
   std::optional<Dtype> equivalent_dtype = gguf_type_to_dtype(tensor->type);
   // If there's an equivalent type, we can simply copy.
   if (equivalent_dtype.has_value()) {
@@ -80,7 +82,7 @@ void set_mx_value_from_gguf(
     gguf_ctx* ctx,
     uint32_t type,
     gguf_value* val,
-    MetaData& value) {
+    GGUFMetaData& value) {
   switch (type) {
     case GGUF_VALUE_TYPE_UINT8:
       value = array(val->uint8, uint8);
@@ -189,12 +191,12 @@ void set_mx_value_from_gguf(
   }
 }
 
-std::unordered_map<std::string, MetaData> load_metadata(gguf_ctx* ctx) {
-  std::unordered_map<std::string, MetaData> metadata;
+std::unordered_map<std::string, GGUFMetaData> load_metadata(gguf_ctx* ctx) {
+  std::unordered_map<std::string, GGUFMetaData> metadata;
   gguf_key key;
   while (gguf_get_key(ctx, &key)) {
     std::string key_name = std::string(key.name, key.namelen);
-    auto& val = metadata.insert({key_name, MetaData{}}).first->second;
+    auto& val = metadata.insert({key_name, GGUFMetaData{}}).first->second;
     set_mx_value_from_gguf(ctx, key.type, key.val, val);
   }
   return metadata;
@@ -203,24 +205,32 @@ std::unordered_map<std::string, MetaData> load_metadata(gguf_ctx* ctx) {
 std::unordered_map<std::string, array> load_arrays(gguf_ctx* ctx) {
   std::unordered_map<std::string, array> array_map;
   gguf_tensor tensor;
-  while (gguf_get_tensor(ctx, &tensor)) {
-    std::vector<int> shape;
-    // The dimension order in GGML is the reverse of the order used in MLX.
-    for (int i = tensor.ndim - 1; i >= 0; i--) {
-      shape.push_back(tensor.dim[i]);
+
+  auto check_insert = [](auto inserted) {
+    if (!inserted.second) {
+      std::ostringstream msg;
+      msg << "[load_gguf] Duplicate parameter name " << inserted.first->second
+          << " this can happend when loading quantized tensors.";
+      throw std::runtime_error(msg.str());
     }
-    const auto& [data, dtype] = extract_tensor_data(&tensor);
-    array loaded_array = array(data, shape, dtype);
-    std::string name = std::string(tensor.name, tensor.namelen);
-    array_map.insert({name, loaded_array});
+  };
+
+  while (gguf_get_tensor(ctx, &tensor)) {
+    if (tensor.type == GGUF_TYPE_Q4_0 || tensor.type == GGUF_TYPE_Q4_1 ||
+        tensor.type == GGUF_TYPE_Q8_0) {
+      gguf_load_quantized(array_map, tensor);
+    } else {
+      std::string name = std::string(tensor.name, tensor.namelen);
+
+      const auto& [data, dtype] = extract_tensor_data(&tensor);
+      array loaded_array = array(data, get_shape(tensor), dtype);
+      array_map.insert({name, loaded_array});
+    }
   }
   return array_map;
 }
 
-std::pair<
-    std::unordered_map<std::string, array>,
-    std::unordered_map<std::string, MetaData>>
-load_gguf(const std::string& file, StreamOrDevice s) {
+GGUFLoad load_gguf(const std::string& file, StreamOrDevice s) {
   gguf_ctx* ctx = gguf_open(file.c_str());
   if (!ctx) {
     throw std::runtime_error("[load_gguf] gguf_init failed");
@@ -267,7 +277,7 @@ void append_kv_array(
 void save_gguf(
     std::string file,
     std::unordered_map<std::string, array> array_map,
-    std::unordered_map<std::string, MetaData> metadata /* = {} */) {
+    std::unordered_map<std::string, GGUFMetaData> metadata /* = {} */) {
   // Add .gguf to file name if it is not there
   if (file.length() < 5 || file.substr(file.length() - 5, 5) != ".gguf") {
     file += ".gguf";

@@ -3,6 +3,7 @@ target_sources(
   PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/arg_reduce.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/conv.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/copy.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/erf.cpp
@@ -16,4 +17,5 @@ target_sources(
   ${CMAKE_CURRENT_SOURCE_DIR}/threefry.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/indexing.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/load.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/qrf.cpp
 )

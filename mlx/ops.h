@@ -123,8 +123,8 @@ inline array tri(int n, Dtype type, StreamOrDevice s = {}) {
   return tri(n, n, 0, type, s);
 }
 
-array tril(array x, int k, StreamOrDevice s = {});
-array triu(array x, int k, StreamOrDevice s = {});
+array tril(array x, int k = 0, StreamOrDevice s = {});
+array triu(array x, int k = 0, StreamOrDevice s = {});
 
 /** array manipulation */
 
@@ -404,6 +404,17 @@ array allclose(
     const array& b,
     double rtol = 1e-5,
     double atol = 1e-8,
+    bool equal_nan = false,
+    StreamOrDevice s = {});
+
+/** Returns a boolean array where two arrays are element-wise equal within the
+ * specified tolerance. */
+array isclose(
+    const array& a,
+    const array& b,
+    double rtol = 1e-5,
+    double atol = 1e-8,
+    bool equal_nan = false,
     StreamOrDevice s = {});
 
 /**
@@ -1093,5 +1104,25 @@ array addmm(
     const float& alpha = 1.f,
     const float& beta = 1.f,
     StreamOrDevice s = {});
+
+/** Extract a diagonal or construct a diagonal array */
+array diagonal(
+    const array& a,
+    int offset = 0,
+    int axis1 = 0,
+    int axis2 = 1,
+    StreamOrDevice s = {});
+
+/** Extract diagonal from a 2d array or create a diagonal matrix. */
+array diag(const array& a, int k = 0, StreamOrDevice s = {});
+
+/**
+ * Implements the identity function but allows injecting dependencies to other
+ * arrays. This ensures that these other arrays will have been computed
+ * when the outputs of this function are computed.
+ */
+std::vector<array> depends(
+    const std::vector<array>& inputs,
+    const std::vector<array>& dependencies);
 
 } // namespace mlx::core

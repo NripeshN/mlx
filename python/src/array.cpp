@@ -39,6 +39,10 @@ py::list to_list(array& a, size_t index, int dim) {
 }
 
 auto to_scalar(array& a) {
+  {
+    py::gil_scoped_release nogil;
+    a.eval();
+  }
   switch (a.dtype()) {
     case bool_:
       return py::cast(a.item<bool>());
@@ -73,7 +77,10 @@ py::object tolist(array& a) {
   if (a.ndim() == 0) {
     return to_scalar(a);
   }
-  a.eval();
+  {
+    py::gil_scoped_release nogil;
+    a.eval();
+  }
   py::object pl;
   switch (a.dtype()) {
     case bool_:
@@ -644,6 +651,7 @@ void init_array(py::module_& m) {
       .def_buffer([](array& a) {
         // Eval if not already evaled
         if (!a.is_evaled()) {
+          py::gil_scoped_release nogil;
           a.eval();
         }
         return pybind11::buffer_info(
@@ -667,17 +675,14 @@ void init_array(py::module_& m) {
           "nbytes",
           &array::nbytes,
           R"pbdoc(The number of bytes in the array.)pbdoc")
-      // TODO, this makes a deep copy of the shape
-      // implement alternatives to use reference
-      // https://pybind11.readthedocs.io/en/stable/advanced/cast/stl.html
       .def_property_readonly(
           "shape",
-          [](const array& a) { return a.shape(); },
+          [](const array& a) { return py::tuple(py::cast(a.shape())); },
           R"pbdoc(
-          The shape of the array as a Python list.
+          The shape of the array as a Python tuple.
 
           Returns:
-            list(int): A list containing the sizes of each dimension.
+            tuple(int): A tuple containing the sizes of each dimension.
         )pbdoc")
       .def_property_readonly(
           "dtype",
@@ -942,6 +947,7 @@ void init_array(py::module_& m) {
           "__repr__",
           [](array& a) {
             if (!a.is_evaled()) {
+              py::gil_scoped_release nogil;
               a.eval();
             }
             std::ostringstream os;
@@ -1104,6 +1110,8 @@ void init_array(py::module_& m) {
           py::kw_only(),
           "stream"_a = none,
           "See :func:`abs`.")
+      .def(
+          "__abs__", [](const array& a) { return abs(a); }, "See :func:`abs`.")
       .def(
           "square",
           &square,
@@ -1477,5 +1485,26 @@ void init_array(py::module_& m) {
           "decimals"_a = 0,
           py::kw_only(),
           "stream"_a = none,
-          "See :func:`round`.");
+          "See :func:`round`.")
+      .def(
+          "diagonal",
+          [](const array& a,
+             int offset,
+             int axis1,
+             int axis2,
+             StreamOrDevice s) { return diagonal(a, offset, axis1, axis2, s); },
+          "offset"_a = 0,
+          "axis1"_a = 0,
+          "axis2"_a = 1,
+          "stream"_a = none,
+          "See :func:`diagonal`.")
+      .def(
+          "diag",
+          [](const array& a, int k, StreamOrDevice s) { return diag(a, k, s); },
+          "k"_a = 0,
+          py::kw_only(),
+          "stream"_a = none,
+          R"pbdoc(
+            Extract a diagonal or construct a diagonal matrix.
+        )pbdoc");
 }

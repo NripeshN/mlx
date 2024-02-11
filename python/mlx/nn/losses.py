@@ -31,9 +31,14 @@ def cross_entropy(
     Computes the cross entropy loss.
 
     Args:
-        logits (array): The unnormalized predicted logits.
-        targets (array): The target values, as class indices.
-        weights (array, optional): Weights for each target. Default: ``None``.
+        logits (array): The unnormalized logits.
+        targets (array): The ground truth values. These can be class indices or
+            probabilities for each class. If the ``targets`` are class indices,
+            then ``targets`` shape should match the ``logits`` shape with
+            the ``axis`` dimension removed. If the ``targets`` are probabilities
+            (or one-hot encoded), then the ``targets`` shape should be the same as
+            the ``logits`` shape.
+        weights (array, optional): Optional weights for each target. Default: ``None``.
         axis (int, optional): The axis over which to compute softmax. Default: ``-1``.
         label_smoothing (float, optional): Label smoothing factor. Default: ``0``.
         reduction (str, optional): Specifies the reduction to apply to the output:
@@ -41,11 +46,47 @@ def cross_entropy(
 
     Returns:
         array: The computed cross entropy loss.
+
+    Examples:
+        >>> import mlx.core as mx
+        >>> import mlx.nn as nn
+        >>>
+        >>> # Class indices as targets
+        >>> logits = mx.array([[2.0, -1.0], [-1.0, 2.0]])
+        >>> targets = mx.array([0, 1])
+        >>> nn.losses.cross_entropy(logits, targets)
+        array([0.0485873, 0.0485873], dtype=float32)
+        >>>
+        >>> # Probabilities (or one-hot vectors) as targets
+        >>> logits = mx.array([[2.0, -1.0], [-1.0, 2.0]])
+        >>> targets = mx.array([[0.9, 0.1], [0.1, 0.9]])
+        >>> nn.losses.cross_entropy(logits, targets)
+        array([0.348587, 0.348587], dtype=float32)
     """
     if label_smoothing < 0 or label_smoothing >= 1:
         raise ValueError(f"Label smoothing must in [0, 1), got {label_smoothing}.")
 
-    score = mx.take_along_axis(logits, targets[..., None], axis).squeeze(-1)
+    # Whether targets are class indices or probabilities
+    targets_as_probs = targets.ndim == logits.ndim
+
+    def _drop_dim(shape, axis):
+        shape = list(shape)
+        shape.pop(axis)
+        return tuple(shape)
+
+    # Check shapes in two cases: targets as class indices and targets as probabilities
+    if (targets_as_probs and targets.shape != logits.shape) or (
+        not targets_as_probs and targets.shape != _drop_dim(logits.shape, axis)
+    ):
+        raise ValueError(
+            f"Targets shape {targets.shape} does not match logits shape {logits.shape}."
+        )
+
+    if targets_as_probs:
+        score = mx.sum(logits * targets, axis=axis)
+    else:
+        score = mx.take_along_axis(logits, targets[..., None], axis).squeeze(-1)
+
     logsumexp_logits = mx.logsumexp(logits, axis=axis)
     if label_smoothing > 0:
         # Adjust the true class score with label smoothing
@@ -62,10 +103,10 @@ def cross_entropy(
 
     # Apply weights if provided
     if weights is not None:
-        if weights.shape != targets.shape:
+        if weights.shape != loss.shape:
             raise ValueError(
                 f"Weights with shape {weights.shape} is not the same as "
-                f"targets with shape {targets.shape}."
+                f"output loss with shape {loss.shape}."
             )
         loss *= weights
 
@@ -76,6 +117,7 @@ def cross_entropy(
 def binary_cross_entropy(
     inputs: mx.array,
     targets: mx.array,
+    weights: mx.array = None,
     with_logits: bool = True,
     reduction: Reduction = "mean",
 ) -> mx.array:
@@ -87,6 +129,7 @@ def binary_cross_entropy(
             ``inputs`` are unnormalized logits. Otherwise, ``inputs`` are probabilities.
         targets (array): The binary target values in {0, 1}.
         with_logits (bool, optional): Whether ``inputs`` are logits. Default: ``True``.
+        weights (array, optional): Optional weights for each target. Default: ``None``.
         reduction (str, optional): Specifies the reduction to apply to the output:
           ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'mean'``.
 
@@ -117,6 +160,15 @@ def binary_cross_entropy(
         loss = mx.logaddexp(0.0, inputs) - inputs * targets
     else:
         loss = -(targets * mx.log(inputs) + (1 - targets) * mx.log(1 - inputs))
+
+    # Apply weights if provided
+    if weights is not None:
+        if weights.shape != loss.shape:
+            raise ValueError(
+                f"Weights with shape {weights.shape} is not the same as "
+                f"output loss with shape {loss.shape}."
+            )
+        loss *= weights
 
     return _reduce(loss, reduction)
 
@@ -490,5 +542,60 @@ def cosine_similarity_loss(
     x2_norm = mx.linalg.norm(x2, axis=axis)
 
     loss = mx.sum(x1 * x2, axis=axis) / mx.maximum(x1_norm * x2_norm, eps)
+
+    return _reduce(loss, reduction)
+
+
+def margin_ranking_loss(
+    inputs1: mx.array,
+    inputs2: mx.array,
+    targets: mx.array,
+    margin: float = 0.0,
+    reduction: Reduction = "none",
+) -> mx.array:
+    r"""
+    Calculate the margin ranking loss that loss given inputs :math:`x_1`, :math:`x_2` and a label
+    :math:`y` (containing 1 or -1).
+
+    The loss is given by:
+
+    .. math::
+        \text{loss} = \max (0, -y * (x_1 - x_2) + \text{margin})
+
+    Where :math:`y` represents ``targets``, :math:`x_1` represents ``inputs1`` and :math:`x_2`
+    represents ``inputs2``.
+
+    Args:
+        inputs1 (array): Scores for the first input.
+        inputs2 (array): Scores for the second input.
+        targets (array): Labels indicating whether samples in ``inputs1`` should be ranked higher
+            than samples in ``inputs2``. Values should be 1 or -1.
+        margin (float, optional): The margin by which the scores should be separated.
+            Default: ``0.0``.
+        reduction (str, optional): Specifies the reduction to apply to the output:
+            ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'none'``.
+
+    Returns:
+        array: The computed margin ranking loss.
+
+    Examples:
+        >>> import mlx.core as mx
+        >>> import mlx.nn as nn
+        >>> targets = mx.array([1, 1, -1])
+        >>> inputs1 = mx.array([-0.573409, -0.765166, -0.0638])
+        >>> inputs2 = mx.array([0.75596, 0.225763, 0.256995])
+        >>> loss = nn.losses.margin_ranking_loss(inputs1, inputs2, targets)
+        >>> loss
+        array(0.773433, dtype=float32)
+    """
+    if not (inputs1.shape == inputs2.shape == targets.shape):
+        raise ValueError(
+            f"The shapes of the arguments do not match. The provided shapes are "
+            f"inputs1.shape={inputs1.shape}, inputs2.shape={inputs2.shape}, and "
+            f"targets.shape={targets.shape}."
+        )
+
+    differences = inputs1 - inputs2
+    loss = mx.maximum(0, -targets * differences + margin)
 
     return _reduce(loss, reduction)

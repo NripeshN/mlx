@@ -232,22 +232,38 @@ void Cosh::eval(const std::vector<array>& inputs, array& out) {
   }
 }
 
+void CustomVJP::eval(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  assert(inputs.size() > outputs.size());
+  for (int i = 0, j = inputs.size() - outputs.size(); i < outputs.size();
+       i++, j++) {
+    outputs[i].copy_shared_buffer(inputs[j]);
+  }
+}
+
+void Depends::eval(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  assert(inputs.size() > outputs.size());
+  for (int i = 0; i < outputs.size(); i++) {
+    outputs[i].copy_shared_buffer(inputs[i]);
+  }
+}
+
 void Erf::eval(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
   const auto& in = inputs[0];
   switch (out.dtype()) {
     case float32:
-      out.set_data(allocator::malloc_or_wait(out.nbytes()));
       unary_op<float>(in, out, [](auto x) { return std::erf(x); });
       break;
     case float16:
-      out.set_data(allocator::malloc_or_wait(out.nbytes()));
       unary_op<float16_t>(in, out, [](auto x) {
         return static_cast<float16_t>(std::erf(static_cast<float>(x)));
       });
       break;
     case bfloat16:
-      out.set_data(allocator::malloc_or_wait(out.nbytes()));
       unary_op<bfloat16_t>(in, out, [](auto x) {
         return static_cast<bfloat16_t>(std::erf(static_cast<float>(x)));
       });
@@ -264,17 +280,14 @@ void ErfInv::eval(const std::vector<array>& inputs, array& out) {
   const auto& in = inputs[0];
   switch (out.dtype()) {
     case float32:
-      out.set_data(allocator::malloc_or_wait(out.nbytes()));
       unary_op<float>(in, out, [](auto x) { return erfinv(x); });
       break;
     case float16:
-      out.set_data(allocator::malloc_or_wait(out.nbytes()));
       unary_op<float16_t>(in, out, [](auto x) {
         return static_cast<float16_t>(erfinv(static_cast<float>(x)));
       });
       break;
     case bfloat16:
-      out.set_data(allocator::malloc_or_wait(out.nbytes()));
       unary_op<bfloat16_t>(in, out, [](auto x) {
         return static_cast<bfloat16_t>(erfinv(static_cast<float>(x)));
       });

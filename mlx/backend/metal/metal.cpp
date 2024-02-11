@@ -63,15 +63,32 @@ std::function<void()> make_task(
     auto s = arr.primitive().stream();
     auto command_buffer = increment_command_buffer(s);
     auto outputs = arr.outputs();
-    arr.primitive().eval_gpu(arr.inputs(), outputs);
+    {
+      // If the array is a tracer hold a reference
+      // to its inputs so they don't get donated
+      std::vector<array> inputs;
+      if (arr.is_tracer()) {
+        inputs = arr.inputs();
+      }
+      arr.primitive().eval_gpu(arr.inputs(), outputs);
+    }
+    std::vector<std::shared_ptr<array::Data>> buffers;
+    for (auto& in : arr.inputs()) {
+      buffers.push_back(in.data_shared_ptr());
+    }
+    for (auto& s : arr.siblings()) {
+      buffers.push_back(s.data_shared_ptr());
+    }
+    if (!arr.is_tracer()) {
+      arr.detach();
+    }
+
     if (p) {
       metal::device(s.device).end_encoding(s.index);
       scheduler::notify_new_task(s);
       command_buffer->addCompletedHandler(
-          [s, arr, p = std::move(p)](MTL::CommandBuffer* cbuf) mutable {
-            if (!arr.is_tracer()) {
-              arr.detach();
-            }
+          [s, buffers = std::move(buffers), p = std::move(p)](
+              MTL::CommandBuffer* cbuf) {
             p->set_value();
             scheduler::notify_task_completion(s);
             check_error(cbuf);
@@ -79,10 +96,7 @@ std::function<void()> make_task(
       metal::device(s.device).commit_command_buffer(s.index);
     } else {
       command_buffer->addCompletedHandler(
-          [s, arr](MTL::CommandBuffer* cbuf) mutable {
-            if (!arr.is_tracer()) {
-              arr.detach();
-            }
+          [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
             check_error(cbuf);
           });
     }
