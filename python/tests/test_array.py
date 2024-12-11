@@ -1,6 +1,5 @@
 # Copyright © 2023-2024 Apple Inc.
 
-import gc
 import operator
 import pickle
 import resource
@@ -1943,7 +1942,6 @@ class TestArray(mlx_tests.MLXTestCase):
             return b
 
         t()
-        gc.collect()
         expected = get_mem()
         for _ in range(100):
             t()
