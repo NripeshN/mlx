@@ -25,6 +25,28 @@ namespace mlx::core {
     throw std::runtime_error(#func " has no Vulkan implementation."); \
   }
 
+void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto cpu_stream = default_stream(Device::cpu);
+  Add cpu_add(cpu_stream);
+  cpu_add.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
+}
+
+void Equal::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto cpu_stream = default_stream(Device::cpu);
+  Equal cpu_equal(cpu_stream, state());
+  cpu_equal.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
+}
+
+void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto [reduce_type, axes] = state();
+  auto cpu_stream = default_stream(Device::cpu);
+  Reduce cpu_reduce(cpu_stream, reduce_type, axes);
+  cpu_reduce.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
+}
+
 bool fast::ScaledDotProductAttention::use_fallback(
     const array& q,
     const array& k,
@@ -49,7 +71,7 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
 }
 
 NO_GPU(Abs)
-NO_GPU(Add)
+// Add has CPU fallback above.
 // AddMM implemented in matmul.cpp
 NO_GPU(Arange)
 NO_GPU(ArcCos)
@@ -74,7 +96,7 @@ NO_GPU(Cosh)
 NO_GPU(Divide)
 NO_GPU_MULTI(DivMod)
 NO_GPU(Remainder)
-NO_GPU(Equal)
+// Equal has CPU fallback above.
 NO_GPU(Erf)
 NO_GPU(ErfInv)
 NO_GPU(Exp)
@@ -113,7 +135,7 @@ NO_GPU(QuantizedMatmul)
 NO_GPU(QQMatmul)
 NO_GPU(RandomBits)
 NO_GPU(Real)
-NO_GPU(Reduce)
+// Reduce has CPU fallback above.
 NO_GPU(Round)
 NO_GPU(Scan)
 NO_GPU(Scatter)

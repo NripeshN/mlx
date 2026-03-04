@@ -3,6 +3,7 @@
 #pragma once
 
 #include <mutex>
+#include <unordered_set>
 
 #include <vulkan/vulkan.h>
 
@@ -61,6 +62,7 @@ class VulkanAllocator : public allocator::Allocator {
   size_t wired_limit_{0};
   size_t num_resources_{0};
   size_t resource_limit_{0};
+  std::unordered_set<VulkanBuffer*> live_buffers_;
 
   mutable std::mutex mutex_;
 };

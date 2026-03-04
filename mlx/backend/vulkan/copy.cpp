@@ -128,9 +128,22 @@ void fill_gpu(const array& val, array& out, const Stream& s) {
 }
 
 void reshape_gpu(const array& in, array& out, Stream s) {
-  // Reshape is typically a no-op if the data is contiguous
-  // Just share the buffer with new shape
-  out.set_data(in.buffer());
+  auto [copy_necessary, out_strides] = prepare_reshape(in, out);
+  if (copy_necessary) {
+    out.set_data(allocator::malloc(out.nbytes()));
+    copy_gpu_inplace(
+        in,
+        out,
+        in.shape(),
+        in.strides(),
+        make_contiguous_strides(in.shape()),
+        0,
+        0,
+        CopyType::General,
+        s);
+  } else {
+    shared_buffer_reshape(in, out_strides, out);
+  }
 }
 
 void concatenate_gpu(

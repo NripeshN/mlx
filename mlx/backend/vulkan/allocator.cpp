@@ -215,6 +215,7 @@ Buffer VulkanAllocator::malloc(size_t size) {
     active_memory_ += buf->allocation_size;
     peak_memory_ = std::max(peak_memory_, active_memory_);
     num_resources_++;
+    live_buffers_.insert(buf);
   }
 
   return Buffer{static_cast<void*>(buf)};
@@ -226,19 +227,21 @@ void VulkanAllocator::free(Buffer buffer) {
     return;
   }
 
-  auto device = VulkanContext::get().device();
-
-  if (buf->mapped_ptr != nullptr) {
-    vkUnmapMemory(device, buf->memory);
-  }
-  vkDestroyBuffer(device, buf->buffer, nullptr);
-  vkFreeMemory(device, buf->memory, nullptr);
-
   {
     std::unique_lock lk(mutex_);
+    if (!live_buffers_.contains(buf)) {
+      return;
+    }
+    live_buffers_.erase(buf);
     active_memory_ -= std::min(active_memory_, buf->allocation_size);
     num_resources_ -= std::min<size_t>(1, num_resources_);
   }
+
+  auto device = VulkanContext::get().device();
+
+  // Match ggml-vulkan destruction order.
+  vkFreeMemory(device, buf->memory, nullptr);
+  vkDestroyBuffer(device, buf->buffer, nullptr);
 
   delete buf;
 }
