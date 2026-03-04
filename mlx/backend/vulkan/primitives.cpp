@@ -47,6 +47,49 @@ void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   synchronize(cpu_stream);
 }
 
+void Divide::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto cpu_stream = default_stream(Device::cpu);
+  Divide cpu_divide(cpu_stream);
+  cpu_divide.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
+}
+
+void Subtract::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto cpu_stream = default_stream(Device::cpu);
+  Subtract cpu_subtract(cpu_stream);
+  cpu_subtract.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
+}
+
+void Minimum::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto cpu_stream = default_stream(Device::cpu);
+  Minimum cpu_minimum(cpu_stream);
+  cpu_minimum.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
+}
+
+void Maximum::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto cpu_stream = default_stream(Device::cpu);
+  Maximum cpu_maximum(cpu_stream);
+  cpu_maximum.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
+}
+
+void Multiply::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto cpu_stream = default_stream(Device::cpu);
+  Multiply cpu_multiply(cpu_stream);
+  cpu_multiply.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
+}
+
+void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto [shape, width] = state();
+  auto cpu_stream = default_stream(Device::cpu);
+  RandomBits cpu_random_bits(cpu_stream, shape, width);
+  cpu_random_bits.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
+}
+
 bool fast::ScaledDotProductAttention::use_fallback(
     const array& q,
     const array& k,
@@ -93,7 +136,7 @@ NO_GPU(Conjugate)
 NO_GPU(Convolution)
 NO_GPU(Cos)
 NO_GPU(Cosh)
-NO_GPU(Divide)
+// Divide has CPU fallback above.
 NO_GPU_MULTI(DivMod)
 NO_GPU(Remainder)
 // Equal has CPU fallback above.
@@ -123,9 +166,9 @@ NO_GPU(LogAddExp)
 NO_GPU(LogSumExp)
 NO_GPU_MULTI(LUF)
 // Matmul implemented in matmul.cpp
-NO_GPU(Maximum)
-NO_GPU(Minimum)
-NO_GPU(Multiply)
+// Maximum has CPU fallback above.
+// Minimum has CPU fallback above.
+// Multiply has CPU fallback above.
 NO_GPU(Negative)
 NO_GPU(NotEqual)
 NO_GPU(Partition)
@@ -133,7 +176,7 @@ NO_GPU(Power)
 NO_GPU_MULTI(QRF)
 NO_GPU(QuantizedMatmul)
 NO_GPU(QQMatmul)
-NO_GPU(RandomBits)
+// RandomBits has CPU fallback above.
 NO_GPU(Real)
 // Reduce has CPU fallback above.
 NO_GPU(Round)
@@ -150,7 +193,7 @@ NO_GPU(Softmax)
 NO_GPU(Sort)
 NO_GPU(Square)
 NO_GPU(Sqrt)
-NO_GPU(Subtract)
+// Subtract has CPU fallback above.
 NO_GPU_MULTI(SVD)
 NO_GPU(Tan)
 NO_GPU(Tanh)

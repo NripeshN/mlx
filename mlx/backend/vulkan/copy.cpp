@@ -2,6 +2,7 @@
 
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/common/utils.h"
+#include "mlx/backend/cpu/copy.h"
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
@@ -41,8 +42,26 @@ void copy_gpu_inplace(
     return;
   }
 
-  // For now, implement simple contiguous copy
-  // TODO: Implement more complex copy types (General, GeneralGeneral, etc.)
+  const bool same_dtype = in.dtype() == out.dtype();
+  const bool raw_buffer_copy = same_dtype && ctype == CopyType::Vector;
+
+  if (!raw_buffer_copy) {
+    auto cpu_stream = default_stream(Device::cpu);
+    copy_cpu_inplace(
+        in,
+        out,
+        data_shape,
+        i_strides,
+        o_strides,
+        i_offset,
+        o_offset,
+        ctype,
+        cpu_stream,
+        dynamic_i_offset,
+        dynamic_o_offset);
+    synchronize(cpu_stream);
+    return;
+  }
 
   // Get Vulkan command buffer
   VkCommandBuffer cmd_buffer = vulkan::begin_command_recording(s.index);
@@ -52,7 +71,7 @@ void copy_gpu_inplace(
       const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
   auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
 
-  if (ctype == CopyType::Vector && in.dtype() == out.dtype()) {
+  if (ctype == CopyType::Vector) {
     // Simple contiguous memory copy using Vulkan command buffer
     VkBufferCopy copy_region{};
     copy_region.srcOffset =
@@ -64,34 +83,8 @@ void copy_gpu_inplace(
     vkCmdCopyBuffer(
         cmd_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
 
-  } else if (ctype == CopyType::Scalar) {
-    // Copy a single element
-    VkBufferCopy copy_region{};
-    copy_region.srcOffset =
-        static_cast<VkDeviceSize>(i_offset * size_of(in.dtype()));
-    copy_region.dstOffset =
-        static_cast<VkDeviceSize>(o_offset * size_of(out.dtype()));
-    copy_region.size = static_cast<VkDeviceSize>(size_of(in.dtype()));
-
-    vkCmdCopyBuffer(
-        cmd_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
-
   } else {
-    // For more complex copies, use a compute shader
-    // For now, fall back to CPU copy
-    vulkan::end_command_recording(s.index);
-
-    // Synchronize to ensure any pending GPU work is done
-    vulkan::synchronize_stream(s);
-
-    // CPU fallback copy
-    const char* src_ptr = static_cast<const char*>(in_buf->mapped_ptr);
-    char* dst_ptr = static_cast<char*>(out_buf->mapped_ptr);
-
-    // Simple element-by-element copy
-    // TODO: Implement proper compute shader for this
-    throw std::runtime_error(
-        "Non-contiguous copy not yet implemented for Vulkan");
+    throw std::runtime_error("Unsupported Vulkan copy type.");
   }
 
   vulkan::end_command_recording(s.index);
