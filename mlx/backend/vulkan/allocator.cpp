@@ -1,27 +1,68 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/backend/vulkan/allocator.h"
+#include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/memory.h"
 
-namespace mlx::core::allocator {
+namespace mlx::core {
 
-void* Buffer::raw_ptr() {
-  if (!ptr_)
-    return nullptr;
-  auto* vbuf = static_cast<vulkan::VulkanBuffer*>(ptr_);
-  return vbuf->mapped_ptr;
+namespace allocator {
+
+// Simple CPU allocator for Vulkan backend
+// Uses std::malloc/free with size tracking at the beginning
+class VulkanCompatibleAllocator : public Allocator {
+ public:
+  virtual Buffer malloc(size_t size) override;
+  virtual void free(Buffer buffer) override;
+  virtual size_t size(Buffer buffer) const override;
+
+ private:
+  std::mutex mutex_;
+};
+
+Buffer VulkanCompatibleAllocator::malloc(size_t size) {
+  void* ptr = std::malloc(size + sizeof(size_t));
+  if (ptr != nullptr) {
+    *static_cast<size_t*>(ptr) = size;
+  }
+  return Buffer{ptr};
+}
+
+void VulkanCompatibleAllocator::free(Buffer buffer) {
+  std::free(buffer.ptr());
+}
+
+size_t VulkanCompatibleAllocator::size(Buffer buffer) const {
+  if (buffer.ptr() == nullptr) {
+    return 0;
+  }
+  return *static_cast<size_t*>(buffer.ptr());
 }
 
 Allocator& allocator() {
-  return vulkan::allocator();
+  static VulkanCompatibleAllocator allocator_;
+  return allocator_;
 }
 
-} // namespace mlx::core::allocator
+void* Buffer::raw_ptr() {
+  if (!ptr_) {
+    return nullptr;
+  }
+  // Skip the size field at the beginning
+  return static_cast<size_t*>(ptr_) + 1;
+}
+
+} // namespace allocator
+
+} // namespace mlx::core
 
 namespace mlx::core::vulkan {
 
+// Vulkan-specific allocator for GPU buffers
+// This is used explicitly when creating GPU buffers
 allocator::Buffer VulkanAllocator::malloc(size_t size) {
   std::lock_guard lock(mutex_);
 
@@ -55,12 +96,11 @@ allocator::Buffer VulkanAllocator::malloc(size_t size) {
   VkMemoryPropertyFlags memory_flags;
   if (use_unified) {
     // For unified memory (integrated GPUs), use device-local + host-visible
-    // memory This gives us zero-copy access between CPU and GPU
     memory_flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
   } else {
-    // For discrete GPUs, use host-visible memory (staging buffer approach)
+    // For discrete GPUs, use host-visible memory
     memory_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
   }
