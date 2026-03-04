@@ -1,14 +1,28 @@
-#include "mlx/array.h"
-#include "mlx/device.h"
+// Copyright © 2024 Apple Inc.
 
-namespace mlx::core {
+#include "mlx/backend/gpu/eval.h"
+#include "mlx/primitives.h"
 
-namespace gpu {
+namespace mlx::core::gpu {
 
-void eval(array&) {}
+void eval(array& arr) {
+  auto outputs = arr.outputs();
+  {
+    // Keep tracer inputs alive so they are not donated.
+    std::vector<array> inputs;
+    if (arr.is_tracer()) {
+      inputs = arr.inputs();
+    }
+    arr.primitive().eval_gpu(arr.inputs(), outputs);
+  }
 
-void finalize(Stream) {}
+  // Temporary conservative behavior: synchronize after each op.
+  // This avoids lifetime hazards while Vulkan command scheduling matures.
+  ::mlx::core::gpu::synchronize(arr.primitive().stream());
+}
 
-} // namespace gpu
+void finalize(Stream s) {
+  ::mlx::core::gpu::synchronize(s);
+}
 
-} // namespace mlx::core
+} // namespace mlx::core::gpu

@@ -18,6 +18,7 @@ struct StreamData {
   VkCommandBuffer command_buffer{VK_NULL_HANDLE};
   VkFence fence{VK_NULL_HANDLE};
   bool recording{false};
+  bool has_pending_work{false};
   int stream_index{0};
 };
 
@@ -45,9 +46,14 @@ class VulkanDevice {
       submit_commands(stream);
     }
 
+    if (!stream->has_pending_work) {
+      return;
+    }
+
     VkDevice device = VulkanContext::get().device();
     vkWaitForFences(device, 1, &stream->fence, VK_TRUE, UINT64_MAX);
     vkResetFences(device, 1, &stream->fence);
+    stream->has_pending_work = false;
   }
 
   void synchronize() {
@@ -147,8 +153,10 @@ class VulkanDevice {
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &stream->command_buffer;
 
+    vkResetFences(device, 1, &stream->fence);
     vkQueueSubmit(queue, 1, &submitInfo, stream->fence);
     stream->recording = false;
+    stream->has_pending_work = true;
   }
 
   std::mutex mutex_;
@@ -168,3 +176,24 @@ void synchronize(Stream s) {
 }
 
 } // namespace mlx::core::gpu
+
+namespace mlx::core::vulkan {
+
+// Expose VulkanDevice methods to other files
+VkCommandBuffer begin_command_recording(int stream_index) {
+  return VulkanDevice::get().begin_recording(stream_index);
+}
+
+void end_command_recording(int stream_index) {
+  VulkanDevice::get().end_recording(stream_index);
+}
+
+void synchronize_stream(Stream s) {
+  VulkanDevice::get().synchronize(s);
+}
+
+void synchronize_all() {
+  VulkanDevice::get().synchronize();
+}
+
+} // namespace mlx::core::vulkan

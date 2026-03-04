@@ -159,49 +159,4 @@ NO_GPU_MULTI(Recv)
 NO_GPU_MULTI(ReduceScatter)
 } // namespace distributed
 
-void copy_gpu_inplace(
-    const array& in,
-    array& out,
-    const Shape& data_shape,
-    const Strides& i_strides,
-    const Strides& o_strides,
-    int64_t i_offset,
-    int64_t o_offset,
-    CopyType ctype,
-    const Stream& s,
-    std::optional<array> dynamic_i_offset,
-    std::optional<array> dynamic_o_offset) {
-  throw std::runtime_error("copy_gpu_inplace has no Vulkan implementation.");
-}
-
-void copy_gpu(const array& src, array& out, CopyType ctype, const Stream& s) {
-  throw std::runtime_error("copy_gpu has no Vulkan implementation.");
-}
-
-void fill_gpu(const array& val, array& out, const Stream& s) {
-  throw std::runtime_error("fill_gpu has no Vulkan implementation.");
-}
-
-void reshape_gpu(const array& in, array& out, Stream s) {
-  throw std::runtime_error("reshape_gpu has no Vulkan implementation.");
-}
-
-void concatenate_gpu(
-    const std::vector<array>& inputs,
-    array& out,
-    int axis,
-    const Stream& s) {
-  throw std::runtime_error("concatenate_gpu has no Vulkan implementation.");
-}
-
-array compute_dynamic_offset(
-    const array& indices,
-    const Strides& strides,
-    const std::vector<int>& axes,
-    const Stream& s) {
-  throw std::runtime_error(
-      "compute_dynamic_offset has no Vulkan implementation.");
-  return array({});
-}
-
 } // namespace mlx::core
