@@ -109,6 +109,7 @@ if(Vulkan_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/device.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/copy.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/matmul.cpp
     ${SHADER_CPP_FILES}
   )
   

@@ -50,7 +50,7 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
 
 NO_GPU(Abs)
 NO_GPU(Add)
-NO_GPU(AddMM)
+// AddMM implemented in matmul.cpp
 NO_GPU(Arange)
 NO_GPU(ArcCos)
 NO_GPU(ArcCosh)
@@ -64,7 +64,7 @@ NO_GPU(ArgReduce)
 NO_GPU(ArgSort)
 NO_GPU(BitwiseBinary)
 NO_GPU(BitwiseInvert)
-NO_GPU(BlockMaskedMM)
+// BlockMaskedMM implemented in matmul.cpp
 NO_GPU(Ceil)
 NO_GPU_MULTI(Compiled)
 NO_GPU(Conjugate)
@@ -100,7 +100,7 @@ NO_GPU(LogicalOr)
 NO_GPU(LogAddExp)
 NO_GPU(LogSumExp)
 NO_GPU_MULTI(LUF)
-NO_GPU(Matmul)
+// Matmul implemented in matmul.cpp
 NO_GPU(Maximum)
 NO_GPU(Minimum)
 NO_GPU(Multiply)
