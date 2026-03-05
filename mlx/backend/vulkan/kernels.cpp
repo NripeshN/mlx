@@ -18,7 +18,8 @@ namespace {
 std::string make_pipeline_key(
     const std::string& shader_name,
     const std::vector<VkDescriptorSetLayoutBinding>& bindings,
-    uint32_t push_constant_size) {
+    uint32_t push_constant_size,
+    const std::vector<uint32_t>& specialization_constants) {
   std::ostringstream key;
   key << shader_name << "|pc=" << push_constant_size
       << "|n=" << bindings.size();
@@ -27,7 +28,26 @@ std::string make_pipeline_key(
         << ",c=" << binding.descriptorCount << ",s=" << binding.stageFlags
         << ",i=" << (binding.pImmutableSamplers != nullptr ? 1 : 0);
   }
+  if (!specialization_constants.empty()) {
+    key << "|sc=";
+    for (size_t i = 0; i < specialization_constants.size(); ++i) {
+      if (i != 0) {
+        key << ",";
+      }
+      key << specialization_constants[i];
+    }
+  }
   return key.str();
+}
+
+const std::vector<uint32_t>& matmul_specialization_constants() {
+  // Conservative matmul tile that avoids relying on device-specific tuning.
+  // constant_id mapping in mul_mm.comp:
+  //   0: BLOCK_SIZE, 1: BM, 2: BN, 3: BK, 4: WM, 5: WN,
+  //   6: WMITER, 7: TM, 8: TN, 9: TK, 10: WARP
+  static const std::vector<uint32_t> kSpec = {
+      32, 32, 32, 16, 32, 32, 2, 2, 2, 1, 32};
+  return kSpec;
 }
 
 VkDescriptorSetLayoutBinding make_storage_buffer_binding(uint32_t binding) {
@@ -172,6 +192,8 @@ enum class KernelSpecId {
   Softmax,
   SoftmaxLarge,
   CumsumMultipass,
+  MatVec,
+  Matmul,
 };
 
 struct KernelSpec {
@@ -194,7 +216,7 @@ constexpr KernelSpec make_kernel_spec(
   return {bindings, binding_count, push_constant_size, grid_kind};
 }
 
-constexpr std::array<KernelSpec, 10> kKernelSpecs = {
+constexpr std::array<KernelSpec, 12> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 0, 0, 0},
         3,
@@ -245,6 +267,16 @@ constexpr std::array<KernelSpec, 10> kKernelSpecs = {
         3,
         sizeof(SumRowsPushConstants),
         DispatchGridKind::RowWise),
+    make_kernel_spec(
+        {0, 1, 2, 3, 4, 0},
+        5,
+        sizeof(MatVecPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 0, 0, 0},
+        3,
+        sizeof(MatmulPushConstants),
+        DispatchGridKind::Linear1D),
 };
 
 size_t kernel_spec_index(KernelSpecId id) {
@@ -466,7 +498,8 @@ void dispatch_with_spec(
     uint32_t num_elements,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
-    std::optional<std::array<uint32_t, 3>> explicit_grid = std::nullopt) {
+    std::optional<std::array<uint32_t, 3>> explicit_grid = std::nullopt,
+    const std::vector<uint32_t>& specialization_constants = {}) {
   if (num_elements == 0) {
     return;
   }
@@ -487,7 +520,10 @@ void dispatch_with_spec(
 
   auto& manager = KernelManager::get();
   auto* pipeline = manager.get_pipeline(
-      shader_name, bindings, static_cast<uint32_t>(sizeof(PushConstants)));
+      shader_name,
+      bindings,
+      static_cast<uint32_t>(sizeof(PushConstants)),
+      specialization_constants);
   VkDescriptorSet descriptor_set =
       manager.allocate_descriptor_set(pipeline->descriptor_layout);
   manager.defer_descriptor_set_free(s.index, descriptor_set);
@@ -635,9 +671,10 @@ ShaderModule* KernelManager::get_shader(const std::string& name) {
 ComputePipeline* KernelManager::get_pipeline(
     const std::string& shader_name,
     const std::vector<VkDescriptorSetLayoutBinding>& bindings,
-    uint32_t push_constant_size) {
-  std::string pipeline_key =
-      make_pipeline_key(shader_name, bindings, push_constant_size);
+    uint32_t push_constant_size,
+    const std::vector<uint32_t>& specialization_constants) {
+  std::string pipeline_key = make_pipeline_key(
+      shader_name, bindings, push_constant_size, specialization_constants);
 
   auto it = pipelines_.find(pipeline_key);
   if (it != pipelines_.end()) {
@@ -704,6 +741,27 @@ ComputePipeline* KernelManager::get_pipeline(
   pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
   pipelineInfo.stage.module = shader->module;
   pipelineInfo.stage.pName = "main";
+
+  std::vector<VkSpecializationMapEntry> specialization_entries;
+  VkSpecializationInfo specialization_info{};
+  if (!specialization_constants.empty()) {
+    specialization_entries.reserve(specialization_constants.size());
+    for (uint32_t i = 0; i < specialization_constants.size(); ++i) {
+      VkSpecializationMapEntry entry{};
+      entry.constantID = i;
+      entry.offset = i * sizeof(uint32_t);
+      entry.size = sizeof(uint32_t);
+      specialization_entries.push_back(entry);
+    }
+    specialization_info.mapEntryCount =
+        static_cast<uint32_t>(specialization_entries.size());
+    specialization_info.pMapEntries = specialization_entries.data();
+    specialization_info.dataSize =
+        specialization_constants.size() * sizeof(uint32_t);
+    specialization_info.pData = specialization_constants.data();
+    pipelineInfo.stage.pSpecializationInfo = &specialization_info;
+  }
+
   pipelineInfo.layout = pipeline_layout;
 
   VkPipeline pipeline;
@@ -1340,6 +1398,112 @@ void dispatch_cumsum_op(
       bound_arrays,
       push_constants,
       row_count,
+      cmd_buffer,
+      s,
+      grid);
+}
+
+void dispatch_mul_mm_op(
+    const array& a,
+    const array& b,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    const MatmulPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  if (a.ndim() < 2 || b.ndim() < 2 || out.ndim() < 2) {
+    throw std::runtime_error(
+        "[vulkan::kernels] mul_mm dispatch requires rank >= 2 tensors.");
+  }
+
+  const uint32_t m = checked_u32(out.shape(-1), "mul_mm M");
+  const uint32_t n = checked_u32(out.shape(-2), "mul_mm N");
+  const uint32_t k = checked_u32(a.shape(-1), "mul_mm K");
+  if (checked_u32(a.shape(-2), "mul_mm A M") != m ||
+      checked_u32(b.shape(-2), "mul_mm B N") != n ||
+      checked_u32(b.shape(-1), "mul_mm B K") != k) {
+    throw std::runtime_error(
+        "[vulkan::kernels] mul_mm dispatch received incompatible shapes.");
+  }
+
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&a, "src0"},
+      {&b, "src1"},
+      {&out, "dst"},
+  }};
+  const uint32_t num_elements = checked_mul_u32(m, n, "mul_mm output elements");
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::Matmul,
+      bound_arrays,
+      push_constants,
+      num_elements,
+      cmd_buffer,
+      s,
+      grid,
+      matmul_specialization_constants());
+}
+
+void dispatch_mul_mat_vec_op(
+    const array& matrix,
+    const array& vec,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s) {
+  if (matrix.ndim() != 2 || vec.ndim() != 2 || out.ndim() != 2) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Mat-vec dispatch requires rank-2 tensors.");
+  }
+  if (vec.shape(0) != 1 || out.shape(0) != 1) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Mat-vec dispatch expects a single input row.");
+  }
+
+  const uint32_t ncols = checked_u32(vec.shape(1), "matvec ncols");
+  const uint32_t nrows = checked_u32(out.shape(1), "matvec nrows");
+  if (checked_u32(matrix.shape(0), "matvec matrix K") != ncols ||
+      checked_u32(matrix.shape(1), "matvec matrix N") != nrows) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Mat-vec dispatch received incompatible shapes.");
+  }
+
+  MatVecPushConstants push_constants{};
+  push_constants.ncols = ncols;
+  push_constants.stride_a = ncols;
+  push_constants.stride_b = ncols;
+  push_constants.stride_d = nrows;
+  push_constants.batch_stride_a =
+      checked_mul_u32(ncols, nrows, "matvec batch_stride_a");
+  push_constants.batch_stride_b = ncols;
+  push_constants.batch_stride_d = nrows;
+  push_constants.fusion_flags = 0;
+  push_constants.base_work_group_y = 0;
+  push_constants.ne02 = 1;
+  push_constants.ne12 = 1;
+  push_constants.broadcast2 = 1;
+  push_constants.broadcast3 = 1;
+
+  const std::array<BoundArray, 5> bound_arrays = {{
+      {&matrix, "src0"},
+      {&vec, "src1"},
+      {&out, "dst"},
+      {&out, "fuse0"},
+      {&out, "fuse1"},
+  }};
+
+  constexpr uint32_t kMaxWorkgroupsX = 65535u;
+  const uint32_t groups_z = (nrows + kMaxWorkgroupsX - 1u) / kMaxWorkgroupsX;
+  const uint32_t groups_x = (nrows + groups_z - 1u) / groups_z;
+  const std::array<uint32_t, 3> grid = {groups_x, 1u, groups_z};
+
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::MatVec,
+      bound_arrays,
+      push_constants,
+      nrows,
       cmd_buffer,
       s,
       grid);

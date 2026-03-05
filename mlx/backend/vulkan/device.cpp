@@ -6,8 +6,10 @@
 
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include "mlx/backend/vulkan/allocator.h"
@@ -19,10 +21,98 @@ namespace mlx::core::vulkan {
 
 namespace {
 
+const char* vk_result_name(VkResult result) {
+  switch (result) {
+    case VK_SUCCESS:
+      return "VK_SUCCESS";
+    case VK_NOT_READY:
+      return "VK_NOT_READY";
+    case VK_TIMEOUT:
+      return "VK_TIMEOUT";
+    case VK_EVENT_SET:
+      return "VK_EVENT_SET";
+    case VK_EVENT_RESET:
+      return "VK_EVENT_RESET";
+    case VK_INCOMPLETE:
+      return "VK_INCOMPLETE";
+    case VK_ERROR_OUT_OF_HOST_MEMORY:
+      return "VK_ERROR_OUT_OF_HOST_MEMORY";
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+      return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+    case VK_ERROR_INITIALIZATION_FAILED:
+      return "VK_ERROR_INITIALIZATION_FAILED";
+    case VK_ERROR_DEVICE_LOST:
+      return "VK_ERROR_DEVICE_LOST";
+    case VK_ERROR_MEMORY_MAP_FAILED:
+      return "VK_ERROR_MEMORY_MAP_FAILED";
+    case VK_ERROR_LAYER_NOT_PRESENT:
+      return "VK_ERROR_LAYER_NOT_PRESENT";
+    case VK_ERROR_EXTENSION_NOT_PRESENT:
+      return "VK_ERROR_EXTENSION_NOT_PRESENT";
+    case VK_ERROR_FEATURE_NOT_PRESENT:
+      return "VK_ERROR_FEATURE_NOT_PRESENT";
+    case VK_ERROR_INCOMPATIBLE_DRIVER:
+      return "VK_ERROR_INCOMPATIBLE_DRIVER";
+    case VK_ERROR_TOO_MANY_OBJECTS:
+      return "VK_ERROR_TOO_MANY_OBJECTS";
+    case VK_ERROR_FORMAT_NOT_SUPPORTED:
+      return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+    case VK_ERROR_FRAGMENTED_POOL:
+      return "VK_ERROR_FRAGMENTED_POOL";
+    case VK_ERROR_UNKNOWN:
+      return "VK_ERROR_UNKNOWN";
+    case VK_ERROR_OUT_OF_POOL_MEMORY:
+      return "VK_ERROR_OUT_OF_POOL_MEMORY";
+    case VK_ERROR_INVALID_EXTERNAL_HANDLE:
+      return "VK_ERROR_INVALID_EXTERNAL_HANDLE";
+    case VK_ERROR_FRAGMENTATION:
+      return "VK_ERROR_FRAGMENTATION";
+    case VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS:
+      return "VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS";
+    case VK_ERROR_SURFACE_LOST_KHR:
+      return "VK_ERROR_SURFACE_LOST_KHR";
+    case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR:
+      return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
+    case VK_SUBOPTIMAL_KHR:
+      return "VK_SUBOPTIMAL_KHR";
+    case VK_ERROR_OUT_OF_DATE_KHR:
+      return "VK_ERROR_OUT_OF_DATE_KHR";
+    case VK_ERROR_INCOMPATIBLE_DISPLAY_KHR:
+      return "VK_ERROR_INCOMPATIBLE_DISPLAY_KHR";
+    case VK_ERROR_VALIDATION_FAILED_EXT:
+      return "VK_ERROR_VALIDATION_FAILED_EXT";
+    case VK_ERROR_INVALID_SHADER_NV:
+      return "VK_ERROR_INVALID_SHADER_NV";
+    case VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT:
+      return "VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT";
+    case VK_ERROR_NOT_PERMITTED_KHR:
+      return "VK_ERROR_NOT_PERMITTED_KHR";
+    case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
+      return "VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT";
+    case VK_THREAD_IDLE_KHR:
+      return "VK_THREAD_IDLE_KHR";
+    case VK_THREAD_DONE_KHR:
+      return "VK_THREAD_DONE_KHR";
+    case VK_OPERATION_DEFERRED_KHR:
+      return "VK_OPERATION_DEFERRED_KHR";
+    case VK_OPERATION_NOT_DEFERRED_KHR:
+      return "VK_OPERATION_NOT_DEFERRED_KHR";
+    case VK_PIPELINE_COMPILE_REQUIRED:
+      return "VK_PIPELINE_COMPILE_REQUIRED";
+    default:
+      return "VK_RESULT_UNKNOWN";
+  }
+}
+
+std::string format_vk_result(VkResult result) {
+  return std::string(vk_result_name(result)) + " (" +
+      std::to_string(static_cast<int>(result)) + ")";
+}
+
 void throw_if_vk_error(VkResult result, const std::string& context) {
   if (result != VK_SUCCESS) {
     throw std::runtime_error(
-        context + " (VkResult=" + std::to_string(result) + ").");
+        context + " (VkResult=" + format_vk_result(result) + ").");
   }
 }
 
@@ -227,21 +317,63 @@ class VulkanDevice {
     VkDevice device = VulkanContext::get().device();
     VkQueue queue = VulkanContext::get().compute_queue();
 
-    throw_if_vk_error(
-        vkEndCommandBuffer(stream->command_buffer),
-        "[vulkan::submit_commands] Failed ending command buffer");
+    auto fail_submit = [&](VkResult result, const std::string& context) {
+      const VkResult fence_status = vkGetFenceStatus(device, stream->fence);
+      VkPhysicalDeviceProperties props{};
+      vkGetPhysicalDeviceProperties(
+          VulkanContext::get().physical_device(), &props);
+
+      stream->recording = false;
+      stream->has_pending_work = false;
+      KernelManager::get().reclaim_descriptor_sets(stream->stream_index);
+
+      const VkResult reset_pool_result =
+          vkResetCommandPool(device, stream->command_pool, 0);
+
+      std::ostringstream details;
+      details << " stream=" << stream->stream_index
+              << " fence_status=" << format_vk_result(fence_status)
+              << " reset_pool=" << format_vk_result(reset_pool_result)
+              << " device='" << props.deviceName << "'";
+
+      throw std::runtime_error(
+          context + " (VkResult=" + format_vk_result(result) + ";" +
+          details.str() + ").");
+    };
+
+    VkResult result = vkEndCommandBuffer(stream->command_buffer);
+    if (result != VK_SUCCESS) {
+      fail_submit(
+          result, "[vulkan::submit_commands] Failed ending command buffer");
+    }
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &stream->command_buffer;
 
-    throw_if_vk_error(
-        vkResetFences(device, 1, &stream->fence),
-        "[vulkan::submit_commands] Failed resetting stream fence");
-    throw_if_vk_error(
-        vkQueueSubmit(queue, 1, &submitInfo, stream->fence),
-        "[vulkan::submit_commands] Failed submitting command buffer");
+    result = vkResetFences(device, 1, &stream->fence);
+    if (result != VK_SUCCESS) {
+      fail_submit(
+          result, "[vulkan::submit_commands] Failed resetting stream fence");
+    }
+
+    constexpr int kSubmitRetryCount = 8;
+    for (int retry = 0; retry < kSubmitRetryCount; ++retry) {
+      result = vkQueueSubmit(queue, 1, &submitInfo, stream->fence);
+      if (result == VK_SUCCESS) {
+        break;
+      }
+      if (result != VK_TIMEOUT && result != VK_NOT_READY) {
+        break;
+      }
+      std::this_thread::yield();
+    }
+    if (result != VK_SUCCESS) {
+      fail_submit(
+          result, "[vulkan::submit_commands] Failed submitting command buffer");
+    }
+
     stream->recording = false;
     stream->has_pending_work = true;
   }

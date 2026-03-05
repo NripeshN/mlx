@@ -42,7 +42,8 @@ class KernelManager {
   ComputePipeline* get_pipeline(
       const std::string& shader_name,
       const std::vector<VkDescriptorSetLayoutBinding>& bindings,
-      uint32_t push_constant_size = 0);
+      uint32_t push_constant_size = 0,
+      const std::vector<uint32_t>& specialization_constants = {});
 
   // Get or load a shader module
   ShaderModule* get_shader(const std::string& name);
@@ -197,6 +198,42 @@ struct SoftmaxPushConstants {
   uint32_t has_sinks;
 };
 
+struct MatmulPushConstants {
+  uint32_t M;
+  uint32_t N;
+  uint32_t K;
+  uint32_t stride_a;
+  uint32_t stride_b;
+  uint32_t stride_d;
+  uint32_t batch_stride_a;
+  uint32_t batch_stride_b;
+  uint32_t batch_stride_d;
+  uint32_t base_work_group_z;
+  uint32_t num_batches;
+  uint32_t k_split;
+  uint32_t ne02;
+  uint32_t ne12;
+  uint32_t broadcast2;
+  uint32_t broadcast3;
+  uint32_t padded_N;
+};
+
+struct MatVecPushConstants {
+  uint32_t ncols;
+  uint32_t stride_a;
+  uint32_t stride_b;
+  uint32_t stride_d;
+  uint32_t batch_stride_a;
+  uint32_t batch_stride_b;
+  uint32_t batch_stride_d;
+  uint32_t fusion_flags;
+  uint32_t base_work_group_y;
+  uint32_t ne02;
+  uint32_t ne12;
+  uint32_t broadcast2;
+  uint32_t broadcast3;
+};
+
 enum class BinaryDispatchVariant {
   Standard,
   AddWithPartials,
@@ -273,6 +310,24 @@ void dispatch_softmax_large_op(
 
 void dispatch_cumsum_op(
     const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s);
+
+void dispatch_mul_mm_op(
+    const array& a,
+    const array& b,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    const MatmulPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid);
+
+void dispatch_mul_mat_vec_op(
+    const array& matrix,
+    const array& vec,
     array& out,
     const std::string& shader_name,
     VkCommandBuffer cmd_buffer,
