@@ -692,4 +692,153 @@ void dispatch_unary_op(
   vkCmdDispatch(cmd_buffer, grid_x, grid_y, grid_z);
 }
 
+void dispatch_generic_unary_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    float param1,
+    float param2,
+    float param3,
+    float param4) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  auto& manager = KernelManager::get();
+  std::vector<VkDescriptorSetLayoutBinding> bindings = {
+      make_storage_buffer_binding(0),
+      make_storage_buffer_binding(1),
+  };
+
+  auto* pipeline =
+      manager.get_pipeline(shader_name, bindings, sizeof(GenericPushConstants));
+  VkDescriptorSet descriptor_set =
+      manager.allocate_descriptor_set(pipeline->descriptor_layout);
+  manager.defer_descriptor_set_free(s.index, descriptor_set);
+
+  std::array<VkDescriptorBufferInfo, 2> descriptor_infos{};
+  std::array<VkWriteDescriptorSet, 2> descriptor_writes{};
+  descriptor_infos[0] = make_buffer_info(in, "src0");
+  descriptor_infos[1] = make_buffer_info(out, "dst");
+
+  for (uint32_t i = 0; i < descriptor_writes.size(); ++i) {
+    auto& write = descriptor_writes[i];
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = descriptor_set;
+    write.dstBinding = i;
+    write.dstArrayElement = 0;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.descriptorCount = 1;
+    write.pBufferInfo = &descriptor_infos[i];
+  }
+
+  vkUpdateDescriptorSets(
+      VulkanContext::get().device(),
+      static_cast<uint32_t>(descriptor_writes.size()),
+      descriptor_writes.data(),
+      0,
+      nullptr);
+
+  GenericPushConstants push_constants{};
+  push_constants.KX = checked_u32(out.size(), "generic unary element count");
+  push_constants.KY = 1;
+  push_constants.param1 = param1;
+  push_constants.param2 = param2;
+  push_constants.param3 = param3;
+  push_constants.param4 = param4;
+
+  vkCmdBindPipeline(
+      cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+  vkCmdBindDescriptorSets(
+      cmd_buffer,
+      VK_PIPELINE_BIND_POINT_COMPUTE,
+      pipeline->layout,
+      0,
+      1,
+      &descriptor_set,
+      0,
+      nullptr);
+  vkCmdPushConstants(
+      cmd_buffer,
+      pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(GenericPushConstants),
+      &push_constants);
+
+  auto [grid_x, grid_y, grid_z] =
+      get_element_wise_grid_dims(out.size(), VULKAN_INDEX_TILE_SIZE);
+  vkCmdDispatch(cmd_buffer, grid_x, grid_y, grid_z);
+}
+
+void dispatch_arange_op(
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    float start,
+    float step) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  auto& manager = KernelManager::get();
+  std::vector<VkDescriptorSetLayoutBinding> bindings = {
+      make_storage_buffer_binding(0),
+  };
+
+  auto* pipeline =
+      manager.get_pipeline(shader_name, bindings, sizeof(GenericPushConstants));
+  VkDescriptorSet descriptor_set =
+      manager.allocate_descriptor_set(pipeline->descriptor_layout);
+  manager.defer_descriptor_set_free(s.index, descriptor_set);
+
+  VkDescriptorBufferInfo descriptor_info = make_buffer_info(out, "dst");
+  VkWriteDescriptorSet descriptor_write{};
+  descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  descriptor_write.dstSet = descriptor_set;
+  descriptor_write.dstBinding = 0;
+  descriptor_write.dstArrayElement = 0;
+  descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  descriptor_write.descriptorCount = 1;
+  descriptor_write.pBufferInfo = &descriptor_info;
+
+  vkUpdateDescriptorSets(
+      VulkanContext::get().device(), 1, &descriptor_write, 0, nullptr);
+
+  const auto num_elements = checked_u32(out.size(), "arange element count");
+  GenericPushConstants push_constants{};
+  push_constants.KX = num_elements;
+  push_constants.KY = 1;
+  push_constants.param1 = start;
+  push_constants.param2 = step;
+  push_constants.param3 = 0.0f;
+  push_constants.param4 = 0.0f;
+
+  vkCmdBindPipeline(
+      cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+  vkCmdBindDescriptorSets(
+      cmd_buffer,
+      VK_PIPELINE_BIND_POINT_COMPUTE,
+      pipeline->layout,
+      0,
+      1,
+      &descriptor_set,
+      0,
+      nullptr);
+  vkCmdPushConstants(
+      cmd_buffer,
+      pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      sizeof(GenericPushConstants),
+      &push_constants);
+
+  const uint32_t grid_x =
+      (num_elements + VULKAN_INDEX_TILE_SIZE - 1) / VULKAN_INDEX_TILE_SIZE;
+  vkCmdDispatch(cmd_buffer, grid_x, 1, 1);
+}
+
 } // namespace mlx::core::vulkan

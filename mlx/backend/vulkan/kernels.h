@@ -177,6 +177,25 @@ void dispatch_unary_op(
     float param1 = 0.0f,
     float param2 = 0.0f);
 
+void dispatch_generic_unary_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    float param1 = 0.0f,
+    float param2 = 0.0f,
+    float param3 = 0.0f,
+    float param4 = 0.0f);
+
+void dispatch_arange_op(
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    float start,
+    float step);
+
 // Get workgroup dimensions for element-wise operations.
 // Returns (workgroup_count_x, workgroup_count_y, workgroup_count_z)
 // using ggml's 512-element tiling expected by get_idx().

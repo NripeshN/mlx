@@ -144,6 +144,11 @@ bool is_supported_unary_layout(const array& arr) {
   return true;
 }
 
+bool is_supported_generic_unary_layout(const array& arr) {
+  return arr.flags().row_contiguous && arr.offset() == 0 &&
+      arr.size() <= std::numeric_limits<uint32_t>::max();
+}
+
 template <typename Primitive>
 bool try_eval_binary_op_vulkan(
     const std::vector<array>& inputs,
@@ -269,6 +274,103 @@ void eval_unary_vulkan_or_cpu(
   eval_cpu_fallback<Primitive>(inputs, out);
 }
 
+template <typename Primitive>
+bool try_eval_generic_unary_op_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    const std::string& shader_name,
+    Stream s,
+    float param1 = 0.0f,
+    float param2 = 0.0f,
+    float param3 = 0.0f,
+    float param4 = 0.0f) {
+  if (inputs.size() != 1) {
+    return false;
+  }
+
+  const auto& in = inputs[0];
+  if (!is_vulkan_float_dtype(in.dtype()) || in.dtype() != out.dtype()) {
+    return false;
+  }
+
+  set_unary_output_data(in, out);
+  if (!is_supported_generic_unary_layout(in) ||
+      !is_supported_generic_unary_layout(out)) {
+    return false;
+  }
+
+  if (out.size() == 0) {
+    return true;
+  }
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_generic_unary_op(
+        in,
+        out,
+        shader_name,
+        command_buffer,
+        s,
+        param1,
+        param2,
+        param3,
+        param4);
+    vulkan::end_command_recording(s.index);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+template <typename Primitive>
+void eval_generic_unary_vulkan_or_cpu(
+    const std::vector<array>& inputs,
+    array& out,
+    const std::string& shader_name,
+    Stream s,
+    float param1 = 0.0f,
+    float param2 = 0.0f,
+    float param3 = 0.0f,
+    float param4 = 0.0f) {
+  if (try_eval_generic_unary_op_vulkan<Primitive>(
+          inputs, out, shader_name, s, param1, param2, param3, param4)) {
+    return;
+  }
+  eval_cpu_fallback<Primitive>(inputs, out);
+}
+
+bool try_eval_arange_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s,
+    double start,
+    double step) {
+  if (!inputs.empty() || out.dtype() != float32 ||
+      !is_supported_generic_unary_layout(out)) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_arange_op(
+        out,
+        "arange_f32",
+        command_buffer,
+        s,
+        static_cast<float>(start),
+        static_cast<float>(step));
+    vulkan::end_command_recording(s.index);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
 } // namespace
 
 #define CPU_FALLBACK(func)                                            \
@@ -332,8 +434,69 @@ void Multiply::eval_gpu(const std::vector<array>& inputs, array& out) {
   eval_binary_vulkan_or_cpu<Multiply>(inputs, out, "mul", stream());
 }
 
+void Abs::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+    auto suffix = dtype_suffix(out.dtype());
+    if (!suffix.empty()) {
+      eval_generic_unary_vulkan_or_cpu<Abs>(
+          inputs, out, "abs_" + suffix, stream());
+      return;
+    }
+  }
+  eval_cpu_fallback<Abs>(inputs, out);
+}
+
+void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto [start, stop, step] = state();
+  if (try_eval_arange_vulkan(inputs, out, stream(), start, step)) {
+    return;
+  }
+  eval_cpu_fallback<Arange>(inputs, out, start, stop, step);
+}
+
+void Ceil::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+    auto suffix = dtype_suffix(out.dtype());
+    if (!suffix.empty()) {
+      eval_generic_unary_vulkan_or_cpu<Ceil>(
+          inputs, out, "ceil_" + suffix, stream());
+      return;
+    }
+  }
+  eval_cpu_fallback<Ceil>(inputs, out);
+}
+
 void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
   eval_cpu_fallback<Cos>(inputs, out);
+}
+
+void Exp::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+    if (out.dtype() == float32) {
+      if (try_eval_generic_unary_op_vulkan<Exp>(
+              inputs, out, "exp_f32", stream())) {
+        return;
+      }
+    } else if (out.dtype() == float16) {
+      if (try_eval_generic_unary_op_vulkan<Exp>(
+              inputs, out, "exp_f16_rte", stream())) {
+        return;
+      }
+    }
+  }
+  eval_cpu_fallback<Exp>(inputs, out);
+}
+
+void Floor::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+    auto suffix = dtype_suffix(out.dtype());
+    if (!suffix.empty()) {
+      eval_generic_unary_vulkan_or_cpu<Floor>(
+          inputs, out, "floor_" + suffix, stream());
+      return;
+    }
+  }
+  eval_cpu_fallback<Floor>(inputs, out);
 }
 
 void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -356,6 +519,34 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
   eval_cpu_fallback<Sin>(inputs, out);
 }
 
+void Negative::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+    auto suffix = dtype_suffix(out.dtype());
+    if (!suffix.empty()) {
+      eval_generic_unary_vulkan_or_cpu<Negative>(
+          inputs, out, "neg_" + suffix, stream());
+      return;
+    }
+  }
+  eval_cpu_fallback<Negative>(inputs, out);
+}
+
+void Round::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval_cpu_fallback<Round>(inputs, out);
+}
+
+void Sigmoid::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+    auto suffix = dtype_suffix(out.dtype());
+    if (!suffix.empty()) {
+      eval_generic_unary_vulkan_or_cpu<Sigmoid>(
+          inputs, out, "sigmoid_" + suffix, stream());
+      return;
+    }
+  }
+  eval_cpu_fallback<Sigmoid>(inputs, out);
+}
+
 void Square::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
       out.dtype() == float32) {
@@ -372,6 +563,18 @@ void Sqrt::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
   eval_cpu_fallback<Sqrt>(inputs, out, state());
+}
+
+void Tanh::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+    auto suffix = dtype_suffix(out.dtype());
+    if (!suffix.empty()) {
+      eval_generic_unary_vulkan_or_cpu<Tanh>(
+          inputs, out, "tanh_" + suffix, stream());
+      return;
+    }
+  }
+  eval_cpu_fallback<Tanh>(inputs, out);
 }
 
 void Compiled::eval_gpu(
@@ -413,10 +616,10 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
   return true;
 }
 
-CPU_FALLBACK(Abs)
+// Abs implemented above.
 // Add implemented above.
 // AddMM implemented in matmul.cpp
-CPU_FALLBACK_STATE(Arange)
+// Arange implemented above.
 CPU_FALLBACK(ArcCos)
 CPU_FALLBACK(ArcCosh)
 CPU_FALLBACK(ArcSin)
@@ -430,7 +633,7 @@ CPU_FALLBACK_STATE(ArgSort)
 CPU_FALLBACK_STATE(BitwiseBinary)
 CPU_FALLBACK(BitwiseInvert)
 // BlockMaskedMM implemented in matmul.cpp
-CPU_FALLBACK(Ceil)
+// Ceil implemented above.
 // Compiled has CPU fallback above.
 CPU_FALLBACK(Conjugate)
 CPU_FALLBACK_STATE(Convolution)
@@ -442,10 +645,10 @@ CPU_FALLBACK(Remainder)
 // Equal has CPU fallback above.
 CPU_FALLBACK(Erf)
 CPU_FALLBACK(ErfInv)
-CPU_FALLBACK(Exp)
+// Exp implemented above.
 CPU_FALLBACK(Expm1)
 CPU_FALLBACK_STATE(FFT)
-CPU_FALLBACK(Floor)
+// Floor implemented above.
 CPU_FALLBACK_STATE(Gather)
 CPU_FALLBACK_STATE(GatherAxis)
 CPU_FALLBACK_STATE(GatherMM)
@@ -469,7 +672,7 @@ CPU_FALLBACK_MULTI(LUF)
 // Maximum has CPU fallback above.
 // Minimum has CPU fallback above.
 // Multiply implemented above.
-CPU_FALLBACK(Negative)
+// Negative implemented above.
 CPU_FALLBACK(NotEqual)
 CPU_FALLBACK_STATE(Partition)
 CPU_FALLBACK(Power)
@@ -479,13 +682,13 @@ CPU_FALLBACK_STATE(QQMatmul)
 // RandomBits has CPU fallback above.
 CPU_FALLBACK(Real)
 // Reduce has CPU fallback above.
-CPU_FALLBACK(Round)
+// Round implemented above.
 CPU_FALLBACK_STATE(Scan)
 CPU_FALLBACK_STATE(Scatter)
 CPU_FALLBACK_STATE(ScatterAxis)
 CPU_FALLBACK(Select)
 CPU_FALLBACK(SegmentedMM)
-CPU_FALLBACK(Sigmoid)
+// Sigmoid implemented above.
 CPU_FALLBACK(Sign)
 // Sin implemented above.
 CPU_FALLBACK(Sinh)
@@ -496,7 +699,7 @@ CPU_FALLBACK_STATE(Sort)
 // Subtract implemented above.
 CPU_FALLBACK_MULTI_STATE(SVD)
 CPU_FALLBACK(Tan)
-CPU_FALLBACK(Tanh)
+// Tanh implemented above.
 CPU_FALLBACK_STATE(Inverse)
 CPU_FALLBACK_STATE(Cholesky)
 CPU_FALLBACK_MULTI_STATE(Eigh)
