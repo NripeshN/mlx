@@ -177,7 +177,7 @@ tests/             # C++ unit tests
 - Shaders should be compiled automatically by CMake; check build output if shaders fail
 - When you complete a task, send me a push notification:
 ```shell
-curl -X POST https://api.getmoshi.app/api/webhook \
+curl -s -X POST https://api.getmoshi.app/api/webhook \
   -H "Content-Type: application/json" \
   -d '{"token": "Xjqyek7li0vXgBnIlvXEn3VJgdhWf8qW", "title": "Done", "message": "Brief summary"}'
 ```

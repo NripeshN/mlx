@@ -57,6 +57,20 @@ bool is_supported_copy_layout(const mlx::core::array& arr) {
 std::string get_copy_shader_name(
     const mlx::core::array& in,
     mlx::core::array& out) {
+  // Fast transpose path: source is column-contiguous and destination is
+  // row-contiguous with identical shape/dtype.
+  if (in.dtype() == out.dtype() && in.shape() == out.shape() &&
+      in.ndim() >= 2 && in.ndim() <= 4 && in.flags().col_contiguous &&
+      out.flags().row_contiguous) {
+    const size_t item_size = size_of(in.dtype());
+    if (item_size == 2) {
+      return "cpy_transpose_16";
+    }
+    if (item_size == 4) {
+      return "cpy_transpose_32";
+    }
+  }
+
   auto src_suffix = copy_dtype_suffix(in.dtype());
   auto dst_suffix = copy_dtype_suffix(out.dtype());
   if (src_suffix.empty() || dst_suffix.empty()) {
