@@ -5,6 +5,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include "mlx/backend/vulkan/vulkan.h"
@@ -144,8 +145,297 @@ VkDescriptorBufferInfo make_buffer_info(const array& arr, const char* name) {
   return info;
 }
 
-bool shader_uses_partial_binding(const std::string& shader_name) {
-  return shader_name.rfind("add_", 0) == 0;
+enum class DispatchGridKind {
+  ElementWise,
+  Linear1D,
+};
+
+enum class KernelSpecId {
+  Binary,
+  BinaryAddWithPartials,
+  Unary,
+  GenericUnary,
+  Arange,
+};
+
+struct KernelSpec {
+  std::array<uint32_t, 4> bindings{};
+  uint32_t binding_count{0};
+  uint32_t push_constant_size{0};
+  DispatchGridKind grid_kind{DispatchGridKind::ElementWise};
+};
+
+struct BoundArray {
+  const array* arr;
+  const char* name;
+};
+
+constexpr KernelSpec make_kernel_spec(
+    std::array<uint32_t, 4> bindings,
+    uint32_t binding_count,
+    uint32_t push_constant_size,
+    DispatchGridKind grid_kind) {
+  return {bindings, binding_count, push_constant_size, grid_kind};
+}
+
+constexpr std::array<KernelSpec, 5> kKernelSpecs = {
+    make_kernel_spec(
+        {0, 1, 2, 0},
+        3,
+        sizeof(BinaryPushConstants),
+        DispatchGridKind::ElementWise),
+    make_kernel_spec(
+        {0, 1, 2, 3},
+        4,
+        sizeof(BinaryPushConstants),
+        DispatchGridKind::ElementWise),
+    make_kernel_spec(
+        {0, 1, 0, 0},
+        2,
+        sizeof(UnaryPushConstants),
+        DispatchGridKind::ElementWise),
+    make_kernel_spec(
+        {0, 1, 0, 0},
+        2,
+        sizeof(GenericPushConstants),
+        DispatchGridKind::ElementWise),
+    make_kernel_spec(
+        {0, 0, 0, 0},
+        1,
+        sizeof(GenericPushConstants),
+        DispatchGridKind::Linear1D),
+};
+
+size_t kernel_spec_index(KernelSpecId id) {
+  return static_cast<size_t>(id);
+}
+
+const KernelSpec& get_kernel_spec(KernelSpecId id) {
+  return kKernelSpecs[kernel_spec_index(id)];
+}
+
+KernelSpecId kernel_spec_id_for_binary_variant(BinaryDispatchVariant variant) {
+  switch (variant) {
+    case BinaryDispatchVariant::Standard:
+      return KernelSpecId::Binary;
+    case BinaryDispatchVariant::AddWithPartials:
+      return KernelSpecId::BinaryAddWithPartials;
+  }
+
+  throw std::runtime_error(
+      "[vulkan::kernels] Unsupported binary dispatch variant.");
+}
+
+std::vector<VkDescriptorSetLayoutBinding> make_layout_bindings(
+    const KernelSpec& spec) {
+  std::vector<VkDescriptorSetLayoutBinding> bindings;
+  bindings.reserve(spec.binding_count);
+  for (size_t i = 0; i < spec.binding_count; ++i) {
+    bindings.push_back(make_storage_buffer_binding(spec.bindings[i]));
+  }
+  return bindings;
+}
+
+std::tuple<uint32_t, uint32_t, uint32_t> get_dispatch_grid_dims(
+    DispatchGridKind grid_kind,
+    uint32_t num_elements) {
+  switch (grid_kind) {
+    case DispatchGridKind::ElementWise:
+      return get_element_wise_grid_dims(num_elements, VULKAN_INDEX_TILE_SIZE);
+    case DispatchGridKind::Linear1D:
+      return {
+          (num_elements + VULKAN_INDEX_TILE_SIZE - 1) / VULKAN_INDEX_TILE_SIZE,
+          1,
+          1};
+  }
+
+  throw std::runtime_error("[vulkan::kernels] Unsupported dispatch grid kind.");
+}
+
+BinaryPushConstants make_binary_push_constants(
+    const array& a,
+    const array& b,
+    const array& out,
+    float param1 = 0.0f,
+    float param2 = 0.0f,
+    int32_t param3 = 0) {
+  const auto a_layout = make_tensor_layout_4d(a, "src0");
+  const auto b_layout = make_tensor_layout_4d(b, "src1");
+  const auto d_layout = make_tensor_layout_4d(out, "dst");
+
+  BinaryPushConstants push_constants{};
+  push_constants.ne = checked_u32(out.size(), "binary element count");
+  push_constants.ne00 = a_layout.ne00;
+  push_constants.ne01 = a_layout.ne01;
+  push_constants.ne02 = a_layout.ne02;
+  push_constants.ne03 = a_layout.ne03;
+  push_constants.nb00 = a_layout.nb00;
+  push_constants.nb01 = a_layout.nb01;
+  push_constants.nb02 = a_layout.nb02;
+  push_constants.nb03 = a_layout.nb03;
+  push_constants.ne10 = b_layout.ne00;
+  push_constants.ne11 = b_layout.ne01;
+  push_constants.ne12 = b_layout.ne02;
+  push_constants.ne13 = b_layout.ne03;
+  push_constants.nb10 = b_layout.nb00;
+  push_constants.nb11 = b_layout.nb01;
+  push_constants.nb12 = b_layout.nb02;
+  push_constants.nb13 = b_layout.nb03;
+  push_constants.ne20 = d_layout.ne00;
+  push_constants.ne21 = d_layout.ne01;
+  push_constants.ne22 = d_layout.ne02;
+  push_constants.ne23 = d_layout.ne03;
+  push_constants.nb20 = d_layout.nb00;
+  push_constants.nb21 = d_layout.nb01;
+  push_constants.nb22 = d_layout.nb02;
+  push_constants.nb23 = d_layout.nb03;
+  const uint32_t a_offset = checked_offset(a, "src0", 0xFFFFu);
+  const uint32_t b_offset = checked_offset(b, "src1", 0xFFu);
+  const uint32_t d_offset = checked_offset(out, "dst", 0xFFu);
+  push_constants.misalign_offsets =
+      (a_offset << 16) | (b_offset << 8) | d_offset;
+  push_constants.param1 = param1;
+  push_constants.param2 = param2;
+  push_constants.param3 = param3;
+
+  return push_constants;
+}
+
+UnaryPushConstants make_unary_push_constants(
+    const array& in,
+    const array& out,
+    float param1,
+    float param2) {
+  const auto in_layout = make_tensor_layout_4d(in, "src0");
+  const auto out_layout = make_tensor_layout_4d(out, "dst");
+
+  UnaryPushConstants push_constants{};
+  push_constants.ne = checked_u32(out.size(), "unary element count");
+  push_constants.ne00 = in_layout.ne00;
+  push_constants.ne01 = in_layout.ne01;
+  push_constants.ne02 = in_layout.ne02;
+  push_constants.ne03 = in_layout.ne03;
+  push_constants.nb00 = in_layout.nb00;
+  push_constants.nb01 = in_layout.nb01;
+  push_constants.nb02 = in_layout.nb02;
+  push_constants.nb03 = in_layout.nb03;
+  push_constants.ne10 = out_layout.ne00;
+  push_constants.ne11 = out_layout.ne01;
+  push_constants.ne12 = out_layout.ne02;
+  push_constants.ne13 = out_layout.ne03;
+  push_constants.nb10 = out_layout.nb00;
+  push_constants.nb11 = out_layout.nb01;
+  push_constants.nb12 = out_layout.nb02;
+  push_constants.nb13 = out_layout.nb03;
+  const uint32_t a_offset = checked_offset(in, "src0", 0xFFFFu);
+  const uint32_t d_offset = checked_offset(out, "dst", 0xFFFFu);
+  push_constants.misalign_offsets = (a_offset << 16) | d_offset;
+  push_constants.param1 = param1;
+  push_constants.param2 = param2;
+  init_unary_fastdiv(push_constants);
+
+  return push_constants;
+}
+
+GenericPushConstants make_generic_push_constants(
+    uint32_t kx,
+    float param1,
+    float param2,
+    float param3,
+    float param4) {
+  GenericPushConstants push_constants{};
+  push_constants.KX = kx;
+  push_constants.KY = 1;
+  push_constants.param1 = param1;
+  push_constants.param2 = param2;
+  push_constants.param3 = param3;
+  push_constants.param4 = param4;
+  return push_constants;
+}
+
+template <typename PushConstants>
+void dispatch_with_spec(
+    const std::string& shader_name,
+    KernelSpecId spec_id,
+    std::span<const BoundArray> bound_arrays,
+    const PushConstants& push_constants,
+    uint32_t num_elements,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s) {
+  if (num_elements == 0) {
+    return;
+  }
+
+  const auto& spec = get_kernel_spec(spec_id);
+  if (bound_arrays.size() != spec.binding_count) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Kernel bindings do not match registered "
+        "KernelSpec.");
+  }
+  if (sizeof(PushConstants) != spec.push_constant_size) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Push constant size does not match registered "
+        "KernelSpec.");
+  }
+
+  auto bindings = make_layout_bindings(spec);
+
+  auto& manager = KernelManager::get();
+  auto* pipeline = manager.get_pipeline(
+      shader_name, bindings, static_cast<uint32_t>(sizeof(PushConstants)));
+  VkDescriptorSet descriptor_set =
+      manager.allocate_descriptor_set(pipeline->descriptor_layout);
+  manager.defer_descriptor_set_free(s.index, descriptor_set);
+
+  std::array<VkDescriptorBufferInfo, 4> descriptor_infos{};
+  std::array<VkWriteDescriptorSet, 4> descriptor_writes{};
+
+  for (size_t i = 0; i < bound_arrays.size(); ++i) {
+    if (bound_arrays[i].arr == nullptr) {
+      throw std::runtime_error("[vulkan::kernels] Missing bound array.");
+    }
+
+    descriptor_infos[i] =
+        make_buffer_info(*bound_arrays[i].arr, bound_arrays[i].name);
+    auto& write = descriptor_writes[i];
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = descriptor_set;
+    write.dstBinding = spec.bindings[i];
+    write.dstArrayElement = 0;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.descriptorCount = 1;
+    write.pBufferInfo = &descriptor_infos[i];
+  }
+
+  vkUpdateDescriptorSets(
+      VulkanContext::get().device(),
+      static_cast<uint32_t>(bound_arrays.size()),
+      descriptor_writes.data(),
+      0,
+      nullptr);
+
+  vkCmdBindPipeline(
+      cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+  vkCmdBindDescriptorSets(
+      cmd_buffer,
+      VK_PIPELINE_BIND_POINT_COMPUTE,
+      pipeline->layout,
+      0,
+      1,
+      &descriptor_set,
+      0,
+      nullptr);
+  vkCmdPushConstants(
+      cmd_buffer,
+      pipeline->layout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0,
+      static_cast<uint32_t>(sizeof(PushConstants)),
+      &push_constants);
+
+  auto [grid_x, grid_y, grid_z] =
+      get_dispatch_grid_dims(spec.grid_kind, num_elements);
+  vkCmdDispatch(cmd_buffer, grid_x, grid_y, grid_z);
 }
 
 } // namespace
@@ -478,119 +768,42 @@ void dispatch_binary_op(
     array& out,
     const std::string& shader_name,
     VkCommandBuffer cmd_buffer,
-    const Stream& s) {
-  if (out.size() == 0) {
+    const Stream& s,
+    BinaryDispatchVariant variant) {
+  const auto push_constants = make_binary_push_constants(a, b, out);
+  const auto spec_id = kernel_spec_id_for_binary_variant(variant);
+
+  if (variant == BinaryDispatchVariant::AddWithPartials) {
+    const std::array<BoundArray, 4> bound_arrays = {{
+        {&a, "src0"},
+        {&b, "src1"},
+        {&out, "dst"},
+        {&out, "partial"},
+    }};
+    dispatch_with_spec(
+        shader_name,
+        spec_id,
+        bound_arrays,
+        push_constants,
+        push_constants.ne,
+        cmd_buffer,
+        s);
     return;
   }
 
-  auto& manager = KernelManager::get();
-  std::vector<VkDescriptorSetLayoutBinding> bindings = {
-      make_storage_buffer_binding(0),
-      make_storage_buffer_binding(1),
-      make_storage_buffer_binding(2),
-  };
-  if (shader_uses_partial_binding(shader_name)) {
-    bindings.push_back(make_storage_buffer_binding(3));
-  }
-
-  auto* pipeline =
-      manager.get_pipeline(shader_name, bindings, sizeof(BinaryPushConstants));
-  VkDescriptorSet descriptor_set =
-      manager.allocate_descriptor_set(pipeline->descriptor_layout);
-  manager.defer_descriptor_set_free(s.index, descriptor_set);
-
-  std::array<VkDescriptorBufferInfo, 4> descriptor_infos{};
-  std::array<VkWriteDescriptorSet, 4> descriptor_writes{};
-  uint32_t descriptor_count = 0;
-
-  auto add_binding = [&](uint32_t binding, const array& arr, const char* name) {
-    descriptor_infos[descriptor_count] = make_buffer_info(arr, name);
-    auto& write = descriptor_writes[descriptor_count];
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptor_set;
-    write.dstBinding = binding;
-    write.dstArrayElement = 0;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    write.descriptorCount = 1;
-    write.pBufferInfo = &descriptor_infos[descriptor_count];
-    descriptor_count++;
-  };
-
-  add_binding(0, a, "src0");
-  add_binding(1, b, "src1");
-  add_binding(2, out, "dst");
-  if (shader_uses_partial_binding(shader_name)) {
-    add_binding(3, out, "partial");
-  }
-
-  vkUpdateDescriptorSets(
-      VulkanContext::get().device(),
-      descriptor_count,
-      descriptor_writes.data(),
-      0,
-      nullptr);
-
-  const auto a_layout = make_tensor_layout_4d(a, "src0");
-  const auto b_layout = make_tensor_layout_4d(b, "src1");
-  const auto d_layout = make_tensor_layout_4d(out, "dst");
-
-  BinaryPushConstants push_constants{};
-  push_constants.ne = checked_u32(out.size(), "binary element count");
-  push_constants.ne00 = a_layout.ne00;
-  push_constants.ne01 = a_layout.ne01;
-  push_constants.ne02 = a_layout.ne02;
-  push_constants.ne03 = a_layout.ne03;
-  push_constants.nb00 = a_layout.nb00;
-  push_constants.nb01 = a_layout.nb01;
-  push_constants.nb02 = a_layout.nb02;
-  push_constants.nb03 = a_layout.nb03;
-  push_constants.ne10 = b_layout.ne00;
-  push_constants.ne11 = b_layout.ne01;
-  push_constants.ne12 = b_layout.ne02;
-  push_constants.ne13 = b_layout.ne03;
-  push_constants.nb10 = b_layout.nb00;
-  push_constants.nb11 = b_layout.nb01;
-  push_constants.nb12 = b_layout.nb02;
-  push_constants.nb13 = b_layout.nb03;
-  push_constants.ne20 = d_layout.ne00;
-  push_constants.ne21 = d_layout.ne01;
-  push_constants.ne22 = d_layout.ne02;
-  push_constants.ne23 = d_layout.ne03;
-  push_constants.nb20 = d_layout.nb00;
-  push_constants.nb21 = d_layout.nb01;
-  push_constants.nb22 = d_layout.nb02;
-  push_constants.nb23 = d_layout.nb03;
-  const uint32_t a_offset = checked_offset(a, "src0", 0xFFFFu);
-  const uint32_t b_offset = checked_offset(b, "src1", 0xFFu);
-  const uint32_t d_offset = checked_offset(out, "dst", 0xFFu);
-  push_constants.misalign_offsets =
-      (a_offset << 16) | (b_offset << 8) | d_offset;
-  push_constants.param1 = 0.0f;
-  push_constants.param2 = 0.0f;
-  push_constants.param3 = 0;
-
-  vkCmdBindPipeline(
-      cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-  vkCmdBindDescriptorSets(
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&a, "src0"},
+      {&b, "src1"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      spec_id,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
       cmd_buffer,
-      VK_PIPELINE_BIND_POINT_COMPUTE,
-      pipeline->layout,
-      0,
-      1,
-      &descriptor_set,
-      0,
-      nullptr);
-  vkCmdPushConstants(
-      cmd_buffer,
-      pipeline->layout,
-      VK_SHADER_STAGE_COMPUTE_BIT,
-      0,
-      sizeof(BinaryPushConstants),
-      &push_constants);
-
-  auto [grid_x, grid_y, grid_z] =
-      get_element_wise_grid_dims(out.size(), VULKAN_INDEX_TILE_SIZE);
-  vkCmdDispatch(cmd_buffer, grid_x, grid_y, grid_z);
+      s);
 }
 
 void dispatch_unary_op(
@@ -601,95 +814,20 @@ void dispatch_unary_op(
     const Stream& s,
     float param1,
     float param2) {
-  if (out.size() == 0) {
-    return;
-  }
-
-  auto& manager = KernelManager::get();
-  std::vector<VkDescriptorSetLayoutBinding> bindings = {
-      make_storage_buffer_binding(0),
-      make_storage_buffer_binding(1),
-  };
-
-  auto* pipeline =
-      manager.get_pipeline(shader_name, bindings, sizeof(UnaryPushConstants));
-  VkDescriptorSet descriptor_set =
-      manager.allocate_descriptor_set(pipeline->descriptor_layout);
-  manager.defer_descriptor_set_free(s.index, descriptor_set);
-
-  std::array<VkDescriptorBufferInfo, 2> descriptor_infos{};
-  std::array<VkWriteDescriptorSet, 2> descriptor_writes{};
-  descriptor_infos[0] = make_buffer_info(in, "src0");
-  descriptor_infos[1] = make_buffer_info(out, "dst");
-
-  for (uint32_t i = 0; i < descriptor_writes.size(); ++i) {
-    auto& write = descriptor_writes[i];
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptor_set;
-    write.dstBinding = i;
-    write.dstArrayElement = 0;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    write.descriptorCount = 1;
-    write.pBufferInfo = &descriptor_infos[i];
-  }
-
-  vkUpdateDescriptorSets(
-      VulkanContext::get().device(),
-      static_cast<uint32_t>(descriptor_writes.size()),
-      descriptor_writes.data(),
-      0,
-      nullptr);
-
-  const auto in_layout = make_tensor_layout_4d(in, "src0");
-  const auto out_layout = make_tensor_layout_4d(out, "dst");
-
-  UnaryPushConstants push_constants{};
-  push_constants.ne = checked_u32(out.size(), "unary element count");
-  push_constants.ne00 = in_layout.ne00;
-  push_constants.ne01 = in_layout.ne01;
-  push_constants.ne02 = in_layout.ne02;
-  push_constants.ne03 = in_layout.ne03;
-  push_constants.nb00 = in_layout.nb00;
-  push_constants.nb01 = in_layout.nb01;
-  push_constants.nb02 = in_layout.nb02;
-  push_constants.nb03 = in_layout.nb03;
-  push_constants.ne10 = out_layout.ne00;
-  push_constants.ne11 = out_layout.ne01;
-  push_constants.ne12 = out_layout.ne02;
-  push_constants.ne13 = out_layout.ne03;
-  push_constants.nb10 = out_layout.nb00;
-  push_constants.nb11 = out_layout.nb01;
-  push_constants.nb12 = out_layout.nb02;
-  push_constants.nb13 = out_layout.nb03;
-  const uint32_t a_offset = checked_offset(in, "src0", 0xFFFFu);
-  const uint32_t d_offset = checked_offset(out, "dst", 0xFFFFu);
-  push_constants.misalign_offsets = (a_offset << 16) | d_offset;
-  push_constants.param1 = param1;
-  push_constants.param2 = param2;
-  init_unary_fastdiv(push_constants);
-
-  vkCmdBindPipeline(
-      cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-  vkCmdBindDescriptorSets(
+  const auto push_constants =
+      make_unary_push_constants(in, out, param1, param2);
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src0"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::Unary,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
       cmd_buffer,
-      VK_PIPELINE_BIND_POINT_COMPUTE,
-      pipeline->layout,
-      0,
-      1,
-      &descriptor_set,
-      0,
-      nullptr);
-  vkCmdPushConstants(
-      cmd_buffer,
-      pipeline->layout,
-      VK_SHADER_STAGE_COMPUTE_BIT,
-      0,
-      sizeof(UnaryPushConstants),
-      &push_constants);
-
-  auto [grid_x, grid_y, grid_z] =
-      get_element_wise_grid_dims(out.size(), VULKAN_INDEX_TILE_SIZE);
-  vkCmdDispatch(cmd_buffer, grid_x, grid_y, grid_z);
+      s);
 }
 
 void dispatch_generic_unary_op(
@@ -702,75 +840,23 @@ void dispatch_generic_unary_op(
     float param2,
     float param3,
     float param4) {
-  if (out.size() == 0) {
-    return;
-  }
+  const auto element_count =
+      checked_u32(out.size(), "generic unary element count");
+  const auto push_constants = make_generic_push_constants(
+      element_count, param1, param2, param3, param4);
 
-  auto& manager = KernelManager::get();
-  std::vector<VkDescriptorSetLayoutBinding> bindings = {
-      make_storage_buffer_binding(0),
-      make_storage_buffer_binding(1),
-  };
-
-  auto* pipeline =
-      manager.get_pipeline(shader_name, bindings, sizeof(GenericPushConstants));
-  VkDescriptorSet descriptor_set =
-      manager.allocate_descriptor_set(pipeline->descriptor_layout);
-  manager.defer_descriptor_set_free(s.index, descriptor_set);
-
-  std::array<VkDescriptorBufferInfo, 2> descriptor_infos{};
-  std::array<VkWriteDescriptorSet, 2> descriptor_writes{};
-  descriptor_infos[0] = make_buffer_info(in, "src0");
-  descriptor_infos[1] = make_buffer_info(out, "dst");
-
-  for (uint32_t i = 0; i < descriptor_writes.size(); ++i) {
-    auto& write = descriptor_writes[i];
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = descriptor_set;
-    write.dstBinding = i;
-    write.dstArrayElement = 0;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    write.descriptorCount = 1;
-    write.pBufferInfo = &descriptor_infos[i];
-  }
-
-  vkUpdateDescriptorSets(
-      VulkanContext::get().device(),
-      static_cast<uint32_t>(descriptor_writes.size()),
-      descriptor_writes.data(),
-      0,
-      nullptr);
-
-  GenericPushConstants push_constants{};
-  push_constants.KX = checked_u32(out.size(), "generic unary element count");
-  push_constants.KY = 1;
-  push_constants.param1 = param1;
-  push_constants.param2 = param2;
-  push_constants.param3 = param3;
-  push_constants.param4 = param4;
-
-  vkCmdBindPipeline(
-      cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-  vkCmdBindDescriptorSets(
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src0"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::GenericUnary,
+      bound_arrays,
+      push_constants,
+      push_constants.KX,
       cmd_buffer,
-      VK_PIPELINE_BIND_POINT_COMPUTE,
-      pipeline->layout,
-      0,
-      1,
-      &descriptor_set,
-      0,
-      nullptr);
-  vkCmdPushConstants(
-      cmd_buffer,
-      pipeline->layout,
-      VK_SHADER_STAGE_COMPUTE_BIT,
-      0,
-      sizeof(GenericPushConstants),
-      &push_constants);
-
-  auto [grid_x, grid_y, grid_z] =
-      get_element_wise_grid_dims(out.size(), VULKAN_INDEX_TILE_SIZE);
-  vkCmdDispatch(cmd_buffer, grid_x, grid_y, grid_z);
+      s);
 }
 
 void dispatch_arange_op(
@@ -780,65 +866,19 @@ void dispatch_arange_op(
     const Stream& s,
     float start,
     float step) {
-  if (out.size() == 0) {
-    return;
-  }
-
-  auto& manager = KernelManager::get();
-  std::vector<VkDescriptorSetLayoutBinding> bindings = {
-      make_storage_buffer_binding(0),
-  };
-
-  auto* pipeline =
-      manager.get_pipeline(shader_name, bindings, sizeof(GenericPushConstants));
-  VkDescriptorSet descriptor_set =
-      manager.allocate_descriptor_set(pipeline->descriptor_layout);
-  manager.defer_descriptor_set_free(s.index, descriptor_set);
-
-  VkDescriptorBufferInfo descriptor_info = make_buffer_info(out, "dst");
-  VkWriteDescriptorSet descriptor_write{};
-  descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  descriptor_write.dstSet = descriptor_set;
-  descriptor_write.dstBinding = 0;
-  descriptor_write.dstArrayElement = 0;
-  descriptor_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  descriptor_write.descriptorCount = 1;
-  descriptor_write.pBufferInfo = &descriptor_info;
-
-  vkUpdateDescriptorSets(
-      VulkanContext::get().device(), 1, &descriptor_write, 0, nullptr);
-
   const auto num_elements = checked_u32(out.size(), "arange element count");
-  GenericPushConstants push_constants{};
-  push_constants.KX = num_elements;
-  push_constants.KY = 1;
-  push_constants.param1 = start;
-  push_constants.param2 = step;
-  push_constants.param3 = 0.0f;
-  push_constants.param4 = 0.0f;
+  const auto push_constants =
+      make_generic_push_constants(num_elements, start, step, 0.0f, 0.0f);
+  const std::array<BoundArray, 1> bound_arrays = {{{&out, "dst"}}};
 
-  vkCmdBindPipeline(
-      cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-  vkCmdBindDescriptorSets(
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::Arange,
+      bound_arrays,
+      push_constants,
+      push_constants.KX,
       cmd_buffer,
-      VK_PIPELINE_BIND_POINT_COMPUTE,
-      pipeline->layout,
-      0,
-      1,
-      &descriptor_set,
-      0,
-      nullptr);
-  vkCmdPushConstants(
-      cmd_buffer,
-      pipeline->layout,
-      VK_SHADER_STAGE_COMPUTE_BIT,
-      0,
-      sizeof(GenericPushConstants),
-      &push_constants);
-
-  const uint32_t grid_x =
-      (num_elements + VULKAN_INDEX_TILE_SIZE - 1) / VULKAN_INDEX_TILE_SIZE;
-  vkCmdDispatch(cmd_buffer, grid_x, 1, 1);
+      s);
 }
 
 } // namespace mlx::core::vulkan

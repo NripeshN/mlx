@@ -150,6 +150,15 @@ bool is_supported_generic_unary_layout(const array& arr) {
 }
 
 template <typename Primitive>
+constexpr vulkan::BinaryDispatchVariant binary_dispatch_variant() {
+  if constexpr (std::is_same_v<Primitive, Add>) {
+    return vulkan::BinaryDispatchVariant::AddWithPartials;
+  } else {
+    return vulkan::BinaryDispatchVariant::Standard;
+  }
+}
+
+template <typename Primitive>
 bool try_eval_binary_op_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -206,7 +215,14 @@ bool try_eval_binary_op_vulkan(
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_binary_op(a, b, out, shader_name, command_buffer, s);
+    vulkan::dispatch_binary_op(
+        a,
+        b,
+        out,
+        shader_name,
+        command_buffer,
+        s,
+        binary_dispatch_variant<Primitive>());
     vulkan::end_command_recording(s.index);
     return true;
   } catch (const std::runtime_error&) {
@@ -339,6 +355,27 @@ void eval_generic_unary_vulkan_or_cpu(
   eval_cpu_fallback<Primitive>(inputs, out);
 }
 
+template <typename Primitive>
+void eval_generic_unary_suffix_vulkan_or_cpu(
+    const std::vector<array>& inputs,
+    array& out,
+    std::string_view op_name,
+    Stream s,
+    bool f16_with_rte = false) {
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+    auto suffix = dtype_suffix(out.dtype());
+    if (!suffix.empty()) {
+      std::string shader_name = std::string(op_name) + "_" + suffix;
+      if (f16_with_rte && out.dtype() == float16) {
+        shader_name += "_rte";
+      }
+      eval_generic_unary_vulkan_or_cpu<Primitive>(inputs, out, shader_name, s);
+      return;
+    }
+  }
+  eval_cpu_fallback<Primitive>(inputs, out);
+}
+
 bool try_eval_arange_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -412,39 +449,35 @@ bool try_eval_arange_vulkan(
     throw std::runtime_error(#func " has no Vulkan implementation."); \
   }
 
+#define VULKAN_BINARY_GPU(func, op_name)                              \
+  void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
+    eval_binary_vulkan_or_cpu<func>(inputs, out, op_name, stream());  \
+  }
+
+#define VULKAN_GENERIC_UNARY_GPU(func, op_name)                       \
+  void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
+    eval_generic_unary_suffix_vulkan_or_cpu<func>(                    \
+        inputs, out, op_name, stream());                              \
+  }
+
+#define VULKAN_GENERIC_UNARY_RTE_GPU(func, op_name)                   \
+  void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
+    eval_generic_unary_suffix_vulkan_or_cpu<func>(                    \
+        inputs, out, op_name, stream(), true);                        \
+  }
+
 CPU_FALLBACK_STATE(Equal)
 CPU_FALLBACK_STATE(Reduce)
 CPU_FALLBACK(Minimum)
 CPU_FALLBACK(Maximum)
 CPU_FALLBACK_STATE(RandomBits)
 
-void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
-  eval_binary_vulkan_or_cpu<Add>(inputs, out, "add", stream());
-}
+VULKAN_BINARY_GPU(Add, "add")
+VULKAN_BINARY_GPU(Divide, "div")
+VULKAN_BINARY_GPU(Subtract, "sub")
+VULKAN_BINARY_GPU(Multiply, "mul")
 
-void Divide::eval_gpu(const std::vector<array>& inputs, array& out) {
-  eval_binary_vulkan_or_cpu<Divide>(inputs, out, "div", stream());
-}
-
-void Subtract::eval_gpu(const std::vector<array>& inputs, array& out) {
-  eval_binary_vulkan_or_cpu<Subtract>(inputs, out, "sub", stream());
-}
-
-void Multiply::eval_gpu(const std::vector<array>& inputs, array& out) {
-  eval_binary_vulkan_or_cpu<Multiply>(inputs, out, "mul", stream());
-}
-
-void Abs::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
-    auto suffix = dtype_suffix(out.dtype());
-    if (!suffix.empty()) {
-      eval_generic_unary_vulkan_or_cpu<Abs>(
-          inputs, out, "abs_" + suffix, stream());
-      return;
-    }
-  }
-  eval_cpu_fallback<Abs>(inputs, out);
-}
+VULKAN_GENERIC_UNARY_GPU(Abs, "abs")
 
 void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [start, stop, step] = state();
@@ -454,50 +487,15 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
   eval_cpu_fallback<Arange>(inputs, out, start, stop, step);
 }
 
-void Ceil::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
-    auto suffix = dtype_suffix(out.dtype());
-    if (!suffix.empty()) {
-      eval_generic_unary_vulkan_or_cpu<Ceil>(
-          inputs, out, "ceil_" + suffix, stream());
-      return;
-    }
-  }
-  eval_cpu_fallback<Ceil>(inputs, out);
-}
+VULKAN_GENERIC_UNARY_GPU(Ceil, "ceil")
 
 void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
   eval_cpu_fallback<Cos>(inputs, out);
 }
 
-void Exp::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
-    if (out.dtype() == float32) {
-      if (try_eval_generic_unary_op_vulkan<Exp>(
-              inputs, out, "exp_f32", stream())) {
-        return;
-      }
-    } else if (out.dtype() == float16) {
-      if (try_eval_generic_unary_op_vulkan<Exp>(
-              inputs, out, "exp_f16_rte", stream())) {
-        return;
-      }
-    }
-  }
-  eval_cpu_fallback<Exp>(inputs, out);
-}
+VULKAN_GENERIC_UNARY_RTE_GPU(Exp, "exp")
 
-void Floor::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
-    auto suffix = dtype_suffix(out.dtype());
-    if (!suffix.empty()) {
-      eval_generic_unary_vulkan_or_cpu<Floor>(
-          inputs, out, "floor_" + suffix, stream());
-      return;
-    }
-  }
-  eval_cpu_fallback<Floor>(inputs, out);
-}
+VULKAN_GENERIC_UNARY_GPU(Floor, "floor")
 
 void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
@@ -519,41 +517,11 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
   eval_cpu_fallback<Sin>(inputs, out);
 }
 
-void Negative::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
-    auto suffix = dtype_suffix(out.dtype());
-    if (!suffix.empty()) {
-      eval_generic_unary_vulkan_or_cpu<Negative>(
-          inputs, out, "neg_" + suffix, stream());
-      return;
-    }
-  }
-  eval_cpu_fallback<Negative>(inputs, out);
-}
+VULKAN_GENERIC_UNARY_GPU(Negative, "neg")
 
-void Round::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
-    auto suffix = dtype_suffix(out.dtype());
-    if (!suffix.empty()) {
-      eval_generic_unary_vulkan_or_cpu<Round>(
-          inputs, out, "round_" + suffix, stream());
-      return;
-    }
-  }
-  eval_cpu_fallback<Round>(inputs, out);
-}
+VULKAN_GENERIC_UNARY_GPU(Round, "round")
 
-void Sigmoid::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
-    auto suffix = dtype_suffix(out.dtype());
-    if (!suffix.empty()) {
-      eval_generic_unary_vulkan_or_cpu<Sigmoid>(
-          inputs, out, "sigmoid_" + suffix, stream());
-      return;
-    }
-  }
-  eval_cpu_fallback<Sigmoid>(inputs, out);
-}
+VULKAN_GENERIC_UNARY_GPU(Sigmoid, "sigmoid")
 
 void Square::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
@@ -573,17 +541,7 @@ void Sqrt::eval_gpu(const std::vector<array>& inputs, array& out) {
   eval_cpu_fallback<Sqrt>(inputs, out, state());
 }
 
-void Tanh::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
-    auto suffix = dtype_suffix(out.dtype());
-    if (!suffix.empty()) {
-      eval_generic_unary_vulkan_or_cpu<Tanh>(
-          inputs, out, "tanh_" + suffix, stream());
-      return;
-    }
-  }
-  eval_cpu_fallback<Tanh>(inputs, out);
-}
+VULKAN_GENERIC_UNARY_GPU(Tanh, "tanh")
 
 void Compiled::eval_gpu(
     const std::vector<array>& inputs,

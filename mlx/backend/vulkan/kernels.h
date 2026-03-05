@@ -159,6 +159,11 @@ struct GenericPushConstants {
   float param4;
 };
 
+enum class BinaryDispatchVariant {
+  Standard,
+  AddWithPartials,
+};
+
 // Helper functions for kernel dispatch
 void dispatch_binary_op(
     const array& a,
@@ -166,7 +171,8 @@ void dispatch_binary_op(
     array& out,
     const std::string& shader_name,
     VkCommandBuffer cmd_buffer,
-    const Stream& s);
+    const Stream& s,
+    BinaryDispatchVariant variant = BinaryDispatchVariant::Standard);
 
 void dispatch_unary_op(
     const array& in,
