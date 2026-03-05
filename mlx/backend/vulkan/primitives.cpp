@@ -586,6 +586,73 @@ bool try_eval_softmax_vulkan(
   }
 }
 
+bool try_eval_scan_cumsum_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Scan::ReduceType reduce_type,
+    int axis,
+    bool reverse,
+    bool inclusive,
+    Stream s) {
+  // Only support Sum scan for now
+  if (inputs.size() != 1 || reduce_type != Scan::Sum) {
+    return false;
+  }
+
+  // Don't support reverse or exclusive scans initially
+  if (reverse || !inclusive) {
+    return false;
+  }
+
+  const auto& in = inputs[0];
+  if (in.ndim() == 0 || in.dtype() != float32 || out.dtype() != float32) {
+    return false;
+  }
+
+  // Normalize axis and check it's the last axis
+  int normalized_axis = axis < 0 ? axis + in.ndim() : axis;
+  if (normalized_axis != in.ndim() - 1) {
+    return false;
+  }
+
+  set_unary_output_data(in, out);
+  if (!in.flags().contiguous || !out.flags().contiguous) {
+    return false;
+  }
+
+  if (in.offset() != 0 || out.offset() != 0) {
+    return false;
+  }
+
+  if (in.shape() != out.shape() || in.strides().back() != 1 ||
+      out.strides().back() != 1) {
+    return false;
+  }
+
+  if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out)) {
+    return false;
+  }
+
+  if (in.size() > std::numeric_limits<uint32_t>::max() ||
+      out.size() > std::numeric_limits<uint32_t>::max() ||
+      in.shape(in.ndim() - 1) > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  if (out.size() == 0) {
+    return true;
+  }
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_cumsum_op(in, out, "cumsum_f32", command_buffer, s);
+    vulkan::end_command_recording(s.index);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
 } // namespace
 
 #define CPU_FALLBACK(func)                                            \
@@ -744,6 +811,15 @@ void Sqrt::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 VULKAN_GENERIC_UNARY_GPU(Tanh, "tanh")
 
+void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto [reduce_type, axis, reverse, inclusive] = state();
+  if (try_eval_scan_cumsum_vulkan(
+          inputs, out, reduce_type, axis, reverse, inclusive, stream())) {
+    return;
+  }
+  eval_cpu_fallback<Scan>(inputs, out, reduce_type, axis, reverse, inclusive);
+}
+
 void Compiled::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
@@ -849,7 +925,7 @@ CPU_FALLBACK_STATE(QQMatmul)
 CPU_FALLBACK(Real)
 // Reduce implemented above.
 // Round implemented above.
-CPU_FALLBACK_STATE(Scan)
+// Scan implemented above.
 CPU_FALLBACK_STATE(Scatter)
 CPU_FALLBACK_STATE(ScatterAxis)
 CPU_FALLBACK(Select)

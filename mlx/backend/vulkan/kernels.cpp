@@ -1081,4 +1081,50 @@ void dispatch_softmax_op(
       s);
 }
 
+void dispatch_cumsum_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  if (in.ndim() == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Cumsum requires input rank >= 1.");
+  }
+
+  const uint32_t row_width =
+      checked_u32(in.shape(in.ndim() - 1), "cumsum n_cols");
+  if (row_width == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Cumsum requires non-zero row width.");
+  }
+
+  const uint32_t total_elements = checked_u32(out.size(), "cumsum elements");
+  if (total_elements % row_width != 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Cumsum elements are not divisible by row width.");
+  }
+  const uint32_t row_count = total_elements / row_width;
+
+  // cumsum uses same push constants as sum_rows
+  const auto push_constants = make_sum_rows_push_constants(in, out, 1.0f);
+
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src0"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::SumRows,
+      bound_arrays,
+      push_constants,
+      row_count,
+      cmd_buffer,
+      s);
+}
+
 } // namespace mlx::core::vulkan

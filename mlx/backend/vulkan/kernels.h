@@ -262,6 +262,13 @@ void dispatch_softmax_op(
     VkCommandBuffer cmd_buffer,
     const Stream& s);
 
+void dispatch_cumsum_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s);
+
 // Get workgroup dimensions for element-wise operations.
 // Returns (workgroup_count_x, workgroup_count_y, workgroup_count_z)
 // using ggml's 512-element tiling expected by get_idx().
