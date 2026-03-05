@@ -3,13 +3,43 @@
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/cpu/copy.h"
+#include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/vulkan.h"
+#include "mlx/primitives.h"
 #include "mlx/stream.h"
 
 #include <cstring>
+
+namespace {
+
+int64_t read_dynamic_index(const mlx::core::array& indices, size_t i) {
+  switch (indices.dtype()) {
+    case mlx::core::int8:
+      return static_cast<int64_t>(indices.data<int8_t>()[i]);
+    case mlx::core::uint8:
+      return static_cast<int64_t>(indices.data<uint8_t>()[i]);
+    case mlx::core::int16:
+      return static_cast<int64_t>(indices.data<int16_t>()[i]);
+    case mlx::core::uint16:
+      return static_cast<int64_t>(indices.data<uint16_t>()[i]);
+    case mlx::core::int32:
+      return static_cast<int64_t>(indices.data<int32_t>()[i]);
+    case mlx::core::uint32:
+      return static_cast<int64_t>(indices.data<uint32_t>()[i]);
+    case mlx::core::int64:
+      return static_cast<int64_t>(indices.data<int64_t>()[i]);
+    case mlx::core::uint64:
+      return static_cast<int64_t>(indices.data<uint64_t>()[i]);
+    default:
+      throw std::runtime_error(
+          "compute_dynamic_offset requires integer index types.");
+  }
+}
+
+} // namespace
 
 namespace mlx::core {
 
@@ -46,6 +76,7 @@ void copy_gpu_inplace(
   const bool raw_buffer_copy = same_dtype && ctype == CopyType::Vector;
 
   if (!raw_buffer_copy) {
+    gpu::synchronize(s);
     auto cpu_stream = default_stream(Device::cpu);
     copy_cpu_inplace(
         in,
@@ -144,7 +175,10 @@ void concatenate_gpu(
     array& out,
     int axis,
     const Stream& s) {
-  throw std::runtime_error("concatenate_gpu has no Vulkan implementation.");
+  auto cpu_stream = default_stream(Device::cpu);
+  Concatenate cpu_concatenate(cpu_stream, axis);
+  cpu_concatenate.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
 }
 
 array compute_dynamic_offset(
@@ -152,9 +186,30 @@ array compute_dynamic_offset(
     const Strides& strides,
     const std::vector<int>& axes,
     const Stream& s) {
-  throw std::runtime_error(
-      "compute_dynamic_offset has no Vulkan implementation.");
-  return array({});
+  if (indices.size() != axes.size()) {
+    throw std::runtime_error(
+        "compute_dynamic_offset expected indices.size() == axes.size().");
+  }
+
+  auto indices_eval = indices;
+  indices_eval.eval();
+
+  int64_t offset_value = 0;
+  for (size_t i = 0; i < axes.size(); ++i) {
+    int axis = axes[i];
+    if (axis < 0) {
+      axis += static_cast<int>(strides.size());
+    }
+    if (axis < 0 || axis >= static_cast<int>(strides.size())) {
+      throw std::out_of_range("compute_dynamic_offset axis out of range.");
+    }
+    offset_value += read_dynamic_index(indices_eval, i) * strides[axis];
+  }
+
+  array offset({1}, int64, nullptr, {});
+  offset.set_data(allocator::malloc(offset.itemsize()));
+  offset.data<int64_t>()[0] = offset_value;
+  return offset;
 }
 
 } // namespace mlx::core

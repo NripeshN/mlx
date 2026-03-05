@@ -5,8 +5,107 @@
 #include "mlx/backend/gpu/slicing.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
+#include "mlx/transforms.h"
+
+#include <tuple>
+#include <type_traits>
+#include <utility>
 
 namespace mlx::core {
+
+namespace {
+
+template <typename Primitive, typename... Args>
+void eval_cpu_fallback(
+    const std::vector<array>& inputs,
+    array& out,
+    Args&&... args) {
+  auto cpu_stream = default_stream(Device::cpu);
+  Primitive cpu_primitive(cpu_stream, std::forward<Args>(args)...);
+  cpu_primitive.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
+}
+
+template <typename Primitive, typename... Args>
+void eval_cpu_fallback_multi(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs,
+    Args&&... args) {
+  auto cpu_stream = default_stream(Device::cpu);
+  Primitive cpu_primitive(cpu_stream, std::forward<Args>(args)...);
+  cpu_primitive.eval_cpu(inputs, outputs);
+  synchronize(cpu_stream);
+}
+
+template <typename T, typename = void>
+struct is_tuple_like : std::false_type {};
+
+template <typename T>
+struct is_tuple_like<
+    T,
+    std::void_t<decltype(std::tuple_size<std::decay_t<T>>::value)>>
+    : std::true_type {};
+
+template <typename Primitive, typename State>
+void eval_cpu_fallback_with_state(
+    const std::vector<array>& inputs,
+    array& out,
+    State&& state) {
+  if constexpr (is_tuple_like<State>::value) {
+    std::apply(
+        [&](auto&&... state_args) {
+          eval_cpu_fallback<Primitive>(
+              inputs, out, std::forward<decltype(state_args)>(state_args)...);
+        },
+        std::forward<State>(state));
+  } else {
+    eval_cpu_fallback<Primitive>(inputs, out, std::forward<State>(state));
+  }
+}
+
+template <typename Primitive, typename State>
+void eval_cpu_fallback_multi_with_state(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs,
+    State&& state) {
+  if constexpr (is_tuple_like<State>::value) {
+    std::apply(
+        [&](auto&&... state_args) {
+          eval_cpu_fallback_multi<Primitive>(
+              inputs,
+              outputs,
+              std::forward<decltype(state_args)>(state_args)...);
+        },
+        std::forward<State>(state));
+  } else {
+    eval_cpu_fallback_multi<Primitive>(
+        inputs, outputs, std::forward<State>(state));
+  }
+}
+
+} // namespace
+
+#define CPU_FALLBACK(func)                                            \
+  void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
+    eval_cpu_fallback<func>(inputs, out);                             \
+  }
+
+#define CPU_FALLBACK_STATE(func)                                      \
+  void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
+    eval_cpu_fallback_with_state<func>(inputs, out, state());         \
+  }
+
+#define CPU_FALLBACK_MULTI(func)                                       \
+  void func::eval_gpu(                                                 \
+      const std::vector<array>& inputs, std::vector<array>& outputs) { \
+    eval_cpu_fallback_multi<func>(inputs, outputs);                    \
+  }
+
+#define CPU_FALLBACK_MULTI_STATE(func)                                  \
+  void func::eval_gpu(                                                  \
+      const std::vector<array>& inputs, std::vector<array>& outputs) {  \
+    eval_cpu_fallback_multi_with_state<func>(inputs, outputs, state()); \
+  }
 
 #define NO_GPU_MULTI(func)                                             \
   void func::eval_gpu(                                                 \
@@ -25,68 +124,29 @@ namespace mlx::core {
     throw std::runtime_error(#func " has no Vulkan implementation."); \
   }
 
-void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
+CPU_FALLBACK(Add)
+CPU_FALLBACK_STATE(Equal)
+CPU_FALLBACK_STATE(Reduce)
+CPU_FALLBACK(Divide)
+CPU_FALLBACK(Subtract)
+CPU_FALLBACK(Minimum)
+CPU_FALLBACK(Maximum)
+CPU_FALLBACK(Multiply)
+CPU_FALLBACK_STATE(RandomBits)
+
+void Compiled::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
   auto cpu_stream = default_stream(Device::cpu);
-  Add cpu_add(cpu_stream);
-  cpu_add.eval_cpu(inputs, out);
+  Compiled cpu_compiled(cpu_stream, inputs_, outputs_, tape_, constant_ids_);
+  cpu_compiled.eval_cpu(inputs, outputs);
   synchronize(cpu_stream);
 }
 
-void Equal::eval_gpu(const std::vector<array>& inputs, array& out) {
+void Load::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto cpu_stream = default_stream(Device::cpu);
-  Equal cpu_equal(cpu_stream, state());
-  cpu_equal.eval_cpu(inputs, out);
-  synchronize(cpu_stream);
-}
-
-void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
-  auto [reduce_type, axes] = state();
-  auto cpu_stream = default_stream(Device::cpu);
-  Reduce cpu_reduce(cpu_stream, reduce_type, axes);
-  cpu_reduce.eval_cpu(inputs, out);
-  synchronize(cpu_stream);
-}
-
-void Divide::eval_gpu(const std::vector<array>& inputs, array& out) {
-  auto cpu_stream = default_stream(Device::cpu);
-  Divide cpu_divide(cpu_stream);
-  cpu_divide.eval_cpu(inputs, out);
-  synchronize(cpu_stream);
-}
-
-void Subtract::eval_gpu(const std::vector<array>& inputs, array& out) {
-  auto cpu_stream = default_stream(Device::cpu);
-  Subtract cpu_subtract(cpu_stream);
-  cpu_subtract.eval_cpu(inputs, out);
-  synchronize(cpu_stream);
-}
-
-void Minimum::eval_gpu(const std::vector<array>& inputs, array& out) {
-  auto cpu_stream = default_stream(Device::cpu);
-  Minimum cpu_minimum(cpu_stream);
-  cpu_minimum.eval_cpu(inputs, out);
-  synchronize(cpu_stream);
-}
-
-void Maximum::eval_gpu(const std::vector<array>& inputs, array& out) {
-  auto cpu_stream = default_stream(Device::cpu);
-  Maximum cpu_maximum(cpu_stream);
-  cpu_maximum.eval_cpu(inputs, out);
-  synchronize(cpu_stream);
-}
-
-void Multiply::eval_gpu(const std::vector<array>& inputs, array& out) {
-  auto cpu_stream = default_stream(Device::cpu);
-  Multiply cpu_multiply(cpu_stream);
-  cpu_multiply.eval_cpu(inputs, out);
-  synchronize(cpu_stream);
-}
-
-void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
-  auto [shape, width] = state();
-  auto cpu_stream = default_stream(Device::cpu);
-  RandomBits cpu_random_bits(cpu_stream, shape, width);
-  cpu_random_bits.eval_cpu(inputs, out);
+  Load cpu_load(cpu_stream, reader_, offset_, swap_endianness_);
+  cpu_load.eval_cpu(inputs, out);
   synchronize(cpu_stream);
 }
 
@@ -113,95 +173,118 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
   return true;
 }
 
-NO_GPU(Abs)
+CPU_FALLBACK(Abs)
 // Add has CPU fallback above.
 // AddMM implemented in matmul.cpp
-NO_GPU(Arange)
-NO_GPU(ArcCos)
-NO_GPU(ArcCosh)
-NO_GPU(ArcSin)
-NO_GPU(ArcSinh)
-NO_GPU(ArcTan)
-NO_GPU(ArcTan2)
-NO_GPU(ArcTanh)
-NO_GPU(ArgPartition)
-NO_GPU(ArgReduce)
-NO_GPU(ArgSort)
-NO_GPU(BitwiseBinary)
-NO_GPU(BitwiseInvert)
+CPU_FALLBACK_STATE(Arange)
+CPU_FALLBACK(ArcCos)
+CPU_FALLBACK(ArcCosh)
+CPU_FALLBACK(ArcSin)
+CPU_FALLBACK(ArcSinh)
+CPU_FALLBACK(ArcTan)
+CPU_FALLBACK(ArcTan2)
+CPU_FALLBACK(ArcTanh)
+CPU_FALLBACK_STATE(ArgPartition)
+CPU_FALLBACK_STATE(ArgReduce)
+CPU_FALLBACK_STATE(ArgSort)
+CPU_FALLBACK_STATE(BitwiseBinary)
+CPU_FALLBACK(BitwiseInvert)
 // BlockMaskedMM implemented in matmul.cpp
-NO_GPU(Ceil)
-NO_GPU_MULTI(Compiled)
-NO_GPU(Conjugate)
-NO_GPU(Convolution)
-NO_GPU(Cos)
-NO_GPU(Cosh)
+CPU_FALLBACK(Ceil)
+// Compiled has CPU fallback above.
+CPU_FALLBACK(Conjugate)
+CPU_FALLBACK_STATE(Convolution)
+CPU_FALLBACK(Cos)
+CPU_FALLBACK(Cosh)
 // Divide has CPU fallback above.
-NO_GPU_MULTI(DivMod)
-NO_GPU(Remainder)
+CPU_FALLBACK_MULTI(DivMod)
+CPU_FALLBACK(Remainder)
 // Equal has CPU fallback above.
-NO_GPU(Erf)
-NO_GPU(ErfInv)
-NO_GPU(Exp)
-NO_GPU(Expm1)
-NO_GPU(FFT)
-NO_GPU(Floor)
-NO_GPU(Gather)
-NO_GPU(GatherAxis)
-NO_GPU(GatherMM)
-NO_GPU(GatherQMM)
-NO_GPU(Greater)
-NO_GPU(GreaterEqual)
-NO_GPU(Hadamard)
-NO_GPU(Imag)
-NO_GPU(Less)
-NO_GPU(LessEqual)
-NO_GPU(Load)
-NO_GPU(Log)
-NO_GPU(Log1p)
-NO_GPU(LogicalNot)
-NO_GPU(LogicalAnd)
-NO_GPU(LogicalOr)
-NO_GPU(LogAddExp)
-NO_GPU(LogSumExp)
-NO_GPU_MULTI(LUF)
+CPU_FALLBACK(Erf)
+CPU_FALLBACK(ErfInv)
+CPU_FALLBACK(Exp)
+CPU_FALLBACK(Expm1)
+CPU_FALLBACK_STATE(FFT)
+CPU_FALLBACK(Floor)
+CPU_FALLBACK_STATE(Gather)
+CPU_FALLBACK_STATE(GatherAxis)
+CPU_FALLBACK_STATE(GatherMM)
+CPU_FALLBACK_STATE(GatherQMM)
+CPU_FALLBACK(Greater)
+CPU_FALLBACK(GreaterEqual)
+CPU_FALLBACK_STATE(Hadamard)
+CPU_FALLBACK(Imag)
+CPU_FALLBACK(Less)
+CPU_FALLBACK(LessEqual)
+// Load has CPU fallback above.
+CPU_FALLBACK_STATE(Log)
+CPU_FALLBACK(Log1p)
+CPU_FALLBACK(LogicalNot)
+CPU_FALLBACK(LogicalAnd)
+CPU_FALLBACK(LogicalOr)
+CPU_FALLBACK(LogAddExp)
+CPU_FALLBACK(LogSumExp)
+CPU_FALLBACK_MULTI(LUF)
 // Matmul implemented in matmul.cpp
 // Maximum has CPU fallback above.
 // Minimum has CPU fallback above.
 // Multiply has CPU fallback above.
-NO_GPU(Negative)
-NO_GPU(NotEqual)
-NO_GPU(Partition)
-NO_GPU(Power)
-NO_GPU_MULTI(QRF)
-NO_GPU(QuantizedMatmul)
-NO_GPU(QQMatmul)
+CPU_FALLBACK(Negative)
+CPU_FALLBACK(NotEqual)
+CPU_FALLBACK_STATE(Partition)
+CPU_FALLBACK(Power)
+CPU_FALLBACK_MULTI(QRF)
+CPU_FALLBACK_STATE(QuantizedMatmul)
+CPU_FALLBACK_STATE(QQMatmul)
 // RandomBits has CPU fallback above.
-NO_GPU(Real)
+CPU_FALLBACK(Real)
 // Reduce has CPU fallback above.
-NO_GPU(Round)
-NO_GPU(Scan)
-NO_GPU(Scatter)
-NO_GPU(ScatterAxis)
-NO_GPU(Select)
-NO_GPU(SegmentedMM)
-NO_GPU(Sigmoid)
-NO_GPU(Sign)
-NO_GPU(Sin)
-NO_GPU(Sinh)
-NO_GPU(Softmax)
-NO_GPU(Sort)
-NO_GPU(Square)
-NO_GPU(Sqrt)
+CPU_FALLBACK(Round)
+CPU_FALLBACK_STATE(Scan)
+CPU_FALLBACK_STATE(Scatter)
+CPU_FALLBACK_STATE(ScatterAxis)
+CPU_FALLBACK(Select)
+CPU_FALLBACK(SegmentedMM)
+CPU_FALLBACK(Sigmoid)
+CPU_FALLBACK(Sign)
+CPU_FALLBACK(Sin)
+CPU_FALLBACK(Sinh)
+CPU_FALLBACK_STATE(Softmax)
+CPU_FALLBACK_STATE(Sort)
+CPU_FALLBACK(Square)
+CPU_FALLBACK_STATE(Sqrt)
 // Subtract has CPU fallback above.
-NO_GPU_MULTI(SVD)
-NO_GPU(Tan)
-NO_GPU(Tanh)
-NO_GPU(Inverse)
-NO_GPU(Cholesky)
-NO_GPU_MULTI(Eigh)
-NO_GPU_MULTI(Eig)
-NO_GPU(MaskedScatter)
+CPU_FALLBACK_MULTI_STATE(SVD)
+CPU_FALLBACK(Tan)
+CPU_FALLBACK(Tanh)
+CPU_FALLBACK_STATE(Inverse)
+CPU_FALLBACK_STATE(Cholesky)
+CPU_FALLBACK_MULTI_STATE(Eigh)
+CPU_FALLBACK_MULTI_STATE(Eig)
+CPU_FALLBACK(MaskedScatter)
+
+void fast::ConvertFP8::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto cpu_stream = default_stream(Device::cpu);
+  fast::ConvertFP8 cpu_convert(cpu_stream, state());
+  cpu_convert.eval_cpu(inputs, outputs);
+  synchronize(cpu_stream);
+}
+
+void fast::Quantize::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto fallback_outputs = fallback_(inputs);
+  if (fallback_outputs.size() != outputs.size()) {
+    throw std::runtime_error(
+        "[vulkan::Quantize::eval_gpu] Fallback output count mismatch.");
+  }
+  eval(fallback_outputs);
+  for (int i = 0; i < outputs.size(); ++i) {
+    outputs[i].copy_shared_buffer(fallback_outputs[i]);
+  }
+}
 
 namespace fast {
 NO_GPU_USE_FALLBACK(LayerNorm)
@@ -211,8 +294,7 @@ NO_GPU_MULTI(RMSNormVJP)
 NO_GPU_USE_FALLBACK(RoPE)
 NO_GPU_MULTI(ScaledDotProductAttention)
 NO_GPU_MULTI(ScaledDotProductAttentionVJP)
-NO_GPU_MULTI(ConvertFP8)
-NO_GPU_MULTI(Quantize)
+// ConvertFP8 and Quantize have CPU fallbacks above.
 NO_GPU_MULTI(CustomKernel)
 } // namespace fast
 
