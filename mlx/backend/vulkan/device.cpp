@@ -11,6 +11,7 @@
 #include <unordered_map>
 
 #include "mlx/backend/vulkan/allocator.h"
+#include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/stream.h"
 
@@ -76,6 +77,7 @@ class VulkanDevice {
     throw_if_vk_error(
         vkResetFences(device, 1, &stream->fence),
         "[vulkan::synchronize] Failed resetting stream fence");
+    KernelManager::get().reclaim_descriptor_sets(s.index);
     stream->has_pending_work = false;
   }
 
@@ -88,6 +90,7 @@ class VulkanDevice {
       stream->recording = false;
       stream->has_pending_work = false;
     }
+    KernelManager::get().reclaim_all_descriptor_sets();
   }
 
   VkCommandBuffer begin_recording(int stream_index) {
@@ -103,6 +106,7 @@ class VulkanDevice {
         throw_if_vk_error(
             vkResetFences(device, 1, &stream->fence),
             "[vulkan::begin_recording] Failed resetting stream fence");
+        KernelManager::get().reclaim_descriptor_sets(stream_index);
         stream->has_pending_work = false;
       }
 

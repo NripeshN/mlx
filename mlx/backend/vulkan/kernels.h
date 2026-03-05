@@ -3,7 +3,9 @@
 #pragma once
 
 #include <vulkan/vulkan.h>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -54,6 +56,9 @@ class KernelManager {
   // Descriptor set management
   VkDescriptorSet allocate_descriptor_set(VkDescriptorSetLayout layout);
   void free_descriptor_set(VkDescriptorSet set);
+  void defer_descriptor_set_free(int stream_index, VkDescriptorSet set);
+  void reclaim_descriptor_sets(int stream_index);
+  void reclaim_all_descriptor_sets();
 
   // Clean up all resources
   void cleanup();
@@ -70,43 +75,44 @@ class KernelManager {
   // Descriptor pool for allocating descriptor sets
   VkDescriptorPool descriptor_pool_{VK_NULL_HANDLE};
   bool descriptor_pool_initialized_{false};
+  std::unordered_map<int, std::vector<VkDescriptorSet>>
+      deferred_descriptor_sets_;
+  std::mutex deferred_descriptor_sets_mutex_;
 
   void init_descriptor_pool();
 };
 
 // Push constant structures used by shaders
 struct BinaryPushConstants {
-  uint32_t ne; // Total number of elements
-  uint32_t ne00; // Dimension 0 of src0
-  uint32_t ne01; // Dimension 1 of src0
-  uint32_t ne02; // Dimension 2 of src0
-  uint32_t ne03; // Dimension 3 of src0
-  uint32_t nb00; // Stride 0 of src0
-  uint32_t nb01; // Stride 1 of src0
-  uint32_t nb02; // Stride 2 of src0
-  uint32_t nb03; // Stride 3 of src0
-  uint32_t ne10; // Dimension 0 of src1
-  uint32_t ne11; // Dimension 1 of src1
-  uint32_t ne12; // Dimension 2 of src1
-  uint32_t ne13; // Dimension 3 of src1
-  uint32_t nb10; // Stride 0 of src1
-  uint32_t nb11; // Stride 1 of src1
-  uint32_t nb12; // Stride 2 of src1
-  uint32_t nb13; // Stride 3 of src1
-  uint32_t ne0; // Dimension 0 of dst
-  uint32_t ne1; // Dimension 1 of dst
-  uint32_t ne2; // Dimension 2 of dst
-  uint32_t ne3; // Dimension 3 of dst
-  uint32_t nb0; // Stride 0 of dst
-  uint32_t nb1; // Stride 1 of dst
-  uint32_t nb2; // Stride 2 of dst
-  uint32_t nb3; // Stride 3 of dst
-  uint32_t a_offset; // Offset into src0 buffer
-  uint32_t b_offset; // Offset into src1 buffer
-  uint32_t d_offset; // Offset into dst buffer
-  float param1; // Extra parameter 1
-  float param2; // Extra parameter 2
-  float param3; // Extra parameter 3
+  uint32_t ne;
+  uint32_t ne00;
+  uint32_t ne01;
+  uint32_t ne02;
+  uint32_t ne03;
+  uint32_t nb00;
+  uint32_t nb01;
+  uint32_t nb02;
+  uint32_t nb03;
+  uint32_t ne10;
+  uint32_t ne11;
+  uint32_t ne12;
+  uint32_t ne13;
+  uint32_t nb10;
+  uint32_t nb11;
+  uint32_t nb12;
+  uint32_t nb13;
+  uint32_t ne20;
+  uint32_t ne21;
+  uint32_t ne22;
+  uint32_t ne23;
+  uint32_t nb20;
+  uint32_t nb21;
+  uint32_t nb22;
+  uint32_t nb23;
+  uint32_t misalign_offsets;
+  float param1;
+  float param2;
+  int32_t param3;
 };
 
 struct UnaryPushConstants {
@@ -119,18 +125,38 @@ struct UnaryPushConstants {
   uint32_t nb01;
   uint32_t nb02;
   uint32_t nb03;
-  uint32_t ne0;
-  uint32_t ne1;
-  uint32_t ne2;
-  uint32_t ne3;
-  uint32_t nb0;
-  uint32_t nb1;
-  uint32_t nb2;
-  uint32_t nb3;
-  uint32_t a_offset;
-  uint32_t d_offset;
+  uint32_t ne10;
+  uint32_t ne11;
+  uint32_t ne12;
+  uint32_t ne13;
+  uint32_t nb10;
+  uint32_t nb11;
+  uint32_t nb12;
+  uint32_t nb13;
+  uint32_t misalign_offsets;
   float param1;
   float param2;
+  uint32_t ne0_012mp;
+  uint32_t ne0_012L;
+  uint32_t ne0_01mp;
+  uint32_t ne0_01L;
+  uint32_t ne0_0mp;
+  uint32_t ne0_0L;
+  uint32_t ne1_012mp;
+  uint32_t ne1_012L;
+  uint32_t ne1_01mp;
+  uint32_t ne1_01L;
+  uint32_t ne1_0mp;
+  uint32_t ne1_0L;
+};
+
+struct GenericPushConstants {
+  uint32_t KX;
+  uint32_t KY;
+  float param1;
+  float param2;
+  float param3;
+  float param4;
 };
 
 // Helper functions for kernel dispatch
@@ -151,14 +177,15 @@ void dispatch_unary_op(
     float param1 = 0.0f,
     float param2 = 0.0f);
 
-// Get workgroup dimensions for element-wise operations
+// Get workgroup dimensions for element-wise operations.
 // Returns (workgroup_count_x, workgroup_count_y, workgroup_count_z)
+// using ggml's 512-element tiling expected by get_idx().
 std::tuple<uint32_t, uint32_t, uint32_t> get_element_wise_grid_dims(
     size_t num_elements,
-    uint32_t workgroup_size);
+    uint32_t tile_size);
 
-// Standard workgroup size for element-wise operations
-constexpr uint32_t VULKAN_WORKGROUP_SIZE = 256;
+// Logical tile size used by generic Vulkan indexing helpers.
+constexpr uint32_t VULKAN_INDEX_TILE_SIZE = 512;
 
 } // namespace mlx::core::vulkan
 
