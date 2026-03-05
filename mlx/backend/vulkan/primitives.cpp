@@ -532,6 +532,14 @@ void Negative::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void Round::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+    auto suffix = dtype_suffix(out.dtype());
+    if (!suffix.empty()) {
+      eval_generic_unary_vulkan_or_cpu<Round>(
+          inputs, out, "round_" + suffix, stream());
+      return;
+    }
+  }
   eval_cpu_fallback<Round>(inputs, out);
 }
 

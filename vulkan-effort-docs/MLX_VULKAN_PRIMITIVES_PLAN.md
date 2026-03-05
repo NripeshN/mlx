@@ -11,10 +11,9 @@ This plan describes how to replace the current CPU fallback path in `mlx/backend
 - Primitive wiring landed:
   - Binary: `Add`, `Subtract`, `Multiply`, `Divide` (with strict fallback guards).
   - Unary (strided ABI path): `Log` (natural log path), `Square`, `Sqrt` (`recip=false`) with guarded Vulkan path.
-  - Unary (generic contiguous path): `Abs`, `Negative`, `Exp`, `Floor`, `Ceil`, `Sigmoid`, `Tanh` with strict contiguous/offset guards.
+  - Unary (generic contiguous path): `Abs`, `Negative`, `Exp`, `Floor`, `Ceil`, `Round` (ties-to-even), `Sigmoid`, `Tanh` with strict contiguous/offset guards.
   - Constructor op: `Arange` (`float32`) with Vulkan dispatch on contiguous outputs and CPU fallback otherwise.
 - `Sin` / `Cos` Vulkan path was attempted but left on CPU fallback for now due precision-sensitive test behavior; to be revisited.
-- `Round` Vulkan path was tested but remains on CPU fallback for now due ties-to-even semantic mismatch vs shader behavior.
 
 It follows the wiring model in `vulkan-effort-docs/GGML_VULKAN_OPS.md`:
 
@@ -159,7 +158,7 @@ Status legend:
 | `Sqrt` | `sqrt_f32` | `generic_unary_head.glsl` | `recip=true` (`Rsqrt`) until dedicated mapping added; unsupported dtype/layout | Partial |
 | `Floor` | `floor_f16`, `floor_f32` | `generic_head.glsl` | currently constrained to same-dtype float16/float32 + row-contiguous + offset==0; fallback otherwise | Partial |
 | `Ceil` | `ceil_f16`, `ceil_f32` | `generic_head.glsl` | currently constrained to same-dtype float16/float32 + row-contiguous + offset==0; fallback otherwise | Partial |
-| `Round` | `round_f16`, `round_f32` | `generic_head.glsl` | kept on CPU fallback for now; revisit ties-to-even semantic behavior | Planned |
+| `Round` | `round_f16`, `round_f32` | `generic_head.glsl` | currently constrained to same-dtype float16/float32 + row-contiguous + offset==0; fallback otherwise | Partial |
 | `Sigmoid` | `sigmoid_f16`, `sigmoid_f32` | `generic_head.glsl` | currently constrained to same-dtype float16/float32 + row-contiguous + offset==0; fallback otherwise | Partial |
 | `Tanh` | `tanh_f16`, `tanh_f32` | `generic_head.glsl` | currently constrained to same-dtype float16/float32 + row-contiguous + offset==0; fallback otherwise | Partial |
 | `Arange` | `arange_f32` | `generic_head.glsl` (`param1=start`, `param2=step`) | `float32` + row-contiguous + offset==0 only in first slice; fallback otherwise | Partial |

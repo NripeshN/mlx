@@ -18,12 +18,5 @@ void main() {
     }
 
     const float x = float(data_a[i]);
-    float result;
-    // Round halfway cases away from zero as roundf does.
-    if (x >= 0.0) {
-        result = floor(x + 0.5);
-    } else {
-        result = ceil(x - 0.5);
-    }
-    data_d[i] = D_TYPE(result);
+    data_d[i] = D_TYPE(roundEven(x));
 }
