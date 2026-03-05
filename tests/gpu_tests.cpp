@@ -191,6 +191,19 @@ TEST_CASE("test gpu reduce with axes") {
       auto out_cpu = sum(a, {0, 1, ax}, false, Device::cpu);
       CHECK(array_equal(out_gpu, out_cpu, Device::cpu).item<bool>());
     }
+
+    auto b = reshape(arange(0.0f, 2.0f * 3.0f * 4.0f * 5.0f), {2, 3, 4, 5});
+    auto b_nc = swapaxes(b, 1, 3);
+    auto out_gpu_keepdims = sum(b_nc, {0, 2}, true, Device::gpu);
+    auto out_cpu_keepdims = sum(b_nc, {0, 2}, true, Device::cpu);
+    CHECK(array_equal(out_gpu_keepdims, out_cpu_keepdims, Device::cpu)
+              .item<bool>());
+
+    auto b_nc_f16 = astype(b_nc, float16, Device::gpu);
+    auto out_gpu_f16 = sum(b_nc_f16, {0, 2}, true, Device::gpu);
+    auto out_cpu_f16 = sum(b_nc_f16, {0, 2}, true, Device::cpu);
+    CHECK(allclose(out_gpu_f16, out_cpu_f16, 5e-3, 5e-3, false, Device::cpu)
+              .item<bool>());
   }
 }
 
@@ -476,6 +489,23 @@ TEST_CASE("test gpu scan softmax trig parity") {
     auto cos_gpu = cos(x, Device::gpu);
     auto cos_cpu = cos(x, Device::cpu);
     CHECK(allclose(cos_gpu, cos_cpu, 1e-6, 1e-6, false, Device::cpu)
+              .item<bool>());
+  }
+
+  {
+    auto x = reshape(arange(-9.0f, 9.0f, 0.25f), {3, 4, 6});
+    x = transpose(x, {2, 0, 1});
+
+    auto x_f16 = astype(x, float16, Device::gpu);
+    auto argmax_f16_gpu = argmax(x_f16, 1, false, Device::gpu);
+    auto argmax_f16_cpu = argmax(x_f16, 1, false, Device::cpu);
+    CHECK(
+        array_equal(argmax_f16_gpu, argmax_f16_cpu, Device::cpu).item<bool>());
+
+    auto x_bf16 = astype(x, bfloat16, Device::gpu);
+    auto argmax_bf16_gpu = argmax(x_bf16, 2, true, Device::gpu);
+    auto argmax_bf16_cpu = argmax(x_bf16, 2, true, Device::cpu);
+    CHECK(array_equal(argmax_bf16_gpu, argmax_bf16_cpu, Device::cpu)
               .item<bool>());
   }
 }
