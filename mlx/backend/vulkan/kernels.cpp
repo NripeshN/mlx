@@ -5,6 +5,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -169,10 +170,11 @@ enum class KernelSpecId {
   SumRows,
   Argmax,
   Softmax,
+  SoftmaxLarge,
 };
 
 struct KernelSpec {
-  std::array<uint32_t, 4> bindings{};
+  std::array<uint32_t, 6> bindings{};
   uint32_t binding_count{0};
   uint32_t push_constant_size{0};
   DispatchGridKind grid_kind{DispatchGridKind::ElementWise};
@@ -184,52 +186,57 @@ struct BoundArray {
 };
 
 constexpr KernelSpec make_kernel_spec(
-    std::array<uint32_t, 4> bindings,
+    std::array<uint32_t, 6> bindings,
     uint32_t binding_count,
     uint32_t push_constant_size,
     DispatchGridKind grid_kind) {
   return {bindings, binding_count, push_constant_size, grid_kind};
 }
 
-constexpr std::array<KernelSpec, 8> kKernelSpecs = {
+constexpr std::array<KernelSpec, 9> kKernelSpecs = {
     make_kernel_spec(
-        {0, 1, 2, 0},
+        {0, 1, 2, 0, 0, 0},
         3,
         sizeof(BinaryPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
-        {0, 1, 2, 3},
+        {0, 1, 2, 3, 0, 0},
         4,
         sizeof(BinaryPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
-        {0, 1, 0, 0},
+        {0, 1, 0, 0, 0, 0},
         2,
         sizeof(UnaryPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
-        {0, 1, 0, 0},
+        {0, 1, 0, 0, 0, 0},
         2,
         sizeof(GenericPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
-        {0, 0, 0, 0},
+        {0, 0, 0, 0, 0, 0},
         1,
         sizeof(GenericPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
-        {0, 1, 0, 0},
+        {0, 1, 0, 0, 0, 0},
         2,
         sizeof(SumRowsPushConstants),
         DispatchGridKind::RowWise),
     make_kernel_spec(
-        {0, 1, 0, 0},
+        {0, 1, 0, 0, 0, 0},
         2,
         sizeof(GenericPushConstants),
         DispatchGridKind::RowWise),
     make_kernel_spec(
-        {0, 1, 2, 3},
+        {0, 1, 2, 3, 0, 0},
         4,
+        sizeof(SoftmaxPushConstants),
+        DispatchGridKind::RowWise),
+    make_kernel_spec(
+        {0, 1, 2, 3, 4, 5},
+        6,
         sizeof(SoftmaxPushConstants),
         DispatchGridKind::RowWise),
 };
@@ -452,7 +459,8 @@ void dispatch_with_spec(
     const PushConstants& push_constants,
     uint32_t num_elements,
     VkCommandBuffer cmd_buffer,
-    const Stream& s) {
+    const Stream& s,
+    std::optional<std::array<uint32_t, 3>> explicit_grid = std::nullopt) {
   if (num_elements == 0) {
     return;
   }
@@ -478,8 +486,8 @@ void dispatch_with_spec(
       manager.allocate_descriptor_set(pipeline->descriptor_layout);
   manager.defer_descriptor_set_free(s.index, descriptor_set);
 
-  std::array<VkDescriptorBufferInfo, 4> descriptor_infos{};
-  std::array<VkWriteDescriptorSet, 4> descriptor_writes{};
+  std::array<VkDescriptorBufferInfo, 6> descriptor_infos{};
+  std::array<VkWriteDescriptorSet, 6> descriptor_writes{};
 
   for (size_t i = 0; i < bound_arrays.size(); ++i) {
     if (bound_arrays[i].arr == nullptr) {
@@ -524,8 +532,19 @@ void dispatch_with_spec(
       static_cast<uint32_t>(sizeof(PushConstants)),
       &push_constants);
 
-  auto [grid_x, grid_y, grid_z] =
-      get_dispatch_grid_dims(spec.grid_kind, num_elements);
+  uint32_t grid_x = 0;
+  uint32_t grid_y = 0;
+  uint32_t grid_z = 0;
+  if (explicit_grid.has_value()) {
+    grid_x = (*explicit_grid)[0];
+    grid_y = (*explicit_grid)[1];
+    grid_z = (*explicit_grid)[2];
+  } else {
+    auto dims = get_dispatch_grid_dims(spec.grid_kind, num_elements);
+    grid_x = std::get<0>(dims);
+    grid_y = std::get<1>(dims);
+    grid_z = std::get<2>(dims);
+  }
   vkCmdDispatch(cmd_buffer, grid_x, grid_y, grid_z);
 }
 
@@ -1079,6 +1098,135 @@ void dispatch_softmax_op(
       push_constants.nrows_x,
       cmd_buffer,
       s);
+}
+
+void dispatch_softmax_large_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name_pass1,
+    const std::string& shader_name_pass2,
+    const std::string& shader_name_pass3,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  if (in.ndim() == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Softmax requires input rank >= 1.");
+  }
+
+  const uint32_t row_width = checked_u32(in.shape(in.ndim() - 1), "softmax KX");
+  if (row_width == 0) {
+    throw std::runtime_error("[vulkan::kernels] Softmax requires non-zero KX.");
+  }
+
+  const uint32_t total_elements = checked_u32(out.size(), "softmax elements");
+  if (total_elements % row_width != 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Softmax elements are not divisible by KX.");
+  }
+
+  const uint32_t row_count = total_elements / row_width;
+  const auto push_constants =
+      make_softmax_push_constants(in, row_width, row_count);
+
+  const uint32_t elems_per_workgroup = 128u * 4u;
+  const uint32_t num_workgroups_x =
+      (row_width + elems_per_workgroup - 1) / elems_per_workgroup;
+  if (num_workgroups_x == 0) {
+    return;
+  }
+
+  const uint64_t tmp_elements_u64 = static_cast<uint64_t>(num_workgroups_x) *
+      static_cast<uint64_t>(row_count);
+  if (tmp_elements_u64 > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Softmax large temporary size exceeds uint32 range.");
+  }
+  if (tmp_elements_u64 >
+      static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Softmax large temporary shape exceeds int range.");
+  }
+  const int tmp_elements = static_cast<int>(tmp_elements_u64);
+
+  array temp_max({tmp_elements}, float32, nullptr, {});
+  array temp_sum({tmp_elements}, float32, nullptr, {});
+  temp_max.set_data(allocator::malloc(temp_max.nbytes()));
+  temp_sum.set_data(allocator::malloc(temp_sum.nbytes()));
+
+  const std::array<BoundArray, 6> bound_arrays = {{
+      {&in, "src0"},
+      {&in, "src1"},
+      {&in, "src2"},
+      {&out, "dst"},
+      {&temp_max, "tmp_max"},
+      {&temp_sum, "tmp_sum"},
+  }};
+
+  const std::array<uint32_t, 3> grid = {num_workgroups_x, row_count, 1};
+
+  dispatch_with_spec(
+      shader_name_pass1,
+      KernelSpecId::SoftmaxLarge,
+      bound_arrays,
+      push_constants,
+      row_count,
+      cmd_buffer,
+      s,
+      grid);
+
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask =
+      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+  vkCmdPipelineBarrier(
+      cmd_buffer,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0,
+      1,
+      &barrier,
+      0,
+      nullptr,
+      0,
+      nullptr);
+
+  dispatch_with_spec(
+      shader_name_pass2,
+      KernelSpecId::SoftmaxLarge,
+      bound_arrays,
+      push_constants,
+      row_count,
+      cmd_buffer,
+      s,
+      grid);
+
+  vkCmdPipelineBarrier(
+      cmd_buffer,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0,
+      1,
+      &barrier,
+      0,
+      nullptr,
+      0,
+      nullptr);
+
+  dispatch_with_spec(
+      shader_name_pass3,
+      KernelSpecId::SoftmaxLarge,
+      bound_arrays,
+      push_constants,
+      row_count,
+      cmd_buffer,
+      s,
+      grid);
 }
 
 void dispatch_cumsum_op(

@@ -455,6 +455,30 @@ bool has_keepdims_axis_shape(const array& in, const array& out, int axis) {
   return true;
 }
 
+bool has_squeezed_axis_shape(const array& in, const array& out, int axis) {
+  if (in.ndim() - 1 != out.ndim()) {
+    return false;
+  }
+
+  int out_dim = 0;
+  for (int in_dim = 0; in_dim < in.ndim(); ++in_dim) {
+    if (in_dim == axis) {
+      continue;
+    }
+    if (out.shape(out_dim) != in.shape(in_dim)) {
+      return false;
+    }
+    out_dim++;
+  }
+  return true;
+}
+
+Shape keepdims_shape_for_axis(const array& in, int axis) {
+  auto shape = in.shape();
+  shape[axis] = 1;
+  return shape;
+}
+
 bool try_eval_reduce_sum_rows_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -471,31 +495,47 @@ bool try_eval_reduce_sum_rows_vulkan(
   }
 
   const int axis = normalize_axis(axes[0], in.ndim());
-  if (axis != in.ndim() - 1) {
-    return false;
-  }
 
   if (in.ndim() == 0 || in.ndim() > 4 || out.ndim() > 4) {
     return false;
   }
 
-  if (!has_keepdims_axis_shape(in, out, axis)) {
+  const bool out_is_keepdims = has_keepdims_axis_shape(in, out, axis);
+  const bool out_is_squeezed = has_squeezed_axis_shape(in, out, axis);
+  if (!out_is_keepdims && !out_is_squeezed) {
     return false;
   }
 
-  if (!in.flags().row_contiguous || !is_supported_unary_layout(in)) {
-    in = contiguous_copy_gpu(in, s);
+  array in_kernel = in;
+  if (axis != in.ndim() - 1) {
+    in_kernel = swapaxes_in_eval(in, axis, in.ndim() - 1);
   }
 
-  const bool staged_output =
-      !out.flags().row_contiguous || !is_supported_unary_layout(out);
-  array out_work =
-      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  if (!in_kernel.flags().row_contiguous ||
+      !is_supported_unary_layout(in_kernel)) {
+    in_kernel = contiguous_copy_gpu(in_kernel, s);
+  }
+
+  array kernel_out(
+      keepdims_shape_for_axis(in_kernel, in_kernel.ndim() - 1),
+      out.dtype(),
+      nullptr,
+      {});
+
+  const bool staged_output = !kernel_out.flags().row_contiguous ||
+      !is_supported_unary_layout(kernel_out);
+  array out_work = staged_output
+      ? array(kernel_out.shape(), kernel_out.dtype(), nullptr, {})
+      : kernel_out;
 
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   if (out_work.size() == 0) {
     if (staged_output) {
-      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+      copy_gpu(out_work, kernel_out, CopyType::GeneralGeneral, s);
+    }
+    if (out_is_squeezed) {
+      auto squeezed = reshape_in_eval(kernel_out, out.shape(), s);
+      copy_gpu(squeezed, out, CopyType::GeneralGeneral, s);
     }
     return true;
   }
@@ -503,10 +543,22 @@ bool try_eval_reduce_sum_rows_vulkan(
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_sum_rows_op(
-        in, out_work, "sum_rows_f32", command_buffer, s, 1.0f);
+        in_kernel, out_work, "sum_rows_f32", command_buffer, s, 1.0f);
     vulkan::end_command_recording(s.index);
     if (staged_output) {
-      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+      copy_gpu(out_work, kernel_out, CopyType::GeneralGeneral, s);
+    }
+
+    array restored_keepdims = kernel_out;
+    if (axis != in.ndim() - 1) {
+      restored_keepdims = swapaxes_in_eval(kernel_out, axis, in.ndim() - 1);
+    }
+
+    if (out_is_squeezed) {
+      auto squeezed = reshape_in_eval(restored_keepdims, out.shape(), s);
+      copy_gpu(squeezed, out, CopyType::GeneralGeneral, s);
+    } else {
+      copy_gpu(restored_keepdims, out, CopyType::GeneralGeneral, s);
     }
     return true;
   } catch (const std::runtime_error&) {
@@ -530,44 +582,73 @@ bool try_eval_arg_reduce_vulkan(
   }
 
   axis = normalize_axis(axis, in.ndim());
+
+  const bool out_is_keepdims = has_keepdims_axis_shape(in, out, axis);
+  const bool out_is_squeezed = has_squeezed_axis_shape(in, out, axis);
+  if (!out_is_keepdims && !out_is_squeezed) {
+    return false;
+  }
+
+  array in_kernel = in;
   if (axis != in.ndim() - 1) {
-    return false;
+    in_kernel = swapaxes_in_eval(in, axis, in.ndim() - 1);
   }
 
-  if (!has_keepdims_axis_shape(in, out, axis)) {
-    return false;
-  }
-
-  if (in.size() > std::numeric_limits<uint32_t>::max() ||
+  if (in_kernel.size() > std::numeric_limits<uint32_t>::max() ||
       out.size() > std::numeric_limits<uint32_t>::max() ||
-      in.shape(axis) > std::numeric_limits<uint32_t>::max()) {
+      in_kernel.shape(in_kernel.ndim() - 1) >
+          std::numeric_limits<uint32_t>::max()) {
     return false;
   }
 
-  if (!in.flags().row_contiguous || in.offset() != 0 ||
-      !is_supported_unary_layout(in)) {
-    in = contiguous_copy_gpu(in, s);
+  if (!in_kernel.flags().row_contiguous || in_kernel.offset() != 0 ||
+      !is_supported_unary_layout(in_kernel)) {
+    in_kernel = contiguous_copy_gpu(in_kernel, s);
   }
 
-  const bool staged_output = !out.flags().row_contiguous || out.offset() != 0 ||
-      !is_supported_unary_layout(out);
-  array out_work =
-      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  array kernel_out(
+      keepdims_shape_for_axis(in_kernel, in_kernel.ndim() - 1),
+      out.dtype(),
+      nullptr,
+      {});
+
+  const bool staged_output = !kernel_out.flags().row_contiguous ||
+      kernel_out.offset() != 0 || !is_supported_unary_layout(kernel_out);
+  array out_work = staged_output
+      ? array(kernel_out.shape(), kernel_out.dtype(), nullptr, {})
+      : kernel_out;
 
   out_work.set_data(allocator::malloc(out_work.nbytes()));
   if (out_work.size() == 0) {
     if (staged_output) {
-      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+      copy_gpu(out_work, kernel_out, CopyType::GeneralGeneral, s);
+    }
+    if (out_is_squeezed) {
+      auto squeezed = reshape_in_eval(kernel_out, out.shape(), s);
+      copy_gpu(squeezed, out, CopyType::GeneralGeneral, s);
     }
     return true;
   }
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_argmax_op(in, out_work, "argmax_f32", command_buffer, s);
+    vulkan::dispatch_argmax_op(
+        in_kernel, out_work, "argmax_f32", command_buffer, s);
     vulkan::end_command_recording(s.index);
     if (staged_output) {
-      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+      copy_gpu(out_work, kernel_out, CopyType::GeneralGeneral, s);
+    }
+
+    array restored_keepdims = kernel_out;
+    if (axis != in.ndim() - 1) {
+      restored_keepdims = swapaxes_in_eval(kernel_out, axis, in.ndim() - 1);
+    }
+
+    if (out_is_squeezed) {
+      auto squeezed = reshape_in_eval(restored_keepdims, out.shape(), s);
+      copy_gpu(squeezed, out, CopyType::GeneralGeneral, s);
+    } else {
+      copy_gpu(restored_keepdims, out, CopyType::GeneralGeneral, s);
     }
     return true;
   } catch (const std::runtime_error&) {
@@ -585,19 +666,35 @@ bool try_eval_softmax_vulkan(
   }
 
   array in = inputs[0];
-  if (in.ndim() == 0 || in.dtype() != float32 || out.dtype() != float32) {
+  const bool f32_io = in.dtype() == float32 && out.dtype() == float32;
+  const bool f16_io = in.dtype() == float16 && out.dtype() == float16;
+  if (in.ndim() == 0 || (!f32_io && !f16_io)) {
     return false;
   }
+
+  const bool use_f16_variant = f16_io;
+  if (use_f16_variant) {
+    array in_f32(in.shape(), float32, nullptr, {});
+    copy_gpu(in, in_f32, CopyType::General, s);
+    in = in_f32;
+  }
+
+  array softmax_out_target =
+      use_f16_variant ? array(out.shape(), float32, nullptr, {}) : out;
 
   if (!in.flags().contiguous || in.offset() != 0 || in.strides().back() != 1 ||
       !is_supported_unary_layout(in)) {
     in = contiguous_copy_gpu(in, s);
   }
 
-  const bool staged_output = !out.flags().contiguous || out.offset() != 0 ||
-      out.strides().back() != 1 || !is_supported_unary_layout(out);
-  array out_work =
-      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  const bool staged_output = !softmax_out_target.flags().contiguous ||
+      softmax_out_target.offset() != 0 ||
+      softmax_out_target.strides().back() != 1 ||
+      !is_supported_unary_layout(softmax_out_target);
+  array out_work = staged_output
+      ? array(
+            softmax_out_target.shape(), softmax_out_target.dtype(), nullptr, {})
+      : softmax_out_target;
 
   set_unary_output_data(in, out_work);
   if (in.shape() != out_work.shape()) {
@@ -610,20 +707,44 @@ bool try_eval_softmax_vulkan(
     return false;
   }
 
+  const uint32_t row_width = static_cast<uint32_t>(in.shape(in.ndim() - 1));
+  const bool use_large_softmax = row_width > 16384u;
+
   if (out_work.size() == 0) {
     if (staged_output) {
-      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+      copy_gpu(out_work, softmax_out_target, CopyType::GeneralGeneral, s);
+    }
+    if (use_f16_variant) {
+      copy_gpu(softmax_out_target, out, CopyType::General, s);
     }
     return true;
   }
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_softmax_op(
-        in, out_work, "soft_max_f32", command_buffer, s);
+    if (use_large_softmax) {
+      vulkan::dispatch_softmax_large_op(
+          in,
+          out_work,
+          use_f16_variant ? "soft_max_large1_f32_f16" : "soft_max_large1_f32",
+          use_f16_variant ? "soft_max_large2_f32_f16" : "soft_max_large2_f32",
+          use_f16_variant ? "soft_max_large3_f32_f16" : "soft_max_large3_f32",
+          command_buffer,
+          s);
+    } else {
+      vulkan::dispatch_softmax_op(
+          in,
+          out_work,
+          use_f16_variant ? "soft_max_f32_f16" : "soft_max_f32",
+          command_buffer,
+          s);
+    }
     vulkan::end_command_recording(s.index);
     if (staged_output) {
-      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+      copy_gpu(out_work, softmax_out_target, CopyType::GeneralGeneral, s);
+    }
+    if (use_f16_variant) {
+      copy_gpu(softmax_out_target, out, CopyType::General, s);
     }
     return true;
   } catch (const std::runtime_error&) {

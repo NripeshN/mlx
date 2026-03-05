@@ -262,6 +262,15 @@ void dispatch_softmax_op(
     VkCommandBuffer cmd_buffer,
     const Stream& s);
 
+void dispatch_softmax_large_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name_pass1,
+    const std::string& shader_name_pass2,
+    const std::string& shader_name_pass3,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s);
+
 void dispatch_cumsum_op(
     const array& in,
     array& out,
