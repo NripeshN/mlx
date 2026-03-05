@@ -168,8 +168,8 @@ bool try_eval_binary_op_vulkan(
     return false;
   }
 
-  const auto& a = inputs[0];
-  const auto& b = inputs[1];
+  array a = inputs[0];
+  array b = inputs[1];
   if (!is_vulkan_float_dtype(a.dtype()) || !is_vulkan_float_dtype(b.dtype()) ||
       !is_vulkan_float_dtype(out.dtype())) {
     return false;
@@ -185,10 +185,16 @@ bool try_eval_binary_op_vulkan(
     return false;
   }
 
-  if (!is_supported_elementwise_layout(a) ||
-      !is_supported_elementwise_layout(b)) {
-    return false;
+  if (!is_supported_elementwise_layout(a)) {
+    a = contiguous_copy_gpu(a, s);
   }
+  if (!is_supported_elementwise_layout(b)) {
+    b = contiguous_copy_gpu(b, s);
+  }
+
+  const bool staged_output = !is_supported_elementwise_layout(out);
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
 
   auto suffix_a = dtype_suffix(a.dtype());
   auto suffix_b = dtype_suffix(b.dtype());
@@ -198,18 +204,21 @@ bool try_eval_binary_op_vulkan(
   }
 
   auto bopt = get_binary_op_type(a, b);
-  set_binary_op_output_data(a, b, out, bopt);
-  if (!is_supported_elementwise_layout(out)) {
+  set_binary_op_output_data(a, b, out_work, bopt);
+  if (!is_supported_elementwise_layout(out_work)) {
     return false;
   }
 
-  if (out.size() == 0) {
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   }
 
   std::string shader_name =
       std::string(op_name) + "_" + suffix_a + "_" + suffix_b + "_" + suffix_out;
-  if (out.dtype() == float16) {
+  if (out_work.dtype() == float16) {
     shader_name += "_rte";
   }
 
@@ -218,12 +227,15 @@ bool try_eval_binary_op_vulkan(
     vulkan::dispatch_binary_op(
         a,
         b,
-        out,
+        out_work,
         shader_name,
         command_buffer,
         s,
         binary_dispatch_variant<Primitive>());
     vulkan::end_command_recording(s.index);
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   } catch (const std::runtime_error&) {
     return false;
@@ -304,18 +316,29 @@ bool try_eval_generic_unary_op_vulkan(
     return false;
   }
 
-  const auto& in = inputs[0];
+  array in = inputs[0];
   if (!is_vulkan_float_dtype(in.dtype()) || in.dtype() != out.dtype()) {
     return false;
   }
 
-  set_unary_output_data(in, out);
+  if (!is_supported_generic_unary_layout(in)) {
+    in = contiguous_copy_gpu(in, s);
+  }
+
+  const bool staged_output = !is_supported_generic_unary_layout(out);
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+
+  set_unary_output_data(in, out_work);
   if (!is_supported_generic_unary_layout(in) ||
-      !is_supported_generic_unary_layout(out)) {
+      !is_supported_generic_unary_layout(out_work)) {
     return false;
   }
 
-  if (out.size() == 0) {
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   }
 
@@ -323,7 +346,7 @@ bool try_eval_generic_unary_op_vulkan(
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_generic_unary_op(
         in,
-        out,
+        out_work,
         shader_name,
         command_buffer,
         s,
@@ -332,6 +355,9 @@ bool try_eval_generic_unary_op_vulkan(
         param3,
         param4);
     vulkan::end_command_recording(s.index);
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   } catch (const std::runtime_error&) {
     return false;
@@ -439,7 +465,7 @@ bool try_eval_reduce_sum_rows_vulkan(
     return false;
   }
 
-  const auto& in = inputs[0];
+  array in = inputs[0];
   if (in.dtype() != float32 || out.dtype() != float32) {
     return false;
   }
@@ -453,28 +479,35 @@ bool try_eval_reduce_sum_rows_vulkan(
     return false;
   }
 
-  if (!in.flags().row_contiguous || !out.flags().row_contiguous) {
-    return false;
-  }
-
   if (!has_keepdims_axis_shape(in, out, axis)) {
     return false;
   }
 
-  if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out)) {
-    return false;
+  if (!in.flags().row_contiguous || !is_supported_unary_layout(in)) {
+    in = contiguous_copy_gpu(in, s);
   }
 
-  out.set_data(allocator::malloc(out.nbytes()));
-  if (out.size() == 0) {
+  const bool staged_output =
+      !out.flags().row_contiguous || !is_supported_unary_layout(out);
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   }
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_sum_rows_op(
-        in, out, "sum_rows_f32", command_buffer, s, 1.0f);
+        in, out_work, "sum_rows_f32", command_buffer, s, 1.0f);
     vulkan::end_command_recording(s.index);
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   } catch (const std::runtime_error&) {
     return false;
@@ -491,21 +524,13 @@ bool try_eval_arg_reduce_vulkan(
     return false;
   }
 
-  const auto& in = inputs[0];
+  array in = inputs[0];
   if (in.ndim() == 0 || in.dtype() != float32 || out.dtype() != uint32) {
     return false;
   }
 
   axis = normalize_axis(axis, in.ndim());
   if (axis != in.ndim() - 1) {
-    return false;
-  }
-
-  if (!in.flags().row_contiguous || !out.flags().row_contiguous) {
-    return false;
-  }
-
-  if (in.offset() != 0 || out.offset() != 0) {
     return false;
   }
 
@@ -519,15 +544,31 @@ bool try_eval_arg_reduce_vulkan(
     return false;
   }
 
-  out.set_data(allocator::malloc(out.nbytes()));
-  if (out.size() == 0) {
+  if (!in.flags().row_contiguous || in.offset() != 0 ||
+      !is_supported_unary_layout(in)) {
+    in = contiguous_copy_gpu(in, s);
+  }
+
+  const bool staged_output = !out.flags().row_contiguous || out.offset() != 0 ||
+      !is_supported_unary_layout(out);
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   }
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_argmax_op(in, out, "argmax_f32", command_buffer, s);
+    vulkan::dispatch_argmax_op(in, out_work, "argmax_f32", command_buffer, s);
     vulkan::end_command_recording(s.index);
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   } catch (const std::runtime_error&) {
     return false;
@@ -543,43 +584,47 @@ bool try_eval_softmax_vulkan(
     return false;
   }
 
-  const auto& in = inputs[0];
+  array in = inputs[0];
   if (in.ndim() == 0 || in.dtype() != float32 || out.dtype() != float32) {
     return false;
   }
 
-  set_unary_output_data(in, out);
-  if (!in.flags().contiguous || !out.flags().contiguous) {
-    return false;
+  if (!in.flags().contiguous || in.offset() != 0 || in.strides().back() != 1 ||
+      !is_supported_unary_layout(in)) {
+    in = contiguous_copy_gpu(in, s);
   }
 
-  if (in.offset() != 0 || out.offset() != 0) {
-    return false;
-  }
+  const bool staged_output = !out.flags().contiguous || out.offset() != 0 ||
+      out.strides().back() != 1 || !is_supported_unary_layout(out);
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
 
-  if (in.shape() != out.shape() || in.strides().back() != 1 ||
-      out.strides().back() != 1) {
-    return false;
-  }
-
-  if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out)) {
+  set_unary_output_data(in, out_work);
+  if (in.shape() != out_work.shape()) {
     return false;
   }
 
   if (in.size() > std::numeric_limits<uint32_t>::max() ||
-      out.size() > std::numeric_limits<uint32_t>::max() ||
+      out_work.size() > std::numeric_limits<uint32_t>::max() ||
       in.shape(in.ndim() - 1) > std::numeric_limits<uint32_t>::max()) {
     return false;
   }
 
-  if (out.size() == 0) {
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   }
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_softmax_op(in, out, "soft_max_f32", command_buffer, s);
+    vulkan::dispatch_softmax_op(
+        in, out_work, "soft_max_f32", command_buffer, s);
     vulkan::end_command_recording(s.index);
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   } catch (const std::runtime_error&) {
     return false;
@@ -604,7 +649,7 @@ bool try_eval_scan_cumsum_vulkan(
     return false;
   }
 
-  const auto& in = inputs[0];
+  array in = inputs[0];
   if (in.ndim() == 0 || in.dtype() != float32 || out.dtype() != float32) {
     return false;
   }
@@ -615,38 +660,41 @@ bool try_eval_scan_cumsum_vulkan(
     return false;
   }
 
-  set_unary_output_data(in, out);
-  if (!in.flags().contiguous || !out.flags().contiguous) {
-    return false;
+  if (!in.flags().contiguous || in.offset() != 0 || in.strides().back() != 1 ||
+      !is_supported_unary_layout(in)) {
+    in = contiguous_copy_gpu(in, s);
   }
 
-  if (in.offset() != 0 || out.offset() != 0) {
-    return false;
-  }
+  const bool staged_output = !out.flags().contiguous || out.offset() != 0 ||
+      out.strides().back() != 1 || !is_supported_unary_layout(out);
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
 
-  if (in.shape() != out.shape() || in.strides().back() != 1 ||
-      out.strides().back() != 1) {
-    return false;
-  }
-
-  if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out)) {
+  set_unary_output_data(in, out_work);
+  if (in.shape() != out_work.shape()) {
     return false;
   }
 
   if (in.size() > std::numeric_limits<uint32_t>::max() ||
-      out.size() > std::numeric_limits<uint32_t>::max() ||
+      out_work.size() > std::numeric_limits<uint32_t>::max() ||
       in.shape(in.ndim() - 1) > std::numeric_limits<uint32_t>::max()) {
     return false;
   }
 
-  if (out.size() == 0) {
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   }
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_cumsum_op(in, out, "cumsum_f32", command_buffer, s);
+    vulkan::dispatch_cumsum_op(in, out_work, "cumsum_f32", command_buffer, s);
     vulkan::end_command_recording(s.index);
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   } catch (const std::runtime_error&) {
     return false;

@@ -12,8 +12,73 @@
 #include "mlx/stream.h"
 
 #include <cstring>
+#include <limits>
+#include <string>
 
 namespace {
+
+using mlx::core::Dtype;
+
+std::string copy_dtype_suffix(Dtype dtype) {
+  switch (dtype) {
+    case mlx::core::float16:
+      return "f16";
+    case mlx::core::float32:
+      return "f32";
+    case mlx::core::bfloat16:
+      return "bf16";
+    case mlx::core::int32:
+      return "i32";
+    default:
+      return {};
+  }
+}
+
+bool is_supported_copy_layout(const mlx::core::array& arr) {
+  if (arr.ndim() > 4 || arr.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  if (arr.offset() < 0 || arr.offset() > 0xFFFF) {
+    return false;
+  }
+  for (auto dim : arr.shape()) {
+    if (dim < 0 || dim > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+  }
+  for (auto stride : arr.strides()) {
+    if (stride < 0 || stride > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string get_copy_shader_name(
+    const mlx::core::array& in,
+    mlx::core::array& out) {
+  auto src_suffix = copy_dtype_suffix(in.dtype());
+  auto dst_suffix = copy_dtype_suffix(out.dtype());
+  if (src_suffix.empty() || dst_suffix.empty()) {
+    return {};
+  }
+
+  const bool supported_pair =
+      (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::float32) ||
+      (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::float16) ||
+      (in.dtype() == mlx::core::float16 && out.dtype() == mlx::core::float16) ||
+      (in.dtype() == mlx::core::float16 && out.dtype() == mlx::core::float32) ||
+      (in.dtype() == mlx::core::float32 &&
+       out.dtype() == mlx::core::bfloat16) ||
+      (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::int32) ||
+      (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::float32);
+
+  if (!supported_pair) {
+    return {};
+  }
+
+  return "cpy_" + src_suffix + "_" + dst_suffix;
+}
 
 int64_t read_dynamic_index(const mlx::core::array& indices, size_t i) {
   switch (indices.dtype()) {
@@ -75,7 +140,13 @@ void copy_gpu_inplace(
   const bool same_dtype = in.dtype() == out.dtype();
   const bool raw_buffer_copy = same_dtype && ctype == CopyType::Vector;
 
-  if (!raw_buffer_copy) {
+  const bool shader_copy =
+      (ctype == CopyType::General || ctype == CopyType::GeneralGeneral) &&
+      !dynamic_i_offset && !dynamic_o_offset && i_offset == 0 &&
+      o_offset == 0 && is_supported_copy_layout(in) &&
+      is_supported_copy_layout(out) && !get_copy_shader_name(in, out).empty();
+
+  if (!raw_buffer_copy && !shader_copy) {
     gpu::synchronize(s);
     auto cpu_stream = default_stream(Device::cpu);
     copy_cpu_inplace(
@@ -94,7 +165,6 @@ void copy_gpu_inplace(
     return;
   }
 
-  // Get Vulkan command buffer
   VkCommandBuffer cmd_buffer = vulkan::begin_command_recording(s.index);
 
   // Get buffer handles
@@ -114,6 +184,29 @@ void copy_gpu_inplace(
     vkCmdCopyBuffer(
         cmd_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
 
+  } else if (shader_copy) {
+    auto shader_name = get_copy_shader_name(in, out);
+    try {
+      vulkan::dispatch_unary_op(in, out, shader_name, cmd_buffer, s);
+    } catch (const std::runtime_error&) {
+      vulkan::end_command_recording(s.index);
+      gpu::synchronize(s);
+      auto cpu_stream = default_stream(Device::cpu);
+      copy_cpu_inplace(
+          in,
+          out,
+          data_shape,
+          i_strides,
+          o_strides,
+          i_offset,
+          o_offset,
+          ctype,
+          cpu_stream,
+          dynamic_i_offset,
+          dynamic_o_offset);
+      synchronize(cpu_stream);
+      return;
+    }
   } else {
     throw std::runtime_error("Unsupported Vulkan copy type.");
   }
