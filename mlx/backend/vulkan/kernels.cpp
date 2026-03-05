@@ -171,6 +171,7 @@ enum class KernelSpecId {
   Argmax,
   Softmax,
   SoftmaxLarge,
+  CumsumMultipass,
 };
 
 struct KernelSpec {
@@ -193,7 +194,7 @@ constexpr KernelSpec make_kernel_spec(
   return {bindings, binding_count, push_constant_size, grid_kind};
 }
 
-constexpr std::array<KernelSpec, 9> kKernelSpecs = {
+constexpr std::array<KernelSpec, 10> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 0, 0, 0},
         3,
@@ -238,6 +239,11 @@ constexpr std::array<KernelSpec, 9> kKernelSpecs = {
         {0, 1, 2, 3, 4, 5},
         6,
         sizeof(SoftmaxPushConstants),
+        DispatchGridKind::RowWise),
+    make_kernel_spec(
+        {0, 1, 2, 0, 0, 0},
+        3,
+        sizeof(SumRowsPushConstants),
         DispatchGridKind::RowWise),
 };
 
@@ -1258,21 +1264,85 @@ void dispatch_cumsum_op(
   }
   const uint32_t row_count = total_elements / row_width;
 
-  // cumsum uses same push constants as sum_rows
   const auto push_constants = make_sum_rows_push_constants(in, out, 1.0f);
 
-  const std::array<BoundArray, 2> bound_arrays = {{
+  const uint32_t elems_per_workgroup = 128u * 4u;
+  const uint32_t num_workgroups_x =
+      (row_width + elems_per_workgroup - 1) / elems_per_workgroup;
+
+  if (num_workgroups_x <= 1) {
+    const std::array<BoundArray, 2> bound_arrays = {{
+        {&in, "src0"},
+        {&out, "dst"},
+    }};
+    dispatch_with_spec(
+        shader_name,
+        KernelSpecId::SumRows,
+        bound_arrays,
+        push_constants,
+        row_count,
+        cmd_buffer,
+        s);
+    return;
+  }
+
+  const uint64_t tmp_elements_u64 = static_cast<uint64_t>(num_workgroups_x) *
+      static_cast<uint64_t>(row_count);
+  if (tmp_elements_u64 >
+      static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Cumsum multipass temporary shape exceeds int range.");
+  }
+  const int tmp_elements = static_cast<int>(tmp_elements_u64);
+
+  array temp({tmp_elements}, float32, nullptr, {});
+  temp.set_data(allocator::malloc(temp.nbytes()));
+
+  const std::array<BoundArray, 3> bound_arrays = {{
       {&in, "src0"},
       {&out, "dst"},
+      {&temp, "tmp"},
   }};
+
+  const std::array<uint32_t, 3> grid = {num_workgroups_x, row_count, 1};
+
   dispatch_with_spec(
-      shader_name,
-      KernelSpecId::SumRows,
+      "cumsum_multipass1_f32",
+      KernelSpecId::CumsumMultipass,
       bound_arrays,
       push_constants,
       row_count,
       cmd_buffer,
-      s);
+      s,
+      grid);
+
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask =
+      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+  vkCmdPipelineBarrier(
+      cmd_buffer,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0,
+      1,
+      &barrier,
+      0,
+      nullptr,
+      0,
+      nullptr);
+
+  dispatch_with_spec(
+      "cumsum_multipass2_f32",
+      KernelSpecId::CumsumMultipass,
+      bound_arrays,
+      push_constants,
+      row_count,
+      cmd_buffer,
+      s,
+      grid);
 }
 
 } // namespace mlx::core::vulkan
