@@ -408,6 +408,184 @@ bool try_eval_arange_vulkan(
   }
 }
 
+int normalize_axis(int axis, int ndim) {
+  if (axis < 0) {
+    axis += ndim;
+  }
+  return axis;
+}
+
+bool has_keepdims_axis_shape(const array& in, const array& out, int axis) {
+  if (in.ndim() != out.ndim()) {
+    return false;
+  }
+
+  for (int i = 0; i < in.ndim(); ++i) {
+    const int64_t expected = (i == axis) ? 1 : in.shape(i);
+    if (out.shape(i) != expected) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool try_eval_reduce_sum_rows_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Reduce::ReduceType reduce_type,
+    const std::vector<int>& axes,
+    Stream s) {
+  if (inputs.size() != 1 || reduce_type != Reduce::Sum || axes.size() != 1) {
+    return false;
+  }
+
+  const auto& in = inputs[0];
+  if (in.dtype() != float32 || out.dtype() != float32) {
+    return false;
+  }
+
+  const int axis = normalize_axis(axes[0], in.ndim());
+  if (axis != in.ndim() - 1) {
+    return false;
+  }
+
+  if (in.ndim() == 0 || in.ndim() > 4 || out.ndim() > 4) {
+    return false;
+  }
+
+  if (!in.flags().row_contiguous || !out.flags().row_contiguous) {
+    return false;
+  }
+
+  if (!has_keepdims_axis_shape(in, out, axis)) {
+    return false;
+  }
+
+  if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out)) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_sum_rows_op(
+        in, out, "sum_rows_f32", command_buffer, s, 1.0f);
+    vulkan::end_command_recording(s.index);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+bool try_eval_arg_reduce_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    ArgReduce::ReduceType reduce_type,
+    int axis,
+    Stream s) {
+  if (inputs.size() != 1 || reduce_type != ArgReduce::ArgMax) {
+    return false;
+  }
+
+  const auto& in = inputs[0];
+  if (in.ndim() == 0 || in.dtype() != float32 || out.dtype() != uint32) {
+    return false;
+  }
+
+  axis = normalize_axis(axis, in.ndim());
+  if (axis != in.ndim() - 1) {
+    return false;
+  }
+
+  if (!in.flags().row_contiguous || !out.flags().row_contiguous) {
+    return false;
+  }
+
+  if (in.offset() != 0 || out.offset() != 0) {
+    return false;
+  }
+
+  if (!has_keepdims_axis_shape(in, out, axis)) {
+    return false;
+  }
+
+  if (in.size() > std::numeric_limits<uint32_t>::max() ||
+      out.size() > std::numeric_limits<uint32_t>::max() ||
+      in.shape(axis) > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_argmax_op(in, out, "argmax_f32", command_buffer, s);
+    vulkan::end_command_recording(s.index);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+bool try_eval_softmax_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    bool /*precise*/,
+    Stream s) {
+  if (inputs.size() != 1) {
+    return false;
+  }
+
+  const auto& in = inputs[0];
+  if (in.ndim() == 0 || in.dtype() != float32 || out.dtype() != float32) {
+    return false;
+  }
+
+  set_unary_output_data(in, out);
+  if (!in.flags().contiguous || !out.flags().contiguous) {
+    return false;
+  }
+
+  if (in.offset() != 0 || out.offset() != 0) {
+    return false;
+  }
+
+  if (in.shape() != out.shape() || in.strides().back() != 1 ||
+      out.strides().back() != 1) {
+    return false;
+  }
+
+  if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out)) {
+    return false;
+  }
+
+  if (in.size() > std::numeric_limits<uint32_t>::max() ||
+      out.size() > std::numeric_limits<uint32_t>::max() ||
+      in.shape(in.ndim() - 1) > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+
+  if (out.size() == 0) {
+    return true;
+  }
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_softmax_op(in, out, "soft_max_f32", command_buffer, s);
+    vulkan::end_command_recording(s.index);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
 } // namespace
 
 #define CPU_FALLBACK(func)                                            \
@@ -467,7 +645,6 @@ bool try_eval_arange_vulkan(
   }
 
 CPU_FALLBACK_STATE(Equal)
-CPU_FALLBACK_STATE(Reduce)
 CPU_FALLBACK(Minimum)
 CPU_FALLBACK(Maximum)
 CPU_FALLBACK_STATE(RandomBits)
@@ -476,6 +653,30 @@ VULKAN_BINARY_GPU(Add, "add")
 VULKAN_BINARY_GPU(Divide, "div")
 VULKAN_BINARY_GPU(Subtract, "sub")
 VULKAN_BINARY_GPU(Multiply, "mul")
+
+void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto [reduce_type, axis] = state();
+  if (try_eval_arg_reduce_vulkan(inputs, out, reduce_type, axis, stream())) {
+    return;
+  }
+  eval_cpu_fallback<ArgReduce>(inputs, out, reduce_type, axis);
+}
+
+void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto [reduce_type, axes] = state();
+  if (try_eval_reduce_sum_rows_vulkan(
+          inputs, out, reduce_type, axes, stream())) {
+    return;
+  }
+  eval_cpu_fallback<Reduce>(inputs, out, reduce_type, axes);
+}
+
+void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (try_eval_softmax_vulkan(inputs, out, state(), stream())) {
+    return;
+  }
+  eval_cpu_fallback<Softmax>(inputs, out, state());
+}
 
 VULKAN_GENERIC_UNARY_GPU(Abs, "abs")
 
@@ -594,7 +795,6 @@ CPU_FALLBACK(ArcTan)
 CPU_FALLBACK(ArcTan2)
 CPU_FALLBACK(ArcTanh)
 CPU_FALLBACK_STATE(ArgPartition)
-CPU_FALLBACK_STATE(ArgReduce)
 CPU_FALLBACK_STATE(ArgSort)
 CPU_FALLBACK_STATE(BitwiseBinary)
 CPU_FALLBACK(BitwiseInvert)
@@ -647,7 +847,7 @@ CPU_FALLBACK_STATE(QuantizedMatmul)
 CPU_FALLBACK_STATE(QQMatmul)
 // RandomBits has CPU fallback above.
 CPU_FALLBACK(Real)
-// Reduce has CPU fallback above.
+// Reduce implemented above.
 // Round implemented above.
 CPU_FALLBACK_STATE(Scan)
 CPU_FALLBACK_STATE(Scatter)
@@ -658,7 +858,6 @@ CPU_FALLBACK(SegmentedMM)
 CPU_FALLBACK(Sign)
 // Sin implemented above.
 CPU_FALLBACK(Sinh)
-CPU_FALLBACK_STATE(Softmax)
 CPU_FALLBACK_STATE(Sort)
 // Square implemented above.
 // Sqrt implemented above.

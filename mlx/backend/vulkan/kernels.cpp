@@ -47,6 +47,15 @@ uint32_t checked_u32(int64_t value, const char* name) {
   return static_cast<uint32_t>(value);
 }
 
+uint32_t checked_mul_u32(uint32_t a, uint32_t b, const char* name) {
+  const uint64_t product = static_cast<uint64_t>(a) * static_cast<uint64_t>(b);
+  if (product > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(
+        std::string("[vulkan::kernels] ") + name + " is out of uint32 range.");
+  }
+  return static_cast<uint32_t>(product);
+}
+
 struct TensorLayout4D {
   uint32_t ne00{1};
   uint32_t ne01{1};
@@ -148,6 +157,7 @@ VkDescriptorBufferInfo make_buffer_info(const array& arr, const char* name) {
 enum class DispatchGridKind {
   ElementWise,
   Linear1D,
+  RowWise,
 };
 
 enum class KernelSpecId {
@@ -156,6 +166,9 @@ enum class KernelSpecId {
   Unary,
   GenericUnary,
   Arange,
+  SumRows,
+  Argmax,
+  Softmax,
 };
 
 struct KernelSpec {
@@ -178,7 +191,7 @@ constexpr KernelSpec make_kernel_spec(
   return {bindings, binding_count, push_constant_size, grid_kind};
 }
 
-constexpr std::array<KernelSpec, 5> kKernelSpecs = {
+constexpr std::array<KernelSpec, 8> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 0},
         3,
@@ -204,6 +217,21 @@ constexpr std::array<KernelSpec, 5> kKernelSpecs = {
         1,
         sizeof(GenericPushConstants),
         DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 0, 0},
+        2,
+        sizeof(SumRowsPushConstants),
+        DispatchGridKind::RowWise),
+    make_kernel_spec(
+        {0, 1, 0, 0},
+        2,
+        sizeof(GenericPushConstants),
+        DispatchGridKind::RowWise),
+    make_kernel_spec(
+        {0, 1, 2, 3},
+        4,
+        sizeof(SoftmaxPushConstants),
+        DispatchGridKind::RowWise),
 };
 
 size_t kernel_spec_index(KernelSpecId id) {
@@ -247,6 +275,8 @@ std::tuple<uint32_t, uint32_t, uint32_t> get_dispatch_grid_dims(
           (num_elements + VULKAN_INDEX_TILE_SIZE - 1) / VULKAN_INDEX_TILE_SIZE,
           1,
           1};
+    case DispatchGridKind::RowWise:
+      return get_element_wise_grid_dims(num_elements, 1);
   }
 
   throw std::runtime_error("[vulkan::kernels] Unsupported dispatch grid kind.");
@@ -350,6 +380,67 @@ GenericPushConstants make_generic_push_constants(
   push_constants.param2 = param2;
   push_constants.param3 = param3;
   push_constants.param4 = param4;
+  return push_constants;
+}
+
+SumRowsPushConstants
+make_sum_rows_push_constants(const array& in, const array& out, float weight) {
+  const auto in_layout = make_tensor_layout_4d(in, "src0");
+  const auto out_layout = make_tensor_layout_4d(out, "dst");
+
+  SumRowsPushConstants push_constants{};
+  push_constants.n_cols = in_layout.ne00;
+  push_constants.ne01 = in_layout.ne01;
+  push_constants.ne02 = in_layout.ne02;
+  push_constants.nb01 = in_layout.nb01;
+  push_constants.nb02 = in_layout.nb02;
+  push_constants.nb03 = in_layout.nb03;
+  push_constants.nb11 = out_layout.nb01;
+  push_constants.nb12 = out_layout.nb02;
+  push_constants.nb13 = out_layout.nb03;
+  push_constants.weight = weight;
+
+  const uint32_t a_offset = checked_offset(in, "src0", 0xFFFFu);
+  const uint32_t d_offset = checked_offset(out, "dst", 0xFFFFu);
+  push_constants.misalign_offsets = (a_offset << 16) | d_offset;
+
+  const uint32_t ne0_12 = checked_mul_u32(
+      push_constants.ne01, push_constants.ne02, "sum_rows ne01*ne02");
+  init_fastdiv_values(ne0_12, push_constants.ne0_12mp, push_constants.ne0_12L);
+  init_fastdiv_values(
+      push_constants.ne01, push_constants.ne0_1mp, push_constants.ne0_1L);
+
+  return push_constants;
+}
+
+SoftmaxPushConstants make_softmax_push_constants(
+    const array& in,
+    uint32_t row_width,
+    uint32_t row_count) {
+  SoftmaxPushConstants push_constants{};
+  push_constants.KX = row_width;
+  push_constants.KY = 0;
+  push_constants.ne00 = row_width;
+  push_constants.ne01 = 1;
+  push_constants.ne02 = 1;
+  push_constants.ne12 = 1;
+  push_constants.ne13 = 1;
+  push_constants.nb11 = 0;
+  push_constants.nb12 = 0;
+  push_constants.nb13 = 0;
+  push_constants.scale = 1.0f;
+  push_constants.max_bias = 0.0f;
+  push_constants.m0 = 0.0f;
+  push_constants.m1 = 0.0f;
+  push_constants.n_head_log2 = 0;
+  push_constants.nrows_x = row_count;
+  push_constants.has_sinks = 0;
+
+  if (in.ndim() > 4) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Softmax supports rank <= 4 for Vulkan kernels.");
+  }
+
   return push_constants;
 }
 
@@ -877,6 +968,115 @@ void dispatch_arange_op(
       bound_arrays,
       push_constants,
       push_constants.KX,
+      cmd_buffer,
+      s);
+}
+
+void dispatch_sum_rows_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    float weight) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  const auto push_constants = make_sum_rows_push_constants(in, out, weight);
+  const auto row_count = checked_u32(out.size(), "sum_rows output rows");
+
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src0"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::SumRows,
+      bound_arrays,
+      push_constants,
+      row_count,
+      cmd_buffer,
+      s);
+}
+
+void dispatch_argmax_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  if (in.ndim() == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] ArgMax requires input rank >= 1.");
+  }
+
+  const uint32_t row_width =
+      checked_u32(in.shape(in.ndim() - 1), "argmax reduction width");
+  const uint32_t row_count = checked_u32(out.size(), "argmax row count");
+  auto push_constants =
+      make_generic_push_constants(row_width, 0.0f, 0.0f, 0.0f, 0.0f);
+  push_constants.KY = row_count;
+
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src0"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::Argmax,
+      bound_arrays,
+      push_constants,
+      push_constants.KY,
+      cmd_buffer,
+      s);
+}
+
+void dispatch_softmax_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  if (in.ndim() == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Softmax requires input rank >= 1.");
+  }
+
+  const uint32_t row_width = checked_u32(in.shape(in.ndim() - 1), "softmax KX");
+  if (row_width == 0) {
+    throw std::runtime_error("[vulkan::kernels] Softmax requires non-zero KX.");
+  }
+
+  const uint32_t total_elements = checked_u32(out.size(), "softmax elements");
+  if (total_elements % row_width != 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Softmax elements are not divisible by KX.");
+  }
+  const uint32_t row_count = total_elements / row_width;
+  const auto push_constants =
+      make_softmax_push_constants(in, row_width, row_count);
+
+  const std::array<BoundArray, 4> bound_arrays = {{
+      {&in, "src0"},
+      {&in, "src1"},
+      {&in, "src2"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::Softmax,
+      bound_arrays,
+      push_constants,
+      push_constants.nrows_x,
       cmd_buffer,
       s);
 }

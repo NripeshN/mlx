@@ -159,6 +159,44 @@ struct GenericPushConstants {
   float param4;
 };
 
+struct SumRowsPushConstants {
+  uint32_t n_cols;
+  uint32_t ne01;
+  uint32_t ne02;
+  uint32_t nb01;
+  uint32_t nb02;
+  uint32_t nb03;
+  uint32_t nb11;
+  uint32_t nb12;
+  uint32_t nb13;
+  float weight;
+  uint32_t misalign_offsets;
+  uint32_t ne0_12mp;
+  uint32_t ne0_12L;
+  uint32_t ne0_1mp;
+  uint32_t ne0_1L;
+};
+
+struct SoftmaxPushConstants {
+  uint32_t KX;
+  uint32_t KY;
+  uint32_t ne00;
+  uint32_t ne01;
+  uint32_t ne02;
+  uint32_t ne12;
+  uint32_t ne13;
+  uint32_t nb11;
+  uint32_t nb12;
+  uint32_t nb13;
+  float scale;
+  float max_bias;
+  float m0;
+  float m1;
+  uint32_t n_head_log2;
+  uint32_t nrows_x;
+  uint32_t has_sinks;
+};
+
 enum class BinaryDispatchVariant {
   Standard,
   AddWithPartials,
@@ -201,6 +239,28 @@ void dispatch_arange_op(
     const Stream& s,
     float start,
     float step);
+
+void dispatch_sum_rows_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    float weight = 1.0f);
+
+void dispatch_argmax_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s);
+
+void dispatch_softmax_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s);
 
 // Get workgroup dimensions for element-wise operations.
 // Returns (workgroup_count_x, workgroup_count_y, workgroup_count_z)

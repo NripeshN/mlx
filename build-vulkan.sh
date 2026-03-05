@@ -40,7 +40,7 @@ if [ "$BUILD_WHEEL" = "1" ]; then
   rm -rf wheelhouse
   mkdir -p wheelhouse
   CMAKE_ARGS="$CMAKE_ARGS" uv build --wheel --python 3.13 --out-dir wheelhouse .
-  ln -sf wheelhouse/*.whl mlx-0.30.7-cp313-cp313-linux_x86_64.whl
+  ln -sf wheelhouse/*.whl mlx-0.31.1-cp313-cp313-linux_x86_64.whl
 else
   if [ -n "${PIP_VERBOSE_FLAG}" ]; then
     CMAKE_ARGS="$CMAKE_ARGS" pip install "$PIP_VERBOSE_FLAG" -e .
