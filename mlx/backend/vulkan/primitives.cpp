@@ -1,12 +1,18 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/distributed/primitives.h"
+#include "mlx/backend/common/binary.h"
+#include "mlx/backend/common/unary.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/gpu/slicing.h"
+#include "mlx/backend/vulkan/device.h"
+#include "mlx/backend/vulkan/kernels.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/primitives.h"
 #include "mlx/transforms.h"
 
+#include <limits>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -83,6 +89,186 @@ void eval_cpu_fallback_multi_with_state(
   }
 }
 
+bool is_vulkan_float_dtype(Dtype dtype) {
+  return dtype == float16 || dtype == float32;
+}
+
+std::string dtype_suffix(Dtype dtype) {
+  switch (dtype) {
+    case float16:
+      return "f16";
+    case float32:
+      return "f32";
+    default:
+      return {};
+  }
+}
+
+bool is_supported_elementwise_layout(const array& arr) {
+  if (arr.ndim() > 4 || !arr.flags().row_contiguous || arr.offset() != 0) {
+    return false;
+  }
+  if (arr.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  for (auto dim : arr.shape()) {
+    if (dim < 0 || dim > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+  }
+  for (auto stride : arr.strides()) {
+    if (stride < 0 || stride > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool is_supported_unary_layout(const array& arr) {
+  if (arr.ndim() > 4 || arr.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  if (arr.offset() < 0 || arr.offset() > 0xFFFF) {
+    return false;
+  }
+  for (auto dim : arr.shape()) {
+    if (dim < 0 || dim > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+  }
+  for (auto stride : arr.strides()) {
+    if (stride < 0 || stride > std::numeric_limits<uint32_t>::max()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename Primitive>
+bool try_eval_binary_op_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    const char* op_name,
+    Stream s) {
+  if (inputs.size() != 2) {
+    return false;
+  }
+
+  const auto& a = inputs[0];
+  const auto& b = inputs[1];
+  if (!is_vulkan_float_dtype(a.dtype()) || !is_vulkan_float_dtype(b.dtype()) ||
+      !is_vulkan_float_dtype(out.dtype())) {
+    return false;
+  }
+
+  if (std::string_view(op_name) == "div" &&
+      (a.dtype() == float16 || b.dtype() == float16 ||
+       out.dtype() == float16)) {
+    return false;
+  }
+
+  if (a.shape() != out.shape() || b.shape() != out.shape()) {
+    return false;
+  }
+
+  if (!is_supported_elementwise_layout(a) ||
+      !is_supported_elementwise_layout(b)) {
+    return false;
+  }
+
+  auto suffix_a = dtype_suffix(a.dtype());
+  auto suffix_b = dtype_suffix(b.dtype());
+  auto suffix_out = dtype_suffix(out.dtype());
+  if (suffix_a.empty() || suffix_b.empty() || suffix_out.empty()) {
+    return false;
+  }
+
+  auto bopt = get_binary_op_type(a, b);
+  set_binary_op_output_data(a, b, out, bopt);
+  if (!is_supported_elementwise_layout(out)) {
+    return false;
+  }
+
+  if (out.size() == 0) {
+    return true;
+  }
+
+  std::string shader_name =
+      std::string(op_name) + "_" + suffix_a + "_" + suffix_b + "_" + suffix_out;
+  if (out.dtype() == float16) {
+    shader_name += "_rte";
+  }
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_binary_op(a, b, out, shader_name, command_buffer, s);
+    vulkan::end_command_recording(s.index);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+template <typename Primitive>
+void eval_binary_vulkan_or_cpu(
+    const std::vector<array>& inputs,
+    array& out,
+    const char* op_name,
+    Stream s) {
+  if (try_eval_binary_op_vulkan<Primitive>(inputs, out, op_name, s)) {
+    return;
+  }
+  eval_cpu_fallback<Primitive>(inputs, out);
+}
+
+template <typename Primitive>
+bool try_eval_unary_op_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    const std::string& shader_name,
+    Stream s,
+    float param1 = 0.0f,
+    float param2 = 0.0f) {
+  if (inputs.size() != 1) {
+    return false;
+  }
+
+  const auto& in = inputs[0];
+  set_unary_output_data(in, out);
+  if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out)) {
+    return false;
+  }
+
+  if (out.size() == 0) {
+    return true;
+  }
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_unary_op(
+        in, out, shader_name, command_buffer, s, param1, param2);
+    vulkan::end_command_recording(s.index);
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+template <typename Primitive>
+void eval_unary_vulkan_or_cpu(
+    const std::vector<array>& inputs,
+    array& out,
+    const std::string& shader_name,
+    Stream s,
+    float param1 = 0.0f,
+    float param2 = 0.0f) {
+  if (try_eval_unary_op_vulkan<Primitive>(
+          inputs, out, shader_name, s, param1, param2)) {
+    return;
+  }
+  eval_cpu_fallback<Primitive>(inputs, out);
+}
+
 } // namespace
 
 #define CPU_FALLBACK(func)                                            \
@@ -124,15 +310,69 @@ void eval_cpu_fallback_multi_with_state(
     throw std::runtime_error(#func " has no Vulkan implementation."); \
   }
 
-CPU_FALLBACK(Add)
 CPU_FALLBACK_STATE(Equal)
 CPU_FALLBACK_STATE(Reduce)
-CPU_FALLBACK(Divide)
-CPU_FALLBACK(Subtract)
 CPU_FALLBACK(Minimum)
 CPU_FALLBACK(Maximum)
-CPU_FALLBACK(Multiply)
 CPU_FALLBACK_STATE(RandomBits)
+
+void Add::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval_binary_vulkan_or_cpu<Add>(inputs, out, "add", stream());
+}
+
+void Divide::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval_binary_vulkan_or_cpu<Divide>(inputs, out, "div", stream());
+}
+
+void Subtract::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval_binary_vulkan_or_cpu<Subtract>(inputs, out, "sub", stream());
+}
+
+void Multiply::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval_binary_vulkan_or_cpu<Multiply>(inputs, out, "mul", stream());
+}
+
+void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval_cpu_fallback<Cos>(inputs, out);
+}
+
+void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+    if (state() == Log::e && out.dtype() == float32) {
+      if (try_eval_unary_op_vulkan<Log>(inputs, out, "log_f32", stream())) {
+        return;
+      }
+    }
+    if (state() == Log::e && out.dtype() == float16) {
+      if (try_eval_unary_op_vulkan<Log>(inputs, out, "log_f16_rte", stream())) {
+        return;
+      }
+    }
+  }
+  eval_cpu_fallback<Log>(inputs, out, state());
+}
+
+void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
+  eval_cpu_fallback<Sin>(inputs, out);
+}
+
+void Square::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
+      out.dtype() == float32) {
+    eval_unary_vulkan_or_cpu<Square>(inputs, out, "sqr_f32", stream());
+    return;
+  }
+  eval_cpu_fallback<Square>(inputs, out);
+}
+
+void Sqrt::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (!state() && inputs.size() == 1 && inputs[0].dtype() == float32 &&
+      out.dtype() == float32) {
+    eval_unary_vulkan_or_cpu<Sqrt>(inputs, out, "sqrt_f32", stream());
+    return;
+  }
+  eval_cpu_fallback<Sqrt>(inputs, out, state());
+}
 
 void Compiled::eval_gpu(
     const std::vector<array>& inputs,
@@ -174,7 +414,7 @@ bool fast::ScaledDotProductAttentionVJP::use_fallback(
 }
 
 CPU_FALLBACK(Abs)
-// Add has CPU fallback above.
+// Add implemented above.
 // AddMM implemented in matmul.cpp
 CPU_FALLBACK_STATE(Arange)
 CPU_FALLBACK(ArcCos)
@@ -194,9 +434,9 @@ CPU_FALLBACK(Ceil)
 // Compiled has CPU fallback above.
 CPU_FALLBACK(Conjugate)
 CPU_FALLBACK_STATE(Convolution)
-CPU_FALLBACK(Cos)
+// Cos implemented above.
 CPU_FALLBACK(Cosh)
-// Divide has CPU fallback above.
+// Divide implemented above.
 CPU_FALLBACK_MULTI(DivMod)
 CPU_FALLBACK(Remainder)
 // Equal has CPU fallback above.
@@ -217,7 +457,7 @@ CPU_FALLBACK(Imag)
 CPU_FALLBACK(Less)
 CPU_FALLBACK(LessEqual)
 // Load has CPU fallback above.
-CPU_FALLBACK_STATE(Log)
+// Log implemented above.
 CPU_FALLBACK(Log1p)
 CPU_FALLBACK(LogicalNot)
 CPU_FALLBACK(LogicalAnd)
@@ -228,7 +468,7 @@ CPU_FALLBACK_MULTI(LUF)
 // Matmul implemented in matmul.cpp
 // Maximum has CPU fallback above.
 // Minimum has CPU fallback above.
-// Multiply has CPU fallback above.
+// Multiply implemented above.
 CPU_FALLBACK(Negative)
 CPU_FALLBACK(NotEqual)
 CPU_FALLBACK_STATE(Partition)
@@ -247,13 +487,13 @@ CPU_FALLBACK(Select)
 CPU_FALLBACK(SegmentedMM)
 CPU_FALLBACK(Sigmoid)
 CPU_FALLBACK(Sign)
-CPU_FALLBACK(Sin)
+// Sin implemented above.
 CPU_FALLBACK(Sinh)
 CPU_FALLBACK_STATE(Softmax)
 CPU_FALLBACK_STATE(Sort)
-CPU_FALLBACK(Square)
-CPU_FALLBACK_STATE(Sqrt)
-// Subtract has CPU fallback above.
+// Square implemented above.
+// Sqrt implemented above.
+// Subtract implemented above.
 CPU_FALLBACK_MULTI_STATE(SVD)
 CPU_FALLBACK(Tan)
 CPU_FALLBACK(Tanh)
