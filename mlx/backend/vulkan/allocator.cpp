@@ -114,12 +114,6 @@ Buffer VulkanAllocator::malloc(size_t size) {
           << ") exceeded.";
       throw std::runtime_error(msg.str());
     }
-    if (active_memory_ + size > block_limit_) {
-      std::ostringstream msg;
-      msg << "[vulkan::malloc] Memory limit (" << block_limit_
-          << " bytes) exceeded while allocating " << size << " bytes.";
-      throw std::runtime_error(msg.str());
-    }
   }
 
   auto& ctx = VulkanContext::get();
@@ -139,6 +133,29 @@ Buffer VulkanAllocator::malloc(size_t size) {
 
   VkMemoryRequirements mem_requirements{};
   vkGetBufferMemoryRequirements(device, vk_buffer, &mem_requirements);
+  const size_t allocation_size = static_cast<size_t>(mem_requirements.size);
+
+  {
+    std::unique_lock lk(mutex_);
+    if (num_resources_ >= resource_limit_) {
+      vkDestroyBuffer(device, vk_buffer, nullptr);
+      std::ostringstream msg;
+      msg << "[vulkan::malloc] Resource limit (" << resource_limit_
+          << ") exceeded.";
+      throw std::runtime_error(msg.str());
+    }
+
+    const bool exceeds_limit = active_memory_ > block_limit_ ||
+        allocation_size > (block_limit_ - active_memory_);
+    if (exceeds_limit) {
+      vkDestroyBuffer(device, vk_buffer, nullptr);
+      std::ostringstream msg;
+      msg << "[vulkan::malloc] Memory limit (" << block_limit_
+          << " bytes) exceeded while allocating " << size << " bytes ("
+          << allocation_size << " bytes with alignment).";
+      throw std::runtime_error(msg.str());
+    }
+  }
 
   std::vector<VkMemoryPropertyFlags> preferred_memory_types;
   if (ctx.is_unified_memory()) {
@@ -203,12 +220,7 @@ Buffer VulkanAllocator::malloc(size_t size) {
   }
 
   auto* buf = new VulkanBuffer{
-      mapped_ptr,
-      vk_buffer,
-      vk_memory,
-      size,
-      static_cast<size_t>(mem_requirements.size),
-      memory_flags};
+      mapped_ptr, vk_buffer, vk_memory, size, allocation_size, memory_flags};
 
   {
     std::unique_lock lk(mutex_);
@@ -239,9 +251,9 @@ void VulkanAllocator::free(Buffer buffer) {
 
   auto device = VulkanContext::get().device();
 
-  // Match ggml-vulkan destruction order.
-  vkFreeMemory(device, buf->memory, nullptr);
+  // A buffer must be destroyed before freeing its bound memory.
   vkDestroyBuffer(device, buf->buffer, nullptr);
+  vkFreeMemory(device, buf->memory, nullptr);
 
   delete buf;
 }

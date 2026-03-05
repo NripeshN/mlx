@@ -7,53 +7,70 @@ if(Vulkan_FOUND)
   function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VARIABLE)
     execute_process(
       COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
+      RESULT_VARIABLE glslc_result
       OUTPUT_VARIABLE glslc_output
       ERROR_VARIABLE glslc_error
     )
-    
-    if(${glslc_error} MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
+
+    if(glslc_result EQUAL 0)
+      message(STATUS "${EXTENSION_NAME} supported by glslc")
+      set(${RESULT_VARIABLE} ON PARENT_SCOPE)
+    elseif(glslc_error MATCHES ".*extension not supported: ${EXTENSION_NAME}.*")
       message(STATUS "${EXTENSION_NAME} not supported by glslc")
       set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
     else()
-      message(STATUS "${EXTENSION_NAME} supported by glslc")
-      set(${RESULT_VARIABLE} ON PARENT_SCOPE)
+      message(STATUS "${EXTENSION_NAME} probe failed; assuming unsupported")
+      set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
     endif()
   endfunction()
-  
+
   # Test extensions
-  set(VULKAN_SHADER_GEN_CMAKE_ARGS "")
-  
+  set(VULKAN_SHADER_GEN_CMAKE_ARGS)
+
   test_shader_extension_support(
     "GL_KHR_cooperative_matrix"
     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/feature-tests/coopmat.comp"
     "MLX_VULKAN_COOPMAT_GLSLC_SUPPORT"
   )
-  
+
   test_shader_extension_support(
     "GL_NV_cooperative_matrix2"
     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/feature-tests/coopmat2.comp"
     "MLX_VULKAN_COOPMAT2_GLSLC_SUPPORT"
   )
-  
+
   test_shader_extension_support(
     "GL_EXT_integer_dot_product"
     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/feature-tests/integer_dot.comp"
     "MLX_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
   )
-  
+
   test_shader_extension_support(
     "GL_EXT_bfloat16"
     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/feature-tests/bfloat16.comp"
     "MLX_VULKAN_BFLOAT16_GLSLC_SUPPORT"
   )
-  
+
+  if(MLX_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+  endif()
+  if(MLX_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+    list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+  endif()
+  if(MLX_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+  endif()
+  if(MLX_VULKAN_BFLOAT16_GLSLC_SUPPORT)
+    list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
+  endif()
+
   # Build shader generator tool
   set(SHADER_GEN_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kernels/vulkan-shaders-gen.cpp")
   set(SHADER_GEN_BIN "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders-gen")
-  
+
   add_custom_command(
     OUTPUT ${SHADER_GEN_BIN}
-    COMMAND ${CMAKE_CXX_COMPILER} -std=c++17 -O2 -o ${SHADER_GEN_BIN} ${SHADER_GEN_SRC} -lpthread
+    COMMAND ${CMAKE_CXX_COMPILER} -std=c++17 -O2 ${VULKAN_SHADER_GEN_CMAKE_ARGS} -o ${SHADER_GEN_BIN} ${SHADER_GEN_SRC} -lpthread
     DEPENDS ${SHADER_GEN_SRC}
     COMMENT "Building Vulkan shader generator"
   )

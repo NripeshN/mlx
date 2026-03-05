@@ -11,6 +11,13 @@ namespace mlx::core::vulkan {
 
 const std::unordered_map<std::string, std::variant<std::string, size_t>>&
 device_info(int device_index) {
+  static std::unordered_map<std::string, std::variant<std::string, size_t>>
+      empty;
+
+  if (device_index != 0 || !is_available()) {
+    return empty;
+  }
+
   auto init_device_info = []()
       -> std::unordered_map<std::string, std::variant<std::string, size_t>> {
     const VulkanContext& ctx = VulkanContext::get();
@@ -130,14 +137,7 @@ device_info(int device_index) {
   };
 
   static auto device_info_ = init_device_info();
-  static std::unordered_map<std::string, std::variant<std::string, size_t>>
-      empty;
-
-  if (device_index == 0) {
-    return device_info_;
-  } else {
-    return empty;
-  }
+  return device_info_;
 }
 
 } // namespace mlx::core::vulkan
@@ -149,7 +149,7 @@ bool is_available() {
 }
 
 int device_count() {
-  return 1;
+  return mlx::core::vulkan::device_count();
 }
 
 const std::unordered_map<std::string, std::variant<std::string, size_t>>&

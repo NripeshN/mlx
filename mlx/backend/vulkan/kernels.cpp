@@ -2,10 +2,30 @@
 
 #include "mlx/backend/vulkan/kernels.h"
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
 #include "mlx/backend/vulkan/vulkan.h"
 
 namespace mlx::core::vulkan {
+
+namespace {
+
+std::string make_pipeline_key(
+    const std::string& shader_name,
+    const std::vector<VkDescriptorSetLayoutBinding>& bindings,
+    uint32_t push_constant_size) {
+  std::ostringstream key;
+  key << shader_name << "|pc=" << push_constant_size
+      << "|n=" << bindings.size();
+  for (const auto& binding : bindings) {
+    key << "|b=" << binding.binding << ",t=" << binding.descriptorType
+        << ",c=" << binding.descriptorCount << ",s=" << binding.stageFlags
+        << ",i=" << (binding.pImmutableSamplers != nullptr ? 1 : 0);
+  }
+  return key.str();
+}
+
+} // namespace
 
 ShaderModule::~ShaderModule() {
   if (module != VK_NULL_HANDLE) {
@@ -32,8 +52,8 @@ KernelManager::~KernelManager() {
 }
 
 KernelManager& KernelManager::get() {
-  static KernelManager manager;
-  return manager;
+  static auto* manager = new KernelManager();
+  return *manager;
 }
 
 void KernelManager::register_shader(
@@ -87,11 +107,8 @@ ComputePipeline* KernelManager::get_pipeline(
     const std::string& shader_name,
     const std::vector<VkDescriptorSetLayoutBinding>& bindings,
     uint32_t push_constant_size) {
-  // Create a unique key based on shader and bindings
-  std::string pipeline_key = shader_name;
-  for (const auto& binding : bindings) {
-    pipeline_key += "_" + std::to_string(binding.binding);
-  }
+  std::string pipeline_key =
+      make_pipeline_key(shader_name, bindings, push_constant_size);
 
   auto it = pipelines_.find(pipeline_key);
   if (it != pipelines_.end()) {
@@ -257,6 +274,29 @@ std::tuple<uint32_t, uint32_t, uint32_t> get_element_wise_grid_dims(
   uint32_t workgroups = static_cast<uint32_t>(
       (num_elements + workgroup_size - 1) / workgroup_size);
   return {workgroups, 1, 1};
+}
+
+void dispatch_binary_op(
+    const array&,
+    const array&,
+    array&,
+    const std::string&,
+    VkCommandBuffer,
+    const Stream&) {
+  throw std::runtime_error(
+      "[vulkan::dispatch_binary_op] Not implemented for Vulkan backend.");
+}
+
+void dispatch_unary_op(
+    const array&,
+    array&,
+    const std::string&,
+    VkCommandBuffer,
+    const Stream&,
+    float,
+    float) {
+  throw std::runtime_error(
+      "[vulkan::dispatch_unary_op] Not implemented for Vulkan backend.");
 }
 
 } // namespace mlx::core::vulkan

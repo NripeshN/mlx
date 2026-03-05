@@ -11,20 +11,26 @@
 namespace mlx::core {
 
 void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
-  // For now, fall back to CPU implementation
-  // TODO: Implement Vulkan matmul using mul_mm.comp shaders
-  eval_cpu(inputs, out);
+  auto cpu_stream = default_stream(Device::cpu);
+  Matmul cpu_matmul(cpu_stream);
+  cpu_matmul.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
 }
 
 void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  // For now, fall back to CPU implementation
-  // TODO: Implement Vulkan AddMM using mul_mm.comp shaders
-  eval_cpu(inputs, out);
+  auto [alpha, beta] = state();
+  auto cpu_stream = default_stream(Device::cpu);
+  AddMM cpu_addmm(cpu_stream, alpha, beta);
+  cpu_addmm.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
 }
 
 void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  // For now, fall back to CPU implementation
-  eval_cpu(inputs, out);
+  auto block_size = state();
+  auto cpu_stream = default_stream(Device::cpu);
+  BlockMaskedMM cpu_block_masked_mm(cpu_stream, block_size);
+  cpu_block_masked_mm.eval_cpu(inputs, out);
+  synchronize(cpu_stream);
 }
 
 } // namespace mlx::core

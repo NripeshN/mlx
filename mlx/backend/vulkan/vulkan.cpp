@@ -1,10 +1,47 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/backend/vulkan/vulkan.h"
-#include <iostream>
+
+#include <mutex>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace mlx::core::vulkan {
+
+namespace {
+
+void throw_if_vk_error(VkResult result, const std::string& context) {
+  if (result != VK_SUCCESS) {
+    throw std::runtime_error(
+        context + " (VkResult=" + std::to_string(result) + ").");
+  }
+}
+
+bool find_compute_queue_family(
+    VkPhysicalDevice physical_device,
+    uint32_t& queue_family_index) {
+  uint32_t queue_family_count = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(
+      physical_device, &queue_family_count, nullptr);
+  if (queue_family_count == 0) {
+    return false;
+  }
+
+  std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
+  vkGetPhysicalDeviceQueueFamilyProperties(
+      physical_device, &queue_family_count, queue_families.data());
+
+  for (uint32_t i = 0; i < queue_family_count; ++i) {
+    if ((queue_families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
+      queue_family_index = i;
+      return true;
+    }
+  }
+  return false;
+}
+
+} // namespace
 
 bool is_available() {
   try {
@@ -20,133 +57,152 @@ bool is_unified_memory() {
 }
 
 int device_count() {
-  return 1; // For now, support single device
+  return is_available() ? 1 : 0;
 }
 
 VulkanContext& VulkanContext::get() {
   static VulkanContext context;
-  if (!context.initialized_) {
-    context.init();
-  }
+  static std::once_flag init_once;
+  auto* context_ptr = &context;
+  std::call_once(init_once, [context_ptr]() { context_ptr->init(); });
   return context;
 }
 
-VulkanContext::VulkanContext() {}
+VulkanContext::VulkanContext() = default;
 
 VulkanContext::~VulkanContext() {
   cleanup();
 }
 
 void VulkanContext::init() {
-  if (initialized_)
+  if (initialized_) {
     return;
-
-  // 1. Create Instance
-  VkApplicationInfo appInfo{};
-  appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-  appInfo.pApplicationName = "MLX Vulkan Backend";
-  appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-  appInfo.pEngineName = "MLX";
-  appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-  appInfo.apiVersion = VK_API_VERSION_1_2;
-
-  VkInstanceCreateInfo createInfo{};
-  createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-  createInfo.pApplicationInfo = &appInfo;
-
-  if (vkCreateInstance(&createInfo, nullptr, &instance_) != VK_SUCCESS) {
-    throw std::runtime_error("failed to create Vulkan instance");
   }
 
-  // 2. Pick Physical Device
-  uint32_t deviceCount = 0;
-  vkEnumeratePhysicalDevices(instance_, &deviceCount, nullptr);
-  if (deviceCount == 0) {
-    throw std::runtime_error("failed to find GPUs with Vulkan support");
-  }
+  VkInstance instance = VK_NULL_HANDLE;
+  VkPhysicalDevice physical_device = VK_NULL_HANDLE;
+  VkDevice device = VK_NULL_HANDLE;
+  VkQueue compute_queue = VK_NULL_HANDLE;
+  uint32_t compute_queue_family_index = 0;
+  bool is_unified_memory = false;
+  VkPhysicalDeviceMemoryProperties mem_properties{};
 
-  std::vector<VkPhysicalDevice> devices(deviceCount);
-  vkEnumeratePhysicalDevices(instance_, &deviceCount, devices.data());
+  try {
+    // 1. Create instance
+    VkApplicationInfo app_info{};
+    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app_info.pApplicationName = "MLX Vulkan Backend";
+    app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+    app_info.pEngineName = "MLX";
+    app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+    app_info.apiVersion = VK_API_VERSION_1_2;
 
-  // Just pick the first one for now
-  physical_device_ = devices[0];
+    VkInstanceCreateInfo create_info{};
+    create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    create_info.pApplicationInfo = &app_info;
 
-  // 3. Get memory properties and check for unified memory
-  vkGetPhysicalDeviceMemoryProperties(physical_device_, &mem_properties_);
+    throw_if_vk_error(
+        vkCreateInstance(&create_info, nullptr, &instance),
+        "[vulkan::init] Failed to create Vulkan instance");
 
-  // Check if device is integrated (unified memory)
-  VkPhysicalDeviceProperties deviceProperties;
-  vkGetPhysicalDeviceProperties(physical_device_, &deviceProperties);
+    // 2. Pick physical device with compute support
+    uint32_t available_device_count = 0;
+    throw_if_vk_error(
+        vkEnumeratePhysicalDevices(instance, &available_device_count, nullptr),
+        "[vulkan::init] Failed to enumerate physical devices");
 
-  // Integrated GPUs typically have unified memory architecture
-  is_unified_memory_ =
-      (deviceProperties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
-
-  // Alternatively, check if there's a memory type that is both device local and
-  // host visible This is the Vulkan equivalent of unified memory
-  for (uint32_t i = 0; i < mem_properties_.memoryTypeCount; i++) {
-    VkMemoryPropertyFlags flags = mem_properties_.memoryTypes[i].propertyFlags;
-    if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-        (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
-        (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-      is_unified_memory_ = true;
-      break;
+    if (available_device_count == 0) {
+      throw std::runtime_error(
+          "[vulkan::init] Failed to find GPUs with Vulkan support.");
     }
-  }
 
-  // 4. Find Compute Queue Family
-  uint32_t queueFamilyCount = 0;
-  vkGetPhysicalDeviceQueueFamilyProperties(
-      physical_device_, &queueFamilyCount, nullptr);
+    std::vector<VkPhysicalDevice> devices(available_device_count);
+    throw_if_vk_error(
+        vkEnumeratePhysicalDevices(
+            instance, &available_device_count, devices.data()),
+        "[vulkan::init] Failed to query physical devices");
 
-  std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
-  vkGetPhysicalDeviceQueueFamilyProperties(
-      physical_device_, &queueFamilyCount, queueFamilies.data());
-
-  int i = 0;
-  bool found = false;
-  for (const auto& queueFamily : queueFamilies) {
-    if (queueFamily.queueFlags & VK_QUEUE_COMPUTE_BIT) {
-      compute_queue_family_index_ = i;
-      found = true;
-      break;
+    bool found_compute_device = false;
+    for (auto candidate : devices) {
+      uint32_t queue_family = 0;
+      if (find_compute_queue_family(candidate, queue_family)) {
+        physical_device = candidate;
+        compute_queue_family_index = queue_family;
+        found_compute_device = true;
+        break;
+      }
     }
-    i++;
+
+    if (!found_compute_device) {
+      throw std::runtime_error(
+          "[vulkan::init] Failed to find a compute-capable physical device.");
+    }
+
+    // 3. Query memory properties and unified-memory characteristics
+    vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_properties);
+
+    VkPhysicalDeviceProperties device_properties{};
+    vkGetPhysicalDeviceProperties(physical_device, &device_properties);
+
+    is_unified_memory =
+        (device_properties.deviceType ==
+         VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
+
+    for (uint32_t i = 0; i < mem_properties.memoryTypeCount; ++i) {
+      const auto flags = mem_properties.memoryTypes[i].propertyFlags;
+      if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+          (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+          (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+        is_unified_memory = true;
+        break;
+      }
+    }
+
+    // 4. Create logical device
+    float queue_priority = 1.0f;
+    VkDeviceQueueCreateInfo queue_create_info{};
+    queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queue_create_info.queueFamilyIndex = compute_queue_family_index;
+    queue_create_info.queueCount = 1;
+    queue_create_info.pQueuePriorities = &queue_priority;
+
+    VkPhysicalDeviceFeatures device_features{};
+
+    VkDeviceCreateInfo device_create_info{};
+    device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    device_create_info.pQueueCreateInfos = &queue_create_info;
+    device_create_info.queueCreateInfoCount = 1;
+    device_create_info.pEnabledFeatures = &device_features;
+
+    throw_if_vk_error(
+        vkCreateDevice(physical_device, &device_create_info, nullptr, &device),
+        "[vulkan::init] Failed to create logical device");
+
+    // 5. Get compute queue
+    vkGetDeviceQueue(device, compute_queue_family_index, 0, &compute_queue);
+
+    instance_ = instance;
+    physical_device_ = physical_device;
+    device_ = device;
+    compute_queue_ = compute_queue;
+    compute_queue_family_index_ = compute_queue_family_index;
+    mem_properties_ = mem_properties;
+    is_unified_memory_ = is_unified_memory;
+    initialized_ = true;
+  } catch (...) {
+    if (device != VK_NULL_HANDLE) {
+      vkDestroyDevice(device, nullptr);
+    }
+    if (instance != VK_NULL_HANDLE) {
+      vkDestroyInstance(instance, nullptr);
+    }
+    throw;
   }
-
-  if (!found) {
-    throw std::runtime_error("failed to find a compute queue family");
-  }
-
-  // 5. Create Logical Device
-  float queuePriority = 1.0f;
-  VkDeviceQueueCreateInfo queueCreateInfo{};
-  queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-  queueCreateInfo.queueFamilyIndex = compute_queue_family_index_;
-  queueCreateInfo.queueCount = 1;
-  queueCreateInfo.pQueuePriorities = &queuePriority;
-
-  VkPhysicalDeviceFeatures deviceFeatures{};
-
-  VkDeviceCreateInfo deviceCreateInfo{};
-  deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-  deviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
-  deviceCreateInfo.queueCreateInfoCount = 1;
-  deviceCreateInfo.pEnabledFeatures = &deviceFeatures;
-
-  if (vkCreateDevice(physical_device_, &deviceCreateInfo, nullptr, &device_) !=
-      VK_SUCCESS) {
-    throw std::runtime_error("failed to create logical device");
-  }
-
-  // 6. Get Compute Queue
-  vkGetDeviceQueue(device_, compute_queue_family_index_, 0, &compute_queue_);
-
-  initialized_ = true;
 }
 
 void VulkanContext::cleanup() {
   if (device_ != VK_NULL_HANDLE) {
+    vkDeviceWaitIdle(device_);
     vkDestroyDevice(device_, nullptr);
     device_ = VK_NULL_HANDLE;
   }
@@ -154,6 +210,11 @@ void VulkanContext::cleanup() {
     vkDestroyInstance(instance_, nullptr);
     instance_ = VK_NULL_HANDLE;
   }
+  physical_device_ = VK_NULL_HANDLE;
+  compute_queue_ = VK_NULL_HANDLE;
+  compute_queue_family_index_ = 0;
+  is_unified_memory_ = false;
+  mem_properties_ = {};
   initialized_ = false;
 }
 

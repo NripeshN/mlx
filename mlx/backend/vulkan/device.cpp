@@ -1,16 +1,31 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/device.h"
+
 #include <vulkan/vulkan.h>
+
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
+
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/stream.h"
 
 namespace mlx::core::vulkan {
+
+namespace {
+
+void throw_if_vk_error(VkResult result, const std::string& context) {
+  if (result != VK_SUCCESS) {
+    throw std::runtime_error(
+        context + " (VkResult=" + std::to_string(result) + ").");
+  }
+}
+
+} // namespace
 
 // Stream data structure for Vulkan
 struct StreamData {
@@ -25,8 +40,12 @@ struct StreamData {
 class VulkanDevice {
  public:
   static VulkanDevice& get() {
-    static VulkanDevice device;
-    return device;
+    static auto* device = new VulkanDevice();
+    return *device;
+  }
+
+  void ensure_stream(int index) {
+    (void)get_stream(index);
   }
 
   StreamData* get_stream(int index) {
@@ -51,14 +70,24 @@ class VulkanDevice {
     }
 
     VkDevice device = VulkanContext::get().device();
-    vkWaitForFences(device, 1, &stream->fence, VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &stream->fence);
+    throw_if_vk_error(
+        vkWaitForFences(device, 1, &stream->fence, VK_TRUE, UINT64_MAX),
+        "[vulkan::synchronize] Failed waiting for stream fence");
+    throw_if_vk_error(
+        vkResetFences(device, 1, &stream->fence),
+        "[vulkan::synchronize] Failed resetting stream fence");
     stream->has_pending_work = false;
   }
 
   void synchronize() {
-    // Wait for all streams
-    vkQueueWaitIdle(VulkanContext::get().compute_queue());
+    throw_if_vk_error(
+        vkQueueWaitIdle(VulkanContext::get().compute_queue()),
+        "[vulkan::synchronize] Failed waiting for compute queue idle");
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& [_, stream] : streams_) {
+      stream->recording = false;
+      stream->has_pending_work = false;
+    }
   }
 
   VkCommandBuffer begin_recording(int stream_index) {
@@ -67,15 +96,29 @@ class VulkanDevice {
     if (!stream->recording) {
       VkDevice device = VulkanContext::get().device();
 
+      if (stream->has_pending_work) {
+        throw_if_vk_error(
+            vkWaitForFences(device, 1, &stream->fence, VK_TRUE, UINT64_MAX),
+            "[vulkan::begin_recording] Failed waiting for stream fence");
+        throw_if_vk_error(
+            vkResetFences(device, 1, &stream->fence),
+            "[vulkan::begin_recording] Failed resetting stream fence");
+        stream->has_pending_work = false;
+      }
+
       // Reset command pool to allow reuse
-      vkResetCommandPool(device, stream->command_pool, 0);
+      throw_if_vk_error(
+          vkResetCommandPool(device, stream->command_pool, 0),
+          "[vulkan::begin_recording] Failed resetting command pool");
 
       // Begin recording
       VkCommandBufferBeginInfo beginInfo{};
       beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
       beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-      vkBeginCommandBuffer(stream->command_buffer, &beginInfo);
+      throw_if_vk_error(
+          vkBeginCommandBuffer(stream->command_buffer, &beginInfo),
+          "[vulkan::begin_recording] Failed beginning command buffer");
       stream->recording = true;
     }
 
@@ -85,13 +128,46 @@ class VulkanDevice {
   void end_recording(int stream_index) {
     auto* stream = get_stream(stream_index);
     if (stream->recording) {
-      vkEndCommandBuffer(stream->command_buffer);
       submit_commands(stream);
     }
   }
 
  private:
   VulkanDevice() = default;
+
+  ~VulkanDevice() {
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    try {
+      auto& ctx = VulkanContext::get();
+      device = ctx.device();
+      queue = ctx.compute_queue();
+    } catch (...) {
+      return;
+    }
+
+    if (queue != VK_NULL_HANDLE) {
+      vkQueueWaitIdle(queue);
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& [_, stream] : streams_) {
+      if (stream->command_buffer != VK_NULL_HANDLE &&
+          stream->command_pool != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(
+            device, stream->command_pool, 1, &stream->command_buffer);
+        stream->command_buffer = VK_NULL_HANDLE;
+      }
+      if (stream->fence != VK_NULL_HANDLE) {
+        vkDestroyFence(device, stream->fence, nullptr);
+        stream->fence = VK_NULL_HANDLE;
+      }
+      if (stream->command_pool != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(device, stream->command_pool, nullptr);
+        stream->command_pool = VK_NULL_HANDLE;
+      }
+    }
+  }
 
   std::unique_ptr<StreamData> create_stream(int index) {
     VkDevice device = VulkanContext::get().device();
@@ -140,21 +216,28 @@ class VulkanDevice {
   }
 
   void submit_commands(StreamData* stream) {
-    if (!stream->recording)
+    if (!stream->recording) {
       return;
+    }
 
     VkDevice device = VulkanContext::get().device();
     VkQueue queue = VulkanContext::get().compute_queue();
 
-    vkEndCommandBuffer(stream->command_buffer);
+    throw_if_vk_error(
+        vkEndCommandBuffer(stream->command_buffer),
+        "[vulkan::submit_commands] Failed ending command buffer");
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &stream->command_buffer;
 
-    vkResetFences(device, 1, &stream->fence);
-    vkQueueSubmit(queue, 1, &submitInfo, stream->fence);
+    throw_if_vk_error(
+        vkResetFences(device, 1, &stream->fence),
+        "[vulkan::submit_commands] Failed resetting stream fence");
+    throw_if_vk_error(
+        vkQueueSubmit(queue, 1, &submitInfo, stream->fence),
+        "[vulkan::submit_commands] Failed submitting command buffer");
     stream->recording = false;
     stream->has_pending_work = true;
   }
@@ -167,8 +250,10 @@ class VulkanDevice {
 
 namespace mlx::core::gpu {
 
-Stream new_stream(Stream s) {
-  return s;
+void new_stream(Stream s) {
+  if (s.device == mlx::core::Device::gpu) {
+    mlx::core::vulkan::VulkanDevice::get().ensure_stream(s.index);
+  }
 }
 
 void synchronize(Stream s) {
