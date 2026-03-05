@@ -128,12 +128,21 @@ TensorLayout4D make_tensor_layout_4d(
 
 uint32_t
 checked_offset(const array& arr, const char* tensor_name, uint32_t max_offset) {
-  if (arr.offset() < 0 || arr.offset() > max_offset) {
+  const int64_t byte_offset = arr.offset();
+  const int64_t item_size = static_cast<int64_t>(size_of(arr.dtype()));
+  if (item_size <= 0 || byte_offset < 0 || (byte_offset % item_size) != 0) {
+    throw std::runtime_error(
+        std::string("[vulkan::kernels] ") + tensor_name +
+        " offset is misaligned.");
+  }
+
+  const int64_t elem_offset = byte_offset / item_size;
+  if (elem_offset > static_cast<int64_t>(max_offset)) {
     throw std::runtime_error(
         std::string("[vulkan::kernels] ") + tensor_name +
         " offset is out of supported range.");
   }
-  return static_cast<uint32_t>(arr.offset());
+  return static_cast<uint32_t>(elem_offset);
 }
 
 void init_fastdiv_values(uint32_t d, uint32_t& mp, uint32_t& L) {
@@ -320,8 +329,22 @@ std::tuple<uint32_t, uint32_t, uint32_t> get_dispatch_grid_dims(
           (num_elements + VULKAN_INDEX_TILE_SIZE - 1) / VULKAN_INDEX_TILE_SIZE,
           1,
           1};
-    case DispatchGridKind::RowWise:
-      return get_element_wise_grid_dims(num_elements, 1);
+    case DispatchGridKind::RowWise: {
+      if (num_elements == 0) {
+        return {0, 0, 0};
+      }
+
+      // Row-wise kernels index rows as:
+      //   row = wg.z * (512 * 512) + wg.y * 512 + wg.x
+      // so dispatch must tile rows across x/y/z in that order.
+      const uint64_t rows = num_elements;
+      const uint32_t x = static_cast<uint32_t>(std::min<uint64_t>(rows, 512));
+      const uint64_t yz_tiles = (rows + 511) / 512;
+      const uint32_t y =
+          static_cast<uint32_t>(std::min<uint64_t>(yz_tiles, 512));
+      const uint32_t z = static_cast<uint32_t>((yz_tiles + 511) / 512);
+      return {x, y, z};
+    }
   }
 
   throw std::runtime_error("[vulkan::kernels] Unsupported dispatch grid kind.");
@@ -1080,7 +1103,9 @@ void dispatch_sum_rows_op(
       push_constants,
       row_count,
       cmd_buffer,
-      s);
+      s,
+      std::nullopt,
+      {32u});
 }
 
 void dispatch_argmax_op(
@@ -1116,7 +1141,9 @@ void dispatch_argmax_op(
       push_constants,
       push_constants.KY,
       cmd_buffer,
-      s);
+      s,
+      std::nullopt,
+      {32u});
 }
 
 void dispatch_softmax_op(
@@ -1161,7 +1188,9 @@ void dispatch_softmax_op(
       push_constants,
       push_constants.nrows_x,
       cmd_buffer,
-      s);
+      s,
+      std::nullopt,
+      {32u});
 }
 
 void dispatch_softmax_large_op(
@@ -1240,7 +1269,8 @@ void dispatch_softmax_large_op(
       row_count,
       cmd_buffer,
       s,
-      grid);
+      grid,
+      {128u, 4u});
 
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1268,7 +1298,8 @@ void dispatch_softmax_large_op(
       row_count,
       cmd_buffer,
       s,
-      grid);
+      grid,
+      {128u, 4u});
 
   vkCmdPipelineBarrier(
       cmd_buffer,
@@ -1290,7 +1321,8 @@ void dispatch_softmax_large_op(
       row_count,
       cmd_buffer,
       s,
-      grid);
+      grid,
+      {128u, 4u});
 }
 
 void dispatch_cumsum_op(
@@ -1340,7 +1372,9 @@ void dispatch_cumsum_op(
         push_constants,
         row_count,
         cmd_buffer,
-        s);
+        s,
+        std::nullopt,
+        {128u, 32u, 4u});
     return;
   }
 
@@ -1372,7 +1406,8 @@ void dispatch_cumsum_op(
       row_count,
       cmd_buffer,
       s,
-      grid);
+      grid,
+      {128u, 32u});
 
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -1400,7 +1435,8 @@ void dispatch_cumsum_op(
       row_count,
       cmd_buffer,
       s,
-      grid);
+      grid,
+      {128u, 32u});
 }
 
 void dispatch_mul_mm_op(

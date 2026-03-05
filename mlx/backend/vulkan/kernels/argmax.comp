@@ -46,7 +46,8 @@ void main() {
     barrier();
     [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
         if (col < s && col + s < p.KX) {
-            if (tmpmax[col] < tmpmax[col + s]) {
+            if (tmpmax[col] < tmpmax[col + s] ||
+                (tmpmax[col] == tmpmax[col + s] && tmp[col] > tmp[col + s])) {
                 tmpmax[col] = tmpmax[col + s];
                 tmp[col] = tmp[col + s];
             }

@@ -35,6 +35,17 @@ bool matmul_debug_enabled() {
   return enabled;
 }
 
+bool matvec_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_VULKAN_ENABLE_MATVEC");
+    if (env == nullptr) {
+      return false;
+    }
+    return std::string(env) != "0";
+  }();
+  return enabled;
+}
+
 bool mul_mm_enabled() {
   static auto& runtime_disabled = []() -> std::atomic<bool>& {
     static std::atomic<bool> disabled{false};
@@ -121,9 +132,9 @@ std::vector<std::string> matvec_shader_candidates(
     return {};
   }
   return {
-      base + "_subgroup_no_shmem",
-      base + "_subgroup",
       base,
+      base + "_subgroup",
+      base + "_subgroup_no_shmem",
   };
 }
 
@@ -423,7 +434,7 @@ bool try_eval_mul_mm_vulkan(
 } // namespace
 
 void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (try_eval_matvec_vulkan(inputs, out, stream())) {
+  if (matvec_enabled() && try_eval_matvec_vulkan(inputs, out, stream())) {
     log_matmul_path(inputs, "mul_mat_vec");
     return;
   }

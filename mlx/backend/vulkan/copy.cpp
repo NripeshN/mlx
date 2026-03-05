@@ -60,7 +60,8 @@ std::string get_copy_shader_name(
   // Fast transpose path: source is column-contiguous and destination is
   // row-contiguous with identical shape/dtype.
   if (in.dtype() == out.dtype() && in.shape() == out.shape() &&
-      in.ndim() >= 2 && in.ndim() <= 4 && in.flags().col_contiguous &&
+      in.ndim() >= 2 && in.ndim() <= 4 && in.offset() == 0 &&
+      out.offset() == 0 && in.flags().col_contiguous &&
       out.flags().row_contiguous) {
     const size_t item_size = size_of(in.dtype());
     if (item_size == 2) {
@@ -154,10 +155,14 @@ void copy_gpu_inplace(
   const bool same_dtype = in.dtype() == out.dtype();
   const bool raw_buffer_copy = same_dtype && ctype == CopyType::Vector;
 
+  const bool full_tensor_copy = data_shape == in.shape() &&
+      data_shape == out.shape() && i_strides == in.strides() &&
+      o_strides == out.strides();
+
   const bool shader_copy =
       (ctype == CopyType::General || ctype == CopyType::GeneralGeneral) &&
       !dynamic_i_offset && !dynamic_o_offset && i_offset == 0 &&
-      o_offset == 0 && is_supported_copy_layout(in) &&
+      o_offset == 0 && full_tensor_copy && is_supported_copy_layout(in) &&
       is_supported_copy_layout(out) && !get_copy_shader_name(in, out).empty();
 
   if (!raw_buffer_copy && !shader_copy) {
