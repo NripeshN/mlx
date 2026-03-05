@@ -266,21 +266,35 @@ bool try_eval_unary_op_vulkan(
     return false;
   }
 
-  const auto& in = inputs[0];
-  set_unary_output_data(in, out);
-  if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out)) {
+  array in = inputs[0];
+  if (!is_supported_unary_layout(in)) {
+    in = contiguous_copy_gpu(in, s);
+  }
+
+  const bool staged_output = !is_supported_unary_layout(out);
+  array out_work =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+
+  set_unary_output_data(in, out_work);
+  if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out_work)) {
     return false;
   }
 
-  if (out.size() == 0) {
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   }
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_unary_op(
-        in, out, shader_name, command_buffer, s, param1, param2);
+        in, out_work, shader_name, command_buffer, s, param1, param2);
     vulkan::end_command_recording(s.index);
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
     return true;
   } catch (const std::runtime_error&) {
     return false;
@@ -668,19 +682,21 @@ bool try_eval_softmax_vulkan(
   array in = inputs[0];
   const bool f32_io = in.dtype() == float32 && out.dtype() == float32;
   const bool f16_io = in.dtype() == float16 && out.dtype() == float16;
-  if (in.ndim() == 0 || (!f32_io && !f16_io)) {
+  const bool bf16_io = in.dtype() == bfloat16 && out.dtype() == bfloat16;
+  if (in.ndim() == 0 || (!f32_io && !f16_io && !bf16_io)) {
     return false;
   }
 
   const bool use_f16_variant = f16_io;
-  if (use_f16_variant) {
+  const bool use_f32_staging_io = f16_io || bf16_io;
+  if (use_f32_staging_io) {
     array in_f32(in.shape(), float32, nullptr, {});
     copy_gpu(in, in_f32, CopyType::General, s);
     in = in_f32;
   }
 
   array softmax_out_target =
-      use_f16_variant ? array(out.shape(), float32, nullptr, {}) : out;
+      use_f32_staging_io ? array(out.shape(), float32, nullptr, {}) : out;
 
   if (!in.flags().contiguous || in.offset() != 0 || in.strides().back() != 1 ||
       !is_supported_unary_layout(in)) {
@@ -714,7 +730,7 @@ bool try_eval_softmax_vulkan(
     if (staged_output) {
       copy_gpu(out_work, softmax_out_target, CopyType::GeneralGeneral, s);
     }
-    if (use_f16_variant) {
+    if (use_f32_staging_io) {
       copy_gpu(softmax_out_target, out, CopyType::General, s);
     }
     return true;
@@ -743,7 +759,7 @@ bool try_eval_softmax_vulkan(
     if (staged_output) {
       copy_gpu(out_work, softmax_out_target, CopyType::GeneralGeneral, s);
     }
-    if (use_f16_variant) {
+    if (use_f32_staging_io) {
       copy_gpu(softmax_out_target, out, CopyType::General, s);
     }
     return true;
