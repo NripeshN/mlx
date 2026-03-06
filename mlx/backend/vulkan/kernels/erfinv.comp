@@ -5,20 +5,41 @@
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
-// Inverse error function approximation using rational approximation
-// Based on the approximation from numerical recipes
+// Inverse error function approximation using piecewise rational approximation
+// Based on algorithm from https://en.wikipedia.org/wiki/Error_function#Inverse_functions
 FLOAT_TYPE erfinv(FLOAT_TYPE x) {
-    const FLOAT_TYPE a = FLOAT_TYPE(0.147);
+    // Handle edge cases
+    if (abs(x) >= 1.0) {
+        return (x > 0.0) ? FLOAT_TYPE(1e10) : FLOAT_TYPE(-1e10);  // Infinity approximation
+    }
+    if (x == 0.0) {
+        return FLOAT_TYPE(0.0);
+    }
+    
     FLOAT_TYPE sign = (x < 0.0) ? FLOAT_TYPE(-1.0) : FLOAT_TYPE(1.0);
-    x = abs(x);
+    FLOAT_TYPE y = abs(x);
     
-    FLOAT_TYPE ln1mx = log(FLOAT_TYPE(1.0) - x);
-    FLOAT_TYPE term1 = FLOAT_TYPE(2.0) / (FLOAT_TYPE(3.14159265359) * a);
-    FLOAT_TYPE term2 = ln1mx / FLOAT_TYPE(2.0);
-    FLOAT_TYPE term3 = sqrt(term1 + term2 * term2);
-    FLOAT_TYPE result = sign * sqrt(sqrt(term1 + term2 * term3) - term2);
+    // Use approximation based on range
+    FLOAT_TYPE z;
+    if (y <= 0.7) {
+        // Central region - use Taylor series approximation
+        // erfinv(x) ≈ x * (π/2)^(1/2) for small x
+        // Better approximation using rational function
+        FLOAT_TYPE t = y * y;
+        FLOAT_TYPE num = y * (FLOAT_TYPE(1.0) + t * (FLOAT_TYPE(0.5) + t * FLOAT_TYPE(0.375)));
+        FLOAT_TYPE den = FLOAT_TYPE(1.0) + t * (FLOAT_TYPE(0.5) + t * FLOAT_TYPE(0.1875));
+        z = num / den;
+    } else {
+        // Tail region - use logarithmic approximation
+        // erfinv(x) ≈ sqrt(-log(1-x^2)) for x near 1
+        FLOAT_TYPE t = -log(FLOAT_TYPE(1.0) - y);
+        z = sqrt(t);
+        
+        // Apply correction factor
+        z = z - (FLOAT_TYPE(2.30753) + FLOAT_TYPE(0.27061) * t) / (FLOAT_TYPE(1.0) + t * (FLOAT_TYPE(0.99229) + FLOAT_TYPE(0.04481) * t));
+    }
     
-    return result;
+    return sign * z;
 }
 
 void main() {
