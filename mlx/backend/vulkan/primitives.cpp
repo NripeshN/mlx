@@ -1255,8 +1255,25 @@ void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 VULKAN_GENERIC_UNARY_RTE_GPU(Exp, "exp")
 
-VULKAN_GENERIC_UNARY_GPU(Erf, "erf")
-VULKAN_GENERIC_UNARY_GPU(ErfInv, "erfinv")
+void Erf::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
+      out.dtype() == float32) {
+    if (try_eval_unary_op_vulkan<Erf>(inputs, out, "erf_f32", stream())) {
+      return;
+    }
+  }
+  eval_cpu_fallback_on_stream<Erf>(inputs, out, stream());
+}
+
+void ErfInv::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
+      out.dtype() == float32) {
+    if (try_eval_unary_op_vulkan<ErfInv>(inputs, out, "erfinv_f32", stream())) {
+      return;
+    }
+  }
+  eval_cpu_fallback_on_stream<ErfInv>(inputs, out, stream());
+}
 
 VULKAN_GENERIC_UNARY_GPU(Floor, "floor")
 
