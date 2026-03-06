@@ -233,6 +233,8 @@ enum class KernelSpecId {
   MatVec,
   Matmul,
   RandomBits,
+  Gather,
+  GatherAxis,
 };
 
 struct KernelSpec {
@@ -255,7 +257,7 @@ constexpr KernelSpec make_kernel_spec(
   return {bindings, binding_count, push_constant_size, grid_kind};
 }
 
-constexpr std::array<KernelSpec, 13> kKernelSpecs = {
+constexpr std::array<KernelSpec, 15> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 0, 0, 0},
         3,
@@ -320,7 +322,17 @@ constexpr std::array<KernelSpec, 13> kKernelSpecs = {
         {0, 1, 0, 0, 0, 0},
         2,
         sizeof(RandomBitsPushConstants),
-        DispatchGridKind::Linear1D),
+        DispatchGridKind::ElementWise),
+    make_kernel_spec(
+        {0, 1, 2, 0, 0, 0},
+        3,
+        sizeof(GatherPushConstants),
+        DispatchGridKind::ElementWise),
+    make_kernel_spec(
+        {0, 1, 2, 0, 0, 0},
+        3,
+        sizeof(GatherAxisPushConstants),
+        DispatchGridKind::ElementWise),
 };
 
 size_t kernel_spec_index(KernelSpecId id) {
@@ -1667,6 +1679,74 @@ void dispatch_random_bits_op(
       cmd_buffer,
       s,
       grid);
+}
+
+void dispatch_gather_op(
+    const array& src,
+    const array& indices,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t slice_size,
+    uint32_t axis_size,
+    uint32_t index_count) {
+  GatherPushConstants push_constants{};
+  push_constants.ne =
+      checked_mul_u32(index_count, slice_size, "gather elements");
+  push_constants.slice_size = slice_size;
+  push_constants.axis_size = axis_size;
+  push_constants.index_count = index_count;
+
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&src, "src"},
+      {&indices, "indices"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::Gather,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s);
+}
+
+void dispatch_gather_axis_op(
+    const array& src,
+    const array& indices,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t size_pre,
+    uint32_t size_axis,
+    uint32_t size_post,
+    uint32_t idx_axis_size) {
+  GatherAxisPushConstants push_constants{};
+  const uint32_t elems_per_prefix =
+      checked_mul_u32(idx_axis_size, size_post, "gather_axis elems_per_prefix");
+  push_constants.ne =
+      checked_mul_u32(size_pre, elems_per_prefix, "gather_axis elements");
+  push_constants.size_pre = size_pre;
+  push_constants.size_axis = size_axis;
+  push_constants.size_post = size_post;
+  push_constants.idx_axis_size = idx_axis_size;
+
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&src, "src"},
+      {&indices, "indices"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::GatherAxis,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s);
 }
 
 } // namespace mlx::core::vulkan

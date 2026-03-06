@@ -1,0 +1,75 @@
+#version 450
+
+#include "types.glsl"
+#include "sum_rows.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer A { A_TYPE data_a[]; };
+layout(binding = 1) writeonly buffer D { D_TYPE data_d[]; };
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+
+shared float tmp_max[BLOCK_SIZE];
+shared float tmp_sum[BLOCK_SIZE];
+
+float load_value(uint idx) {
+#if defined(DATA_A_BF16)
+    return bf16_to_fp32(data_a[idx]);
+#else
+    return float(data_a[idx]);
+#endif
+}
+
+void store_value(uint idx, float value) {
+#if defined(DATA_D_BF16)
+    data_d[idx] = D_TYPE(fp32_to_bf16(value));
+#else
+    data_d[idx] = D_TYPE(value);
+#endif
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint col = gl_LocalInvocationID.x;
+
+    const uint i03 = fastdiv(row, p.ne0_12mp, p.ne0_12L);
+    const uint i03_offset = i03 * p.ne01 * p.ne02;
+    const uint i02 = fastdiv(row - i03_offset, p.ne0_1mp, p.ne0_1L);
+    const uint i01 = row - i03_offset - i02 * p.ne01;
+
+    const uint src_idx = get_aoffset() + i01 * p.nb01 + i02 * p.nb02 + i03 * p.nb03;
+    const uint dst_idx = get_doffset() + i01 * p.nb11 + i02 * p.nb12 + i03 * p.nb13;
+
+    tmp_max[col] = -1.0 / 0.0;
+    for (uint i = col; i < p.n_cols; i += BLOCK_SIZE) {
+        tmp_max[col] = max(tmp_max[col], load_value(src_idx + i));
+    }
+
+    barrier();
+    for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (col < s) {
+            tmp_max[col] = max(tmp_max[col], tmp_max[col + s]);
+        }
+        barrier();
+    }
+
+    const float row_max = tmp_max[0];
+    tmp_sum[col] = 0.0;
+    for (uint i = col; i < p.n_cols; i += BLOCK_SIZE) {
+        tmp_sum[col] += exp(load_value(src_idx + i) - row_max);
+    }
+
+    barrier();
+    for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (col < s) {
+            tmp_sum[col] += tmp_sum[col + s];
+        }
+        barrier();
+    }
+
+    if (col == 0) {
+        const float result = isinf(row_max) ? row_max : log(tmp_sum[0]) + row_max;
+        store_value(dst_idx, result);
+    }
+}

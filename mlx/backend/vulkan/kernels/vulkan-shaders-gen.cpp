@@ -1212,6 +1212,101 @@ void process_shaders() {
        {"B_TYPE", "int"},
        {"D_TYPE", "uint"}});
 
+  string_to_spv("gather_f32_i32", "gather.comp", {{"VALUE_TYPE", "float"}});
+  string_to_spv("gather_f16_i32", "gather.comp", {{"VALUE_TYPE", "float16_t"}});
+  string_to_spv("gather_bf16_i32", "gather.comp", {{"VALUE_TYPE", "uint16_t"}});
+  string_to_spv(
+      "gather_f32_i64",
+      "gather.comp",
+      {{"VALUE_TYPE", "float"}, {"INDEX_IS_I64", "1"}});
+  string_to_spv(
+      "gather_f16_i64",
+      "gather.comp",
+      {{"VALUE_TYPE", "float16_t"}, {"INDEX_IS_I64", "1"}});
+  string_to_spv(
+      "gather_bf16_i64",
+      "gather.comp",
+      {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_I64", "1"}});
+  string_to_spv(
+      "gather_f32_u32",
+      "gather.comp",
+      {{"VALUE_TYPE", "float"}, {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_f16_u32",
+      "gather.comp",
+      {{"VALUE_TYPE", "float16_t"}, {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_bf16_u32",
+      "gather.comp",
+      {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_f32_u64",
+      "gather.comp",
+      {{"VALUE_TYPE", "float"},
+       {"INDEX_IS_I64", "1"},
+       {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_f16_u64",
+      "gather.comp",
+      {{"VALUE_TYPE", "float16_t"},
+       {"INDEX_IS_I64", "1"},
+       {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_bf16_u64",
+      "gather.comp",
+      {{"VALUE_TYPE", "uint16_t"},
+       {"INDEX_IS_I64", "1"},
+       {"INDEX_IS_UNSIGNED", "1"}});
+
+  string_to_spv(
+      "gather_axis_f32_i32", "gather_axis.comp", {{"VALUE_TYPE", "float"}});
+  string_to_spv(
+      "gather_axis_f16_i32", "gather_axis.comp", {{"VALUE_TYPE", "float16_t"}});
+  string_to_spv(
+      "gather_axis_bf16_i32", "gather_axis.comp", {{"VALUE_TYPE", "uint16_t"}});
+  string_to_spv(
+      "gather_axis_f32_i64",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "float"}, {"INDEX_IS_I64", "1"}});
+  string_to_spv(
+      "gather_axis_f16_i64",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "float16_t"}, {"INDEX_IS_I64", "1"}});
+  string_to_spv(
+      "gather_axis_bf16_i64",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_I64", "1"}});
+  string_to_spv(
+      "gather_axis_f32_u32",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "float"}, {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_axis_f16_u32",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "float16_t"}, {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_axis_bf16_u32",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_axis_f32_u64",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "float"},
+       {"INDEX_IS_I64", "1"},
+       {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_axis_f16_u64",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "float16_t"},
+       {"INDEX_IS_I64", "1"},
+       {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_axis_bf16_u64",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "uint16_t"},
+       {"INDEX_IS_I64", "1"},
+       {"INDEX_IS_UNSIGNED", "1"}});
+
   string_to_spv(
       "mul_mat_vec_p021_f16_f32_subgroup_add",
       "mul_mat_vec_p021.comp",
@@ -1871,6 +1966,22 @@ void process_shaders() {
       "diag_mask_inf_f32",
       "diag_mask_inf.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+
+  string_to_spv(
+      "logsumexp_f32",
+      "logsumexp.comp",
+      {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "logsumexp_f16",
+      "logsumexp.comp",
+      {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+  string_to_spv(
+      "logsumexp_bf16",
+      "logsumexp.comp",
+      {{"A_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"DATA_A_BF16", "1"},
+       {"DATA_D_BF16", "1"}});
 
   string_to_spv(
       "soft_max_f32",

@@ -9,6 +9,7 @@
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/fast_primitives.h"
+#include "mlx/ops.h"
 #include "mlx/primitives.h"
 #include "mlx/transforms.h"
 
@@ -17,6 +18,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <string_view>
 #include <tuple>
@@ -46,6 +48,62 @@ void trace_fallback(const std::string& msg) {
   static std::mutex trace_mutex;
   std::lock_guard<std::mutex> lock(trace_mutex);
   std::cerr << "[vulkan-fallback] " << msg << "\n";
+}
+
+void trace_use_fallback(
+    std::string_view primitive_name,
+    Stream s,
+    std::string_view reason,
+    std::string_view details = {}) {
+  if (!trace_fallback_enabled()) {
+    return;
+  }
+  std::ostringstream oss;
+  oss << "primitive=" << primitive_name << " kind=use_fallback"
+      << " stream=" << s.index << " reason=" << reason;
+  if (!details.empty()) {
+    oss << ' ' << details;
+  }
+  trace_fallback(oss.str());
+}
+
+void trace_vulkan_unsupported(
+    std::string_view primitive_name,
+    std::string_view reason) {
+  if (!trace_fallback_enabled()) {
+    return;
+  }
+  std::ostringstream oss;
+  oss << "primitive=" << primitive_name << " kind=unsupported"
+      << " reason=" << reason;
+  trace_fallback(oss.str());
+}
+
+uint32_t checked_u32_size(int64_t value, const char* name) {
+  if (value < 0 || value > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(
+        std::string("[vulkan::primitives] ") + name +
+        " is out of uint32 range.");
+  }
+  return static_cast<uint32_t>(value);
+}
+
+uint32_t checked_mul_u32(uint32_t a, uint32_t b, const char* name) {
+  const uint64_t product = static_cast<uint64_t>(a) * static_cast<uint64_t>(b);
+  if (product > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(
+        std::string("[vulkan::primitives] ") + name +
+        " is out of uint32 range.");
+  }
+  return static_cast<uint32_t>(product);
+}
+
+uint32_t checked_product_u32(const Shape& shape, const char* name) {
+  uint32_t product = 1;
+  for (auto dim : shape) {
+    product = checked_mul_u32(product, checked_u32_size(dim, name), name);
+  }
+  return product;
 }
 
 template <typename Primitive, typename... Args>
@@ -206,6 +264,45 @@ std::string dtype_suffix(Dtype dtype) {
     default:
       return {};
   }
+}
+
+std::string gather_index_suffix(Dtype dtype) {
+  switch (dtype) {
+    case int32:
+      return "i32";
+    case int64:
+      return "i64";
+    case uint32:
+      return "u32";
+    case uint64:
+      return "u64";
+    default:
+      return {};
+  }
+}
+
+std::string gather_shader_name(Dtype value_dtype, Dtype index_dtype) {
+  auto value_suffix = dtype_suffix(value_dtype);
+  if (value_dtype == bfloat16) {
+    value_suffix = "bf16";
+  }
+  auto index_suffix = gather_index_suffix(index_dtype);
+  if (value_suffix.empty() || index_suffix.empty()) {
+    return {};
+  }
+  return "gather_" + value_suffix + "_" + index_suffix;
+}
+
+std::string gather_axis_shader_name(Dtype value_dtype, Dtype index_dtype) {
+  auto value_suffix = dtype_suffix(value_dtype);
+  if (value_dtype == bfloat16) {
+    value_suffix = "bf16";
+  }
+  auto index_suffix = gather_index_suffix(index_dtype);
+  if (value_suffix.empty() || index_suffix.empty()) {
+    return {};
+  }
+  return "gather_axis_" + value_suffix + "_" + index_suffix;
 }
 
 bool is_supported_elementwise_layout(const array& arr) {
@@ -633,6 +730,242 @@ int normalize_axis(int axis, int ndim) {
   return axis;
 }
 
+bool try_eval_gather_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    const std::vector<int>& axes,
+    const Shape& slice_sizes,
+    Stream s) {
+  if (inputs.size() != 2 || axes.size() != 1) {
+    return false;
+  }
+
+  const auto& src_input = inputs[0];
+  array idx = inputs[1];
+  if (src_input.ndim() == 0 || out.dtype() != src_input.dtype()) {
+    return false;
+  }
+  const int axis = normalize_axis(axes[0], src_input.ndim());
+  if (axis < 0 || axis >= src_input.ndim()) {
+    trace_vulkan_unsupported("Gather", "axis is out of range");
+    return false;
+  }
+
+  for (int i = 0; i < src_input.ndim(); ++i) {
+    const int64_t expected = (i == axis) ? 1 : src_input.shape(i);
+    if (slice_sizes[i] != expected) {
+      trace_vulkan_unsupported(
+          "Gather", "only take-like single-axis gathers are supported");
+      return false;
+    }
+  }
+
+  const auto shader_name = gather_shader_name(src_input.dtype(), idx.dtype());
+  if (shader_name.empty()) {
+    trace_vulkan_unsupported(
+        "Gather",
+        "value/index dtype combination is not supported by Vulkan gather");
+    return false;
+  }
+
+  array src = src_input;
+  if (axis != 0) {
+    std::vector<int> perm(src.ndim());
+    perm[0] = axis;
+    int dst_axis = 1;
+    for (int src_axis = 0; src_axis < src.ndim(); ++src_axis) {
+      if (src_axis != axis) {
+        perm[dst_axis++] = src_axis;
+      }
+    }
+    src = transpose(src, perm, s);
+  }
+  if (!src.flags().contiguous || src.offset() != 0 ||
+      src.strides().back() != 1) {
+    src = contiguous_copy_gpu(src, s);
+  }
+
+  if (!idx.flags().contiguous || idx.offset() != 0 ||
+      idx.strides().back() != 1) {
+    idx = contiguous_copy_gpu(idx, s);
+  }
+
+  const uint32_t axis_size =
+      checked_u32_size(src_input.shape(axis), "gather axis size");
+  const uint32_t index_count =
+      checked_u32_size(idx.size(), "gather index count");
+  const uint32_t slice_size =
+      checked_product_u32(slice_sizes, "gather slice size");
+
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return true;
+  }
+
+  array src_2d = reshape_in_eval(
+      src,
+      Shape{static_cast<int64_t>(axis_size), static_cast<int64_t>(slice_size)},
+      s);
+  array idx_1d =
+      reshape_in_eval(idx, Shape{static_cast<int64_t>(index_count)}, s);
+  array out_2d(
+      Shape{
+          static_cast<int64_t>(index_count), static_cast<int64_t>(slice_size)},
+      out.dtype(),
+      nullptr,
+      {});
+  out_2d.set_data(allocator::malloc(out_2d.nbytes()));
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_gather_op(
+        src_2d,
+        idx_1d,
+        out_2d,
+        shader_name,
+        command_buffer,
+        s,
+        slice_size,
+        axis_size,
+        index_count);
+    vulkan::end_command_recording(s.index);
+
+    array gathered = reshape_in_eval(out_2d, out.shape(), s);
+    copy_gpu(gathered, out, CopyType::GeneralGeneral, s);
+    return true;
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "gather_dispatch_failed reason=" << e.what();
+      trace_fallback(oss.str());
+    }
+    return false;
+  }
+}
+
+bool try_eval_gather_axis_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    int axis,
+    Stream s) {
+  if (inputs.size() != 2) {
+    return false;
+  }
+
+  array src = inputs[0];
+  array idx = inputs[1];
+  if (src.ndim() == 0 || idx.ndim() != src.ndim() ||
+      out.shape() != idx.shape() || out.dtype() != src.dtype()) {
+    return false;
+  }
+  axis = normalize_axis(axis, src.ndim());
+  if (axis < 0 || axis >= src.ndim()) {
+    trace_vulkan_unsupported("GatherAxis", "axis is out of range");
+    return false;
+  }
+
+  const auto shader_name = gather_axis_shader_name(src.dtype(), idx.dtype());
+  if (shader_name.empty()) {
+    trace_vulkan_unsupported(
+        "GatherAxis",
+        "value/index dtype combination is not supported by Vulkan gather_axis");
+    return false;
+  }
+
+  if (!src.flags().contiguous || src.offset() != 0 ||
+      src.strides().back() != 1) {
+    src = contiguous_copy_gpu(src, s);
+  }
+  if (!idx.flags().contiguous || idx.offset() != 0 ||
+      idx.strides().back() != 1) {
+    idx = contiguous_copy_gpu(idx, s);
+  }
+
+  uint32_t size_pre = 1;
+  for (int i = 0; i < axis; ++i) {
+    size_pre = checked_mul_u32(
+        size_pre,
+        checked_u32_size(src.shape(i), "gather_axis size_pre"),
+        "gather_axis size_pre");
+  }
+  const uint32_t size_axis =
+      checked_u32_size(src.shape(axis), "gather_axis size_axis");
+  uint32_t size_post = 1;
+  for (int i = axis + 1; i < src.ndim(); ++i) {
+    size_post = checked_mul_u32(
+        size_post,
+        checked_u32_size(src.shape(i), "gather_axis size_post"),
+        "gather_axis size_post");
+  }
+  const uint32_t idx_axis_size =
+      checked_u32_size(idx.shape(axis), "gather_axis idx_axis_size");
+
+  array out_work = out;
+  const bool staged_output =
+      !out.flags().contiguous || out.offset() != 0 || out.strides().back() != 1;
+  if (staged_output) {
+    out_work = array(out.shape(), out.dtype(), nullptr, {});
+  }
+
+  out_work.set_data(allocator::malloc(out_work.nbytes()));
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  }
+
+  array src_flat = reshape_in_eval(
+      src,
+      Shape{
+          static_cast<int64_t>(size_pre),
+          static_cast<int64_t>(size_axis),
+          static_cast<int64_t>(size_post)},
+      s);
+  array idx_flat = reshape_in_eval(
+      idx,
+      Shape{
+          static_cast<int64_t>(size_pre),
+          static_cast<int64_t>(idx_axis_size),
+          static_cast<int64_t>(size_post)},
+      s);
+  array out_flat = reshape_in_eval(
+      out_work,
+      Shape{
+          static_cast<int64_t>(size_pre),
+          static_cast<int64_t>(idx_axis_size),
+          static_cast<int64_t>(size_post)},
+      s);
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_gather_axis_op(
+        src_flat,
+        idx_flat,
+        out_flat,
+        shader_name,
+        command_buffer,
+        s,
+        size_pre,
+        size_axis,
+        size_post,
+        idx_axis_size);
+    vulkan::end_command_recording(s.index);
+
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "gather_axis_dispatch_failed reason=" << e.what();
+      trace_fallback(oss.str());
+    }
+    return false;
+  }
+}
+
 bool has_keepdims_axis_shape(const array& in, const array& out, int axis) {
   if (in.ndim() != out.ndim()) {
     return false;
@@ -939,6 +1272,65 @@ bool try_eval_arg_reduce_vulkan(
   }
 }
 
+bool try_eval_logsumexp_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
+  if (inputs.size() != 1) {
+    return false;
+  }
+
+  array in = inputs[0];
+  if (in.ndim() == 0 || !is_vulkan_float_dtype(in.dtype()) ||
+      out.dtype() != in.dtype()) {
+    return false;
+  }
+
+  if (!in.flags().contiguous || in.offset() != 0 || in.strides().back() != 1 ||
+      !is_supported_unary_layout(in)) {
+    in = contiguous_copy_gpu(in, s);
+  }
+
+  array out_work = out;
+  const bool staged_output = !out.flags().contiguous || out.offset() != 0 ||
+      out.strides().back() != 1 || !is_supported_unary_layout(out);
+  if (staged_output) {
+    out_work = array(out.shape(), out.dtype(), nullptr, {});
+  }
+
+  set_unary_output_data(in, out_work);
+  if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out_work)) {
+    return false;
+  }
+
+  if (out_work.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  }
+
+  try {
+    const std::string shader_name = out.dtype() == bfloat16
+        ? "logsumexp_bf16"
+        : "logsumexp_" + dtype_suffix(out.dtype());
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_sum_rows_op(in, out_work, shader_name, command_buffer, s);
+    vulkan::end_command_recording(s.index);
+    if (staged_output) {
+      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "logsumexp_dispatch_failed reason=" << e.what();
+      trace_fallback(oss.str());
+    }
+    return false;
+  }
+}
+
 bool try_eval_softmax_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -1168,10 +1560,11 @@ bool try_eval_scan_cumsum_vulkan(
     throw std::runtime_error(#func " has no Vulkan implementation.");  \
   }
 
-#define NO_GPU_USE_FALLBACK(func)     \
-  bool func::use_fallback(Stream s) { \
-    return true;                      \
-  }                                   \
+#define NO_GPU_USE_FALLBACK(func)                             \
+  bool func::use_fallback(Stream s) {                         \
+    trace_use_fallback(#func, s, "no Vulkan implementation"); \
+    return true;                                              \
+  }                                                           \
   NO_GPU_MULTI(func)
 
 #define NO_GPU(func)                                                  \
@@ -1428,6 +1821,28 @@ void Load::eval_gpu(const std::vector<array>& inputs, array& out) {
   synchronize(cpu_stream);
 }
 
+void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
+  auto [axes, slice_sizes] = state();
+  if (try_eval_gather_vulkan(inputs, out, axes, slice_sizes, stream())) {
+    return;
+  }
+  eval_cpu_fallback_on_stream<Gather>(inputs, out, stream(), axes, slice_sizes);
+}
+
+void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (try_eval_gather_axis_vulkan(inputs, out, state(), stream())) {
+    return;
+  }
+  eval_cpu_fallback_on_stream<GatherAxis>(inputs, out, stream(), state());
+}
+
+void LogSumExp::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (try_eval_logsumexp_vulkan(inputs, out, stream())) {
+    return;
+  }
+  eval_cpu_fallback_on_stream<LogSumExp>(inputs, out, stream());
+}
+
 bool fast::ScaledDotProductAttention::use_fallback(
     const array& q,
     const array& k,
@@ -1438,6 +1853,16 @@ bool fast::ScaledDotProductAttention::use_fallback(
     bool is_training,
     bool output_logsumexp,
     Stream s) {
+  if (trace_fallback_enabled()) {
+    std::ostringstream oss;
+    oss << "q_shape=" << q.shape() << " k_shape=" << k.shape()
+        << " v_shape=" << v.shape() << " has_mask=" << has_mask
+        << " has_arr_mask=" << has_arr_mask << " do_causal=" << do_causal
+        << " is_training=" << is_training
+        << " output_logsumexp=" << output_logsumexp;
+    trace_use_fallback(
+        "ScaledDotProductAttention", s, "no Vulkan implementation", oss.str());
+  }
   return true;
 }
 
@@ -1448,6 +1873,15 @@ bool fast::ScaledDotProductAttention::supports_bool_mask() {
 bool fast::ScaledDotProductAttentionVJP::use_fallback(
     const array& q,
     Stream s) {
+  if (trace_fallback_enabled()) {
+    std::ostringstream oss;
+    oss << "q_shape=" << q.shape();
+    trace_use_fallback(
+        "ScaledDotProductAttentionVJP",
+        s,
+        "no Vulkan implementation",
+        oss.str());
+  }
   return true;
 }
 
@@ -1482,8 +1916,8 @@ CPU_FALLBACK(Remainder)
 CPU_FALLBACK(Expm1)
 CPU_FALLBACK_STATE(FFT)
 // Floor implemented above.
-CPU_FALLBACK_STATE(Gather)
-CPU_FALLBACK_STATE(GatherAxis)
+// Gather implemented above.
+// GatherAxis implemented above.
 CPU_FALLBACK_STATE(GatherMM)
 CPU_FALLBACK_STATE(GatherQMM)
 CPU_FALLBACK(Greater)
@@ -1499,7 +1933,7 @@ CPU_FALLBACK(LogicalNot)
 CPU_FALLBACK(LogicalAnd)
 CPU_FALLBACK(LogicalOr)
 CPU_FALLBACK(LogAddExp)
-CPU_FALLBACK(LogSumExp)
+// LogSumExp implemented above.
 CPU_FALLBACK_MULTI(LUF)
 // Matmul implemented in matmul.cpp
 // Maximum has CPU fallback above.

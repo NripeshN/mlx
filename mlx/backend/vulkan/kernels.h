@@ -248,6 +248,21 @@ struct RandomBitsPushConstants {
   uint32_t out_skip;
 };
 
+struct GatherPushConstants {
+  uint32_t ne;
+  uint32_t slice_size;
+  uint32_t axis_size;
+  uint32_t index_count;
+};
+
+struct GatherAxisPushConstants {
+  uint32_t ne;
+  uint32_t size_pre;
+  uint32_t size_axis;
+  uint32_t size_post;
+  uint32_t idx_axis_size;
+};
+
 enum class BinaryDispatchVariant {
   Standard,
   AddWithPartials,
@@ -355,6 +370,29 @@ void dispatch_random_bits_op(
     const Stream& s,
     const RandomBitsPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid);
+
+void dispatch_gather_op(
+    const array& src,
+    const array& indices,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t slice_size,
+    uint32_t axis_size,
+    uint32_t index_count);
+
+void dispatch_gather_axis_op(
+    const array& src,
+    const array& indices,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t size_pre,
+    uint32_t size_axis,
+    uint32_t size_post,
+    uint32_t idx_axis_size);
 
 // Get workgroup dimensions for element-wise operations.
 // Returns (workgroup_count_x, workgroup_count_y, workgroup_count_z)
