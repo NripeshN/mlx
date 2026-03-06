@@ -1539,6 +1539,11 @@ void process_shaders() {
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
   string_to_spv(
+      "rsqrt_f32",
+      "rsqrt.comp",
+      {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+
+  string_to_spv(
       "sin_f32",
       "sin.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});

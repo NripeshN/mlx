@@ -3,17 +3,46 @@
 #include "mlx/backend/vulkan/kernels.h"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
+#include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/vulkan.h"
 
 namespace mlx::core::vulkan {
 
 namespace {
+
+bool trace_descriptor_epochs_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_TRACE_SYNC");
+        env != nullptr) {
+      return std::string(env) != "0";
+    }
+    if (const char* env = std::getenv("MLX_VULKAN_TRACE_DESCRIPTORS");
+        env != nullptr) {
+      return std::string(env) != "0";
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+void trace_descriptor_epochs(const std::string& msg) {
+  if (!trace_descriptor_epochs_enabled()) {
+    return;
+  }
+
+  static std::mutex trace_mutex;
+  std::lock_guard<std::mutex> lock(trace_mutex);
+  std::cerr << "[vulkan-descriptor] " << msg << std::endl;
+}
 
 std::string make_pipeline_key(
     const std::string& shader_name,
@@ -549,7 +578,15 @@ void dispatch_with_spec(
       specialization_constants);
   VkDescriptorSet descriptor_set =
       manager.allocate_descriptor_set(pipeline->descriptor_layout);
-  manager.defer_descriptor_set_free(s.index, descriptor_set);
+  const uint64_t descriptor_epoch = descriptor_epoch_for_stream(s);
+  manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
+  if (trace_descriptor_epochs_enabled()) {
+    std::ostringstream oss;
+    oss << "defer stream=" << s.index << " epoch=" << descriptor_epoch
+        << " set=0x" << std::hex << reinterpret_cast<uintptr_t>(descriptor_set)
+        << std::dec;
+    trace_descriptor_epochs(oss.str());
+  }
 
   std::array<VkDescriptorBufferInfo, 6> descriptor_infos{};
   std::array<VkWriteDescriptorSet, 6> descriptor_writes{};
@@ -558,6 +595,8 @@ void dispatch_with_spec(
     if (bound_arrays[i].arr == nullptr) {
       throw std::runtime_error("[vulkan::kernels] Missing bound array.");
     }
+
+    retain_array_for_stream(s, *bound_arrays[i].arr);
 
     descriptor_infos[i] =
         make_buffer_info(*bound_arrays[i].arr, bound_arrays[i].name);
@@ -869,23 +908,62 @@ void KernelManager::free_descriptor_set(VkDescriptorSet set) {
 void KernelManager::defer_descriptor_set_free(
     int stream_index,
     VkDescriptorSet set) {
+  defer_descriptor_set_free(stream_index, 0, set);
+}
+
+void KernelManager::defer_descriptor_set_free(
+    int stream_index,
+    uint64_t submission_epoch,
+    VkDescriptorSet set) {
   if (set == VK_NULL_HANDLE) {
     return;
   }
   std::lock_guard<std::mutex> lock(deferred_descriptor_sets_mutex_);
-  deferred_descriptor_sets_[stream_index].push_back(set);
+  deferred_descriptor_sets_[stream_index][submission_epoch].push_back(set);
+  if (trace_descriptor_epochs_enabled()) {
+    std::ostringstream oss;
+    oss << "enqueue stream=" << stream_index << " epoch=" << submission_epoch
+        << " queued="
+        << deferred_descriptor_sets_[stream_index][submission_epoch].size();
+    trace_descriptor_epochs(oss.str());
+  }
 }
 
 void KernelManager::reclaim_descriptor_sets(int stream_index) {
+  reclaim_descriptor_sets(stream_index, std::numeric_limits<uint64_t>::max());
+}
+
+void KernelManager::reclaim_descriptor_sets(
+    int stream_index,
+    uint64_t completed_epoch) {
   std::vector<VkDescriptorSet> sets;
+  size_t remaining_epochs = 0;
   {
     std::lock_guard<std::mutex> lock(deferred_descriptor_sets_mutex_);
     auto it = deferred_descriptor_sets_.find(stream_index);
     if (it == deferred_descriptor_sets_.end()) {
       return;
     }
-    sets = std::move(it->second);
-    deferred_descriptor_sets_.erase(it);
+
+    auto& epoch_map = it->second;
+    for (auto epoch_it = epoch_map.begin(); epoch_it != epoch_map.end();) {
+      if (epoch_it->first <= completed_epoch) {
+        auto& epoch_sets = epoch_it->second;
+        sets.insert(
+            sets.end(),
+            std::make_move_iterator(epoch_sets.begin()),
+            std::make_move_iterator(epoch_sets.end()));
+        epoch_it = epoch_map.erase(epoch_it);
+      } else {
+        ++epoch_it;
+      }
+    }
+    if (epoch_map.empty()) {
+      deferred_descriptor_sets_.erase(it);
+      remaining_epochs = 0;
+    } else {
+      remaining_epochs = epoch_map.size();
+    }
   }
 
   if (sets.empty() || descriptor_pool_ == VK_NULL_HANDLE) {
@@ -898,30 +976,47 @@ void KernelManager::reclaim_descriptor_sets(int stream_index) {
       descriptor_pool_,
       static_cast<uint32_t>(sets.size()),
       sets.data());
+
+  if (trace_descriptor_epochs_enabled()) {
+    std::ostringstream oss;
+    oss << "reclaim stream=" << stream_index
+        << " completed_epoch=" << completed_epoch
+        << " freed_sets=" << sets.size()
+        << " remaining_epochs=" << remaining_epochs;
+    trace_descriptor_epochs(oss.str());
+  }
 }
 
 void KernelManager::reclaim_all_descriptor_sets() {
-  std::unordered_map<int, std::vector<VkDescriptorSet>> all_sets;
+  std::vector<VkDescriptorSet> all_sets;
   {
     std::lock_guard<std::mutex> lock(deferred_descriptor_sets_mutex_);
-    all_sets = std::move(deferred_descriptor_sets_);
+    for (auto& [_, epoch_map] : deferred_descriptor_sets_) {
+      for (auto& [_, sets] : epoch_map) {
+        all_sets.insert(
+            all_sets.end(),
+            std::make_move_iterator(sets.begin()),
+            std::make_move_iterator(sets.end()));
+      }
+    }
     deferred_descriptor_sets_.clear();
   }
 
-  if (descriptor_pool_ == VK_NULL_HANDLE) {
+  if (all_sets.empty() || descriptor_pool_ == VK_NULL_HANDLE) {
     return;
   }
 
   VkDevice device = VulkanContext::get().device();
-  for (auto& [_, sets] : all_sets) {
-    if (sets.empty()) {
-      continue;
-    }
-    vkFreeDescriptorSets(
-        device,
-        descriptor_pool_,
-        static_cast<uint32_t>(sets.size()),
-        sets.data());
+  vkFreeDescriptorSets(
+      device,
+      descriptor_pool_,
+      static_cast<uint32_t>(all_sets.size()),
+      all_sets.data());
+
+  if (trace_descriptor_epochs_enabled()) {
+    std::ostringstream oss;
+    oss << "reclaim_all freed_sets=" << all_sets.size();
+    trace_descriptor_epochs(oss.str());
   }
 }
 

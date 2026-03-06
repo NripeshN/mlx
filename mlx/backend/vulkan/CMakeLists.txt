@@ -76,7 +76,10 @@ if(Vulkan_FOUND)
   )
   
   # Get all shader files
-  file(GLOB SHADER_FILES "${CMAKE_CURRENT_SOURCE_DIR}/kernels/*.comp")
+  file(
+    GLOB SHADER_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/kernels/*.comp"
+  )
   set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
   set(SHADER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/vulkan_shaders.hpp")
   
@@ -102,13 +105,13 @@ if(Vulkan_FOUND)
     list(APPEND SHADER_CPP_FILES ${shader_cpp})
   endforeach()
   
-  # Generate main header
+  # Generate main header - must happen after all shader variants are compiled
   add_custom_command(
     OUTPUT ${SHADER_HEADER}
     COMMAND ${SHADER_GEN_BIN}
       --output-dir ${SHADER_OUTPUT_DIR}
       --target-hpp ${SHADER_HEADER}
-    DEPENDS ${SHADER_GEN_BIN}
+    DEPENDS ${SHADER_GEN_BIN} ${SHADER_CPP_FILES}
     COMMENT "Generating Vulkan shaders header"
   )
   

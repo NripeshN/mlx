@@ -2,6 +2,7 @@
 
 #include "mlx/backend/common/matmul.h"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
@@ -443,6 +444,7 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
   log_matmul_path(inputs, "cpu_fallback");
+  ::mlx::core::gpu::synchronize(stream());
   auto cpu_stream = default_stream(Device::cpu);
   Matmul cpu_matmul(cpu_stream);
   cpu_matmul.eval_cpu(inputs, out);
@@ -451,6 +453,7 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [alpha, beta] = state();
+  ::mlx::core::gpu::synchronize(stream());
   auto cpu_stream = default_stream(Device::cpu);
   AddMM cpu_addmm(cpu_stream, alpha, beta);
   cpu_addmm.eval_cpu(inputs, out);
@@ -459,6 +462,7 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto block_size = state();
+  ::mlx::core::gpu::synchronize(stream());
   auto cpu_stream = default_stream(Device::cpu);
   BlockMaskedMM cpu_block_masked_mm(cpu_stream, block_size);
   cpu_block_masked_mm.eval_cpu(inputs, out);

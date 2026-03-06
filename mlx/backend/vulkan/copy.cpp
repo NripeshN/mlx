@@ -203,6 +203,9 @@ void copy_gpu_inplace(
     vkCmdCopyBuffer(
         cmd_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
 
+    vulkan::retain_array_for_stream(s, in);
+    vulkan::retain_array_for_stream(s, out);
+
   } else if (shader_copy) {
     auto shader_name = get_copy_shader_name(in, out);
     try {

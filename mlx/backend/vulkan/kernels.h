@@ -58,7 +58,12 @@ class KernelManager {
   VkDescriptorSet allocate_descriptor_set(VkDescriptorSetLayout layout);
   void free_descriptor_set(VkDescriptorSet set);
   void defer_descriptor_set_free(int stream_index, VkDescriptorSet set);
+  void defer_descriptor_set_free(
+      int stream_index,
+      uint64_t submission_epoch,
+      VkDescriptorSet set);
   void reclaim_descriptor_sets(int stream_index);
+  void reclaim_descriptor_sets(int stream_index, uint64_t completed_epoch);
   void reclaim_all_descriptor_sets();
 
   // Clean up all resources
@@ -76,7 +81,9 @@ class KernelManager {
   // Descriptor pool for allocating descriptor sets
   VkDescriptorPool descriptor_pool_{VK_NULL_HANDLE};
   bool descriptor_pool_initialized_{false};
-  std::unordered_map<int, std::vector<VkDescriptorSet>>
+  std::unordered_map<
+      int,
+      std::unordered_map<uint64_t, std::vector<VkDescriptorSet>>>
       deferred_descriptor_sets_;
   std::mutex deferred_descriptor_sets_mutex_;
 

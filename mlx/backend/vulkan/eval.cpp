@@ -1,12 +1,16 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/backend/gpu/eval.h"
+#include "mlx/backend/vulkan/device.h"
 #include "mlx/primitives.h"
 
 namespace mlx::core::gpu {
 
 void eval(array& arr) {
   auto outputs = arr.outputs();
+  auto s = arr.primitive().stream();
+
+  vulkan::begin_primitive_tracking(s, arr.inputs(), outputs);
   {
     // Keep tracer inputs alive so they are not donated.
     std::vector<array> inputs;
@@ -16,9 +20,14 @@ void eval(array& arr) {
     arr.primitive().eval_gpu(arr.inputs(), outputs);
   }
 
-  // Temporary conservative behavior: synchronize after each op.
-  // This avoids lifetime hazards while Vulkan command scheduling matures.
-  ::mlx::core::gpu::synchronize(arr.primitive().stream());
+  vulkan::end_primitive_tracking(s, arr.inputs(), outputs);
+
+  for (const auto& in : arr.inputs()) {
+    vulkan::retain_array_for_stream(s, in);
+  }
+  for (const auto& out : outputs) {
+    vulkan::retain_array_for_stream(s, out);
+  }
 }
 
 void finalize(Stream s) {

@@ -4,6 +4,7 @@
 #include "mlx/backend/common/binary.h"
 #include "mlx/backend/common/unary.h"
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/gpu/eval.h"
 #include "mlx/backend/gpu/slicing.h"
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
@@ -12,21 +13,52 @@
 #include "mlx/transforms.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
+#include <mutex>
+#include <sstream>
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <typeinfo>
 #include <utility>
 
 namespace mlx::core {
 
 namespace {
 
+bool trace_fallback_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_TRACE_FALLBACKS");
+        env != nullptr) {
+      return std::string(env) != "0";
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+void trace_fallback(const std::string& msg) {
+  if (!trace_fallback_enabled()) {
+    return;
+  }
+  static std::mutex trace_mutex;
+  std::lock_guard<std::mutex> lock(trace_mutex);
+  std::cerr << "[vulkan-fallback] " << msg << "\n";
+}
+
 template <typename Primitive, typename... Args>
 void eval_cpu_fallback(
     const std::vector<array>& inputs,
     array& out,
     Args&&... args) {
+  if (trace_fallback_enabled()) {
+    std::ostringstream oss;
+    oss << "primitive=" << typeid(Primitive).name() << " kind=unary"
+        << " inputs=" << inputs.size() << " out_shape=" << out.shape();
+    trace_fallback(oss.str());
+  }
   auto cpu_stream = default_stream(Device::cpu);
   Primitive cpu_primitive(cpu_stream, std::forward<Args>(args)...);
   cpu_primitive.eval_cpu(inputs, out);
@@ -34,14 +66,41 @@ void eval_cpu_fallback(
 }
 
 template <typename Primitive, typename... Args>
+void eval_cpu_fallback_on_stream(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream stream,
+    Args&&... args) {
+  ::mlx::core::gpu::synchronize(stream);
+  eval_cpu_fallback<Primitive>(inputs, out, std::forward<Args>(args)...);
+}
+
+template <typename Primitive, typename... Args>
 void eval_cpu_fallback_multi(
     const std::vector<array>& inputs,
     std::vector<array>& outputs,
     Args&&... args) {
+  if (trace_fallback_enabled()) {
+    std::ostringstream oss;
+    oss << "primitive=" << typeid(Primitive).name() << " kind=multi"
+        << " inputs=" << inputs.size() << " outputs=" << outputs.size();
+    trace_fallback(oss.str());
+  }
   auto cpu_stream = default_stream(Device::cpu);
   Primitive cpu_primitive(cpu_stream, std::forward<Args>(args)...);
   cpu_primitive.eval_cpu(inputs, outputs);
   synchronize(cpu_stream);
+}
+
+template <typename Primitive, typename... Args>
+void eval_cpu_fallback_multi_on_stream(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs,
+    Stream stream,
+    Args&&... args) {
+  ::mlx::core::gpu::synchronize(stream);
+  eval_cpu_fallback_multi<Primitive>(
+      inputs, outputs, std::forward<Args>(args)...);
 }
 
 template <typename T, typename = void>
@@ -71,6 +130,28 @@ void eval_cpu_fallback_with_state(
 }
 
 template <typename Primitive, typename State>
+void eval_cpu_fallback_with_state_on_stream(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream stream,
+    State&& state) {
+  if constexpr (is_tuple_like<State>::value) {
+    std::apply(
+        [&](auto&&... state_args) {
+          eval_cpu_fallback_on_stream<Primitive>(
+              inputs,
+              out,
+              stream,
+              std::forward<decltype(state_args)>(state_args)...);
+        },
+        std::forward<State>(state));
+  } else {
+    eval_cpu_fallback_on_stream<Primitive>(
+        inputs, out, stream, std::forward<State>(state));
+  }
+}
+
+template <typename Primitive, typename State>
 void eval_cpu_fallback_multi_with_state(
     const std::vector<array>& inputs,
     std::vector<array>& outputs,
@@ -90,8 +171,30 @@ void eval_cpu_fallback_multi_with_state(
   }
 }
 
+template <typename Primitive, typename State>
+void eval_cpu_fallback_multi_with_state_on_stream(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs,
+    Stream stream,
+    State&& state) {
+  if constexpr (is_tuple_like<State>::value) {
+    std::apply(
+        [&](auto&&... state_args) {
+          eval_cpu_fallback_multi_on_stream<Primitive>(
+              inputs,
+              outputs,
+              stream,
+              std::forward<decltype(state_args)>(state_args)...);
+        },
+        std::forward<State>(state));
+  } else {
+    eval_cpu_fallback_multi_on_stream<Primitive>(
+        inputs, outputs, stream, std::forward<State>(state));
+  }
+}
+
 bool is_vulkan_float_dtype(Dtype dtype) {
-  return dtype == float16 || dtype == float32;
+  return dtype == float16 || dtype == float32 || dtype == bfloat16;
 }
 
 std::string dtype_suffix(Dtype dtype) {
@@ -176,7 +279,18 @@ bool try_eval_binary_op_vulkan(
     return false;
   }
 
-  if (std::string_view(op_name) == "div" &&
+  const bool use_f32_staging_io =
+      a.dtype() == bfloat16 || b.dtype() == bfloat16 || out.dtype() == bfloat16;
+  if (use_f32_staging_io) {
+    array a_f32(a.shape(), float32, nullptr, {});
+    array b_f32(b.shape(), float32, nullptr, {});
+    copy_gpu(a, a_f32, CopyType::General, s);
+    copy_gpu(b, b_f32, CopyType::General, s);
+    a = a_f32;
+    b = b_f32;
+  }
+
+  if (!use_f32_staging_io && std::string_view(op_name) == "div" &&
       (a.dtype() == float16 || b.dtype() == float16 ||
        out.dtype() == float16)) {
     return false;
@@ -193,13 +307,19 @@ bool try_eval_binary_op_vulkan(
     b = contiguous_copy_gpu(b, s);
   }
 
-  const bool staged_output = !is_supported_elementwise_layout(out);
-  array out_work =
-      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  const bool staged_output =
+      use_f32_staging_io || !is_supported_elementwise_layout(out);
+  array out_work = staged_output
+      ? array(
+            out.shape(),
+            use_f32_staging_io ? float32 : out.dtype(),
+            nullptr,
+            {})
+      : out;
 
   auto suffix_a = dtype_suffix(a.dtype());
   auto suffix_b = dtype_suffix(b.dtype());
-  auto suffix_out = dtype_suffix(out.dtype());
+  auto suffix_out = dtype_suffix(out_work.dtype());
   if (suffix_a.empty() || suffix_b.empty() || suffix_out.empty()) {
     return false;
   }
@@ -225,20 +345,25 @@ bool try_eval_binary_op_vulkan(
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
+    auto dispatch_variant = binary_dispatch_variant<Primitive>();
+    if constexpr (std::is_same_v<Primitive, Add>) {
+      if (use_f32_staging_io) {
+        dispatch_variant = vulkan::BinaryDispatchVariant::Standard;
+      }
+    }
     vulkan::dispatch_binary_op(
-        a,
-        b,
-        out_work,
-        shader_name,
-        command_buffer,
-        s,
-        binary_dispatch_variant<Primitive>());
+        a, b, out_work, shader_name, command_buffer, s, dispatch_variant);
     vulkan::end_command_recording(s.index);
-    if (staged_output) {
-      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    if (staged_output || use_f32_staging_io) {
+      copy_gpu(out_work, out, CopyType::General, s);
     }
     return true;
-  } catch (const std::runtime_error&) {
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "binary_dispatch_failed op=" << op_name << " reason=" << e.what();
+      trace_fallback(oss.str());
+    }
     return false;
   }
 }
@@ -252,7 +377,7 @@ void eval_binary_vulkan_or_cpu(
   if (try_eval_binary_op_vulkan<Primitive>(inputs, out, op_name, s)) {
     return;
   }
-  eval_cpu_fallback<Primitive>(inputs, out);
+  eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
 }
 
 template <typename Primitive>
@@ -268,13 +393,31 @@ bool try_eval_unary_op_vulkan(
   }
 
   array in = inputs[0];
+  if (!is_vulkan_float_dtype(in.dtype()) || in.dtype() != out.dtype()) {
+    return false;
+  }
+
+  const bool use_f32_staging_io =
+      in.dtype() == bfloat16 || out.dtype() == bfloat16;
+  if (use_f32_staging_io) {
+    array in_f32(in.shape(), float32, nullptr, {});
+    copy_gpu(in, in_f32, CopyType::General, s);
+    in = in_f32;
+  }
+
   if (!is_supported_unary_layout(in)) {
     in = contiguous_copy_gpu(in, s);
   }
 
-  const bool staged_output = !is_supported_unary_layout(out);
-  array out_work =
-      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  const bool staged_output =
+      use_f32_staging_io || !is_supported_unary_layout(out);
+  array out_work = staged_output
+      ? array(
+            out.shape(),
+            use_f32_staging_io ? float32 : out.dtype(),
+            nullptr,
+            {})
+      : out;
 
   set_unary_output_data(in, out_work);
   if (!is_supported_unary_layout(in) || !is_supported_unary_layout(out_work)) {
@@ -293,11 +436,17 @@ bool try_eval_unary_op_vulkan(
     vulkan::dispatch_unary_op(
         in, out_work, shader_name, command_buffer, s, param1, param2);
     vulkan::end_command_recording(s.index);
-    if (staged_output) {
-      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    if (staged_output || use_f32_staging_io) {
+      copy_gpu(out_work, out, CopyType::General, s);
     }
     return true;
-  } catch (const std::runtime_error&) {
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "unary_dispatch_failed shader=" << shader_name
+          << " reason=" << e.what();
+      trace_fallback(oss.str());
+    }
     return false;
   }
 }
@@ -314,7 +463,7 @@ void eval_unary_vulkan_or_cpu(
           inputs, out, shader_name, s, param1, param2)) {
     return;
   }
-  eval_cpu_fallback<Primitive>(inputs, out);
+  eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
 }
 
 template <typename Primitive>
@@ -336,13 +485,27 @@ bool try_eval_generic_unary_op_vulkan(
     return false;
   }
 
+  const bool use_f32_staging_io =
+      in.dtype() == bfloat16 || out.dtype() == bfloat16;
+  if (use_f32_staging_io) {
+    array in_f32(in.shape(), float32, nullptr, {});
+    copy_gpu(in, in_f32, CopyType::General, s);
+    in = in_f32;
+  }
+
   if (!is_supported_generic_unary_layout(in)) {
     in = contiguous_copy_gpu(in, s);
   }
 
-  const bool staged_output = !is_supported_generic_unary_layout(out);
-  array out_work =
-      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  const bool staged_output =
+      use_f32_staging_io || !is_supported_generic_unary_layout(out);
+  array out_work = staged_output
+      ? array(
+            out.shape(),
+            use_f32_staging_io ? float32 : out.dtype(),
+            nullptr,
+            {})
+      : out;
 
   set_unary_output_data(in, out_work);
   if (!is_supported_generic_unary_layout(in) ||
@@ -370,11 +533,17 @@ bool try_eval_generic_unary_op_vulkan(
         param3,
         param4);
     vulkan::end_command_recording(s.index);
-    if (staged_output) {
-      copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
+    if (staged_output || use_f32_staging_io) {
+      copy_gpu(out_work, out, CopyType::General, s);
     }
     return true;
-  } catch (const std::runtime_error&) {
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "generic_unary_dispatch_failed shader=" << shader_name
+          << " reason=" << e.what();
+      trace_fallback(oss.str());
+    }
     return false;
   }
 }
@@ -393,7 +562,7 @@ void eval_generic_unary_vulkan_or_cpu(
           inputs, out, shader_name, s, param1, param2, param3, param4)) {
     return;
   }
-  eval_cpu_fallback<Primitive>(inputs, out);
+  eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
 }
 
 template <typename Primitive>
@@ -405,6 +574,9 @@ void eval_generic_unary_suffix_vulkan_or_cpu(
     bool f16_with_rte = false) {
   if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
     auto suffix = dtype_suffix(out.dtype());
+    if (suffix.empty() && out.dtype() == bfloat16) {
+      suffix = "f32";
+    }
     if (!suffix.empty()) {
       std::string shader_name = std::string(op_name) + "_" + suffix;
       if (f16_with_rte && out.dtype() == float16) {
@@ -414,7 +586,7 @@ void eval_generic_unary_suffix_vulkan_or_cpu(
       return;
     }
   }
-  eval_cpu_fallback<Primitive>(inputs, out);
+  eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
 }
 
 bool try_eval_arange_vulkan(
@@ -444,7 +616,12 @@ bool try_eval_arange_vulkan(
         static_cast<float>(step));
     vulkan::end_command_recording(s.index);
     return true;
-  } catch (const std::runtime_error&) {
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "softmax_dispatch_failed reason=" << e.what();
+      trace_fallback(oss.str());
+    }
     return false;
   }
 }
@@ -963,24 +1140,26 @@ bool try_eval_scan_cumsum_vulkan(
 
 #define CPU_FALLBACK(func)                                            \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
-    eval_cpu_fallback<func>(inputs, out);                             \
+    eval_cpu_fallback_on_stream<func>(inputs, out, stream());         \
   }
 
 #define CPU_FALLBACK_STATE(func)                                      \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
-    eval_cpu_fallback_with_state<func>(inputs, out, state());         \
+    eval_cpu_fallback_with_state_on_stream<func>(                     \
+        inputs, out, stream(), state());                              \
   }
 
-#define CPU_FALLBACK_MULTI(func)                                       \
-  void func::eval_gpu(                                                 \
-      const std::vector<array>& inputs, std::vector<array>& outputs) { \
-    eval_cpu_fallback_multi<func>(inputs, outputs);                    \
-  }
-
-#define CPU_FALLBACK_MULTI_STATE(func)                                  \
+#define CPU_FALLBACK_MULTI(func)                                        \
   void func::eval_gpu(                                                  \
       const std::vector<array>& inputs, std::vector<array>& outputs) {  \
-    eval_cpu_fallback_multi_with_state<func>(inputs, outputs, state()); \
+    eval_cpu_fallback_multi_on_stream<func>(inputs, outputs, stream()); \
+  }
+
+#define CPU_FALLBACK_MULTI_STATE(func)                                 \
+  void func::eval_gpu(                                                 \
+      const std::vector<array>& inputs, std::vector<array>& outputs) { \
+    eval_cpu_fallback_multi_with_state_on_stream<func>(                \
+        inputs, outputs, stream(), state());                           \
   }
 
 #define NO_GPU_MULTI(func)                                             \
@@ -1032,7 +1211,8 @@ void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_arg_reduce_vulkan(inputs, out, reduce_type, axis, stream())) {
     return;
   }
-  eval_cpu_fallback<ArgReduce>(inputs, out, reduce_type, axis);
+  eval_cpu_fallback_on_stream<ArgReduce>(
+      inputs, out, stream(), reduce_type, axis);
 }
 
 void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -1041,14 +1221,14 @@ void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
           inputs, out, reduce_type, axes, stream())) {
     return;
   }
-  eval_cpu_fallback<Reduce>(inputs, out, reduce_type, axes);
+  eval_cpu_fallback_on_stream<Reduce>(inputs, out, stream(), reduce_type, axes);
 }
 
 void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_softmax_vulkan(inputs, out, state(), stream())) {
     return;
   }
-  eval_cpu_fallback<Softmax>(inputs, out, state());
+  eval_cpu_fallback_on_stream<Softmax>(inputs, out, stream(), state());
 }
 
 VULKAN_GENERIC_UNARY_GPU(Abs, "abs")
@@ -1058,7 +1238,7 @@ void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (try_eval_arange_vulkan(inputs, out, stream(), start, step)) {
     return;
   }
-  eval_cpu_fallback<Arange>(inputs, out, start, stop, step);
+  eval_cpu_fallback_on_stream<Arange>(inputs, out, stream(), start, stop, step);
 }
 
 VULKAN_GENERIC_UNARY_GPU(Ceil, "ceil")
@@ -1070,7 +1250,7 @@ void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
   }
-  eval_cpu_fallback<Cos>(inputs, out);
+  eval_cpu_fallback_on_stream<Cos>(inputs, out, stream());
 }
 
 VULKAN_GENERIC_UNARY_RTE_GPU(Exp, "exp")
@@ -1090,7 +1270,7 @@ void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
       }
     }
   }
-  eval_cpu_fallback<Log>(inputs, out, state());
+  eval_cpu_fallback_on_stream<Log>(inputs, out, stream(), state());
 }
 
 void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -1100,7 +1280,7 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
   }
-  eval_cpu_fallback<Sin>(inputs, out);
+  eval_cpu_fallback_on_stream<Sin>(inputs, out, stream());
 }
 
 VULKAN_GENERIC_UNARY_GPU(Negative, "neg")
@@ -1115,16 +1295,18 @@ void Square::eval_gpu(const std::vector<array>& inputs, array& out) {
     eval_unary_vulkan_or_cpu<Square>(inputs, out, "sqr_f32", stream());
     return;
   }
-  eval_cpu_fallback<Square>(inputs, out);
+  eval_cpu_fallback_on_stream<Square>(inputs, out, stream());
 }
 
 void Sqrt::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (!state() && inputs.size() == 1 && inputs[0].dtype() == float32 &&
-      out.dtype() == float32) {
-    eval_unary_vulkan_or_cpu<Sqrt>(inputs, out, "sqrt_f32", stream());
+  if (inputs.size() == 1 &&
+      (inputs[0].dtype() == float32 || inputs[0].dtype() == bfloat16) &&
+      out.dtype() == inputs[0].dtype()) {
+    eval_unary_vulkan_or_cpu<Sqrt>(
+        inputs, out, state() ? "rsqrt_f32" : "sqrt_f32", stream());
     return;
   }
-  eval_cpu_fallback<Sqrt>(inputs, out, state());
+  eval_cpu_fallback_on_stream<Sqrt>(inputs, out, stream(), state());
 }
 
 VULKAN_GENERIC_UNARY_GPU(Tanh, "tanh")
@@ -1135,12 +1317,14 @@ void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
           inputs, out, reduce_type, axis, reverse, inclusive, stream())) {
     return;
   }
-  eval_cpu_fallback<Scan>(inputs, out, reduce_type, axis, reverse, inclusive);
+  eval_cpu_fallback_on_stream<Scan>(
+      inputs, out, stream(), reduce_type, axis, reverse, inclusive);
 }
 
 void Compiled::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  ::mlx::core::gpu::synchronize(stream());
   auto cpu_stream = default_stream(Device::cpu);
   Compiled cpu_compiled(cpu_stream, inputs_, outputs_, tape_, constant_ids_);
   cpu_compiled.eval_cpu(inputs, outputs);
@@ -1148,6 +1332,7 @@ void Compiled::eval_gpu(
 }
 
 void Load::eval_gpu(const std::vector<array>& inputs, array& out) {
+  ::mlx::core::gpu::synchronize(stream());
   auto cpu_stream = default_stream(Device::cpu);
   Load cpu_load(cpu_stream, reader_, offset_, swap_endianness_);
   cpu_load.eval_cpu(inputs, out);
@@ -1268,6 +1453,7 @@ CPU_FALLBACK(MaskedScatter)
 void fast::ConvertFP8::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  ::mlx::core::gpu::synchronize(stream());
   auto cpu_stream = default_stream(Device::cpu);
   fast::ConvertFP8 cpu_convert(cpu_stream, state());
   cpu_convert.eval_cpu(inputs, outputs);
@@ -1277,6 +1463,7 @@ void fast::ConvertFP8::eval_gpu(
 void fast::Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  ::mlx::core::gpu::synchronize(stream());
   auto fallback_outputs = fallback_(inputs);
   if (fallback_outputs.size() != outputs.size()) {
     throw std::runtime_error(
