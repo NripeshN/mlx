@@ -303,6 +303,12 @@ TEST_CASE("test gpu binary ops") {
     y = array(2.0f);
     CHECK_EQ(maximum(x, y, Device::gpu).item<float>(), 2.0f);
     CHECK_EQ(minimum(x, y, Device::gpu).item<float>(), 1.0f);
+
+    auto nan = array(std::numeric_limits<float>::quiet_NaN());
+    CHECK(std::isnan(maximum(nan, y, Device::gpu).item<float>()));
+    CHECK(std::isnan(maximum(y, nan, Device::gpu).item<float>()));
+    CHECK(std::isnan(minimum(nan, y, Device::gpu).item<float>()));
+    CHECK(std::isnan(minimum(y, nan, Device::gpu).item<float>()));
   }
 
   // Check equal
@@ -406,6 +412,15 @@ TEST_CASE("test gpu unary ops") {
 
     x = array(-2.0f);
     CHECK(std::isnan(log1p(x, Device::gpu).item<float>()));
+  }
+
+  {
+    auto x =
+        array({-0.999f, -0.5f, 0.0f, 0.5f, 0.999f}, {5}, float32, Device::cpu);
+    auto out_gpu = erfinv(x, Device::gpu);
+    auto out_cpu = erfinv(x, Device::cpu);
+    CHECK(allclose(out_gpu, out_cpu, 1e-5, 1e-5, false, Device::cpu)
+              .item<bool>());
   }
 }
 

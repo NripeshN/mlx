@@ -1200,7 +1200,7 @@ CPU_FALLBACK_STATE(Equal)
 
 void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
   assert(inputs.size() == 1);
-  auto& keys = inputs[0];
+  array keys = inputs[0];
   size_t num_keys = keys.size() / 2;
 
   if (num_keys == 0) {
@@ -1212,18 +1212,24 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
   size_t bytes_per_key = out.itemsize() * elems_per_key;
   out.set_data(allocator::malloc(out.nbytes()));
 
-  // For simplicity, fall back to CPU for now if output is not uint32
-  // A full implementation would handle different bit widths
-  if (out.dtype() != uint32) {
+  // For now, support only uint32 keys/output on Vulkan.
+  if (keys.dtype() != uint32 || out.dtype() != uint32) {
     eval_cpu_fallback_on_stream<RandomBits>(
         inputs, out, stream(), state().first, state().second);
     return;
+  }
+
+  // Shader expects packed key layout.
+  if (!keys.flags().contiguous || keys.offset() != 0 ||
+      keys.strides().back() != 1) {
+    keys = contiguous_copy_gpu(keys, stream());
   }
 
   // Calculate dispatch grid
   uint32_t out_skip = (static_cast<uint32_t>(bytes_per_key) + 4 - 1) / 4;
   uint32_t half_size = out_skip / 2;
   bool odd = (out_skip % 2) != 0;
+  constexpr uint32_t kRandomBitsLocalSizeX = 256;
 
   try {
     auto cmd_buffer = vulkan::begin_command_recording(stream().index);
@@ -1237,7 +1243,10 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
 
     // Dispatch the kernel
     std::array<uint32_t, 3> grid = {
-        static_cast<uint32_t>(num_keys), half_size + (odd ? 1u : 0u), 1};
+        (static_cast<uint32_t>(num_keys) + kRandomBitsLocalSizeX - 1) /
+            kRandomBitsLocalSizeX,
+        half_size + (odd ? 1u : 0u),
+        1};
     vulkan::dispatch_random_bits_op(
         keys,
         out,
