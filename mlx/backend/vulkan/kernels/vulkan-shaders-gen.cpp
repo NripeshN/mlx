@@ -1564,6 +1564,11 @@ void process_shaders() {
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
   string_to_spv(
+      "random_bits_f32",
+      "random_bits.comp",
+      {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
+
+  string_to_spv(
       "sin_f32",
       "sin.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});

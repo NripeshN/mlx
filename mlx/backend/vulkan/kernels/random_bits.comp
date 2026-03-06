@@ -1,0 +1,95 @@
+#version 450
+
+#include "types.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint num_keys;
+    uint bytes_per_key;
+    uint odd;
+    uint out_skip;
+} p;
+
+layout(binding = 0) readonly buffer Keys { uint keys[]; };
+layout(binding = 1) writeonly buffer Out { uint out_data[]; };
+
+const uint ROTATIONS[2][4] = uint[2][4](
+    uint[4](13, 15, 26, 6),
+    uint[4](17, 29, 16, 24)
+);
+
+// Threefry2x32 hash function
+// Returns 2x32-bit random values from a 2x32-bit key and 2x32-bit counter
+uvec2 threefry2x32_hash(uvec2 key, uvec2 count) {
+    uint k0 = key.x;
+    uint k1 = key.y;
+    uint k2 = key.x ^ key.y ^ 0x1BD11BDAu;
+    
+    uint x = count.x + k0;
+    uint y = count.y + k1;
+    
+    for (int i = 0; i < 5; ++i) {
+        for (int r = 0; r < 4; ++r) {
+            uint rot = ROTATIONS[i % 2][r];
+            x += y;
+            y = (y << rot) | (y >> (32 - rot));
+            y ^= x;
+        }
+        x += (i == 0) ? k1 : (i == 1) ? k2 : k0;
+        y += (i == 0) ? k2 : (i == 1) ? k0 : k1 + uint(i + 1);
+    }
+    
+    return uvec2(x, y);
+}
+
+void main() {
+    uint key_idx = gl_GlobalInvocationID.x;
+    uint half_idx = gl_GlobalInvocationID.y;
+    
+    if (key_idx >= p.num_keys) {
+        return;
+    }
+    
+    uint half_size = p.out_skip / 2;
+    bool even = (p.out_skip % 2) == 0;
+    
+    if (half_idx >= half_size + (even ? 0 : 1)) {
+        return;
+    }
+    
+    // Get the key
+    uint kidx = 2 * key_idx;
+    uvec2 key = uvec2(keys[kidx], keys[kidx + 1]);
+    
+    // Calculate output position
+    uint out_offset = key_idx * p.out_skip;
+    
+    // Generate random bits
+    bool drop_last = !even && (half_idx == half_size);
+    uvec2 count = uvec2(half_idx, drop_last ? 0 : half_idx + half_size + (even ? 0 : 1));
+    uvec2 bits = threefry2x32_hash(key, count);
+    
+    // Write first 4 bytes
+    uint idx1 = out_offset + half_idx * 2;
+    if (idx1 < (key_idx + 1) * p.bytes_per_key / 4) {
+        out_data[idx1] = bits.x;
+    }
+    
+    // Write second 4 bytes (if not dropping last)
+    if (!drop_last) {
+        uint idx2 = out_offset + half_idx * 2 + 1;
+        // Handle edge case for partial final write
+        if ((half_idx + 1) == half_size && !even && (p.bytes_per_key % 4) > 0) {
+            // Only write partial bytes - handled by the caller
+            // For now, write the full uint and let CPU handle masking if needed
+            if (idx2 < (key_idx + 1) * p.bytes_per_key / 4 + 1) {
+                out_data[idx2] = bits.y;
+            }
+        } else {
+            if (idx2 < (key_idx + 1) * p.bytes_per_key / 4) {
+                out_data[idx2] = bits.y;
+            }
+        }
+    }
+}

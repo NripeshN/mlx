@@ -232,6 +232,7 @@ enum class KernelSpecId {
   CumsumMultipass,
   MatVec,
   Matmul,
+  RandomBits,
 };
 
 struct KernelSpec {
@@ -254,7 +255,7 @@ constexpr KernelSpec make_kernel_spec(
   return {bindings, binding_count, push_constant_size, grid_kind};
 }
 
-constexpr std::array<KernelSpec, 12> kKernelSpecs = {
+constexpr std::array<KernelSpec, 13> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 0, 0, 0},
         3,
@@ -314,6 +315,11 @@ constexpr std::array<KernelSpec, 12> kKernelSpecs = {
         {0, 1, 2, 0, 0, 0},
         3,
         sizeof(MatmulPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 0, 0, 0, 0},
+        2,
+        sizeof(RandomBitsPushConstants),
         DispatchGridKind::Linear1D),
 };
 
@@ -1635,6 +1641,29 @@ void dispatch_mul_mat_vec_op(
       bound_arrays,
       push_constants,
       nrows,
+      cmd_buffer,
+      s,
+      grid);
+}
+
+void dispatch_random_bits_op(
+    const array& keys,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    const RandomBitsPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&keys, "keys"},
+      {&out, "out"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::RandomBits,
+      bound_arrays,
+      push_constants,
+      push_constants.num_keys,
       cmd_buffer,
       s,
       grid);

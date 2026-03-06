@@ -241,6 +241,13 @@ struct MatVecPushConstants {
   uint32_t broadcast3;
 };
 
+struct RandomBitsPushConstants {
+  uint32_t num_keys;
+  uint32_t bytes_per_key;
+  uint32_t odd;
+  uint32_t out_skip;
+};
+
 enum class BinaryDispatchVariant {
   Standard,
   AddWithPartials,
@@ -339,6 +346,15 @@ void dispatch_mul_mat_vec_op(
     const std::string& shader_name,
     VkCommandBuffer cmd_buffer,
     const Stream& s);
+
+void dispatch_random_bits_op(
+    const array& keys,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    const RandomBitsPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid);
 
 // Get workgroup dimensions for element-wise operations.
 // Returns (workgroup_count_x, workgroup_count_y, workgroup_count_z)
