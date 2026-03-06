@@ -1,0 +1,32 @@
+#version 450
+
+#include "generic_unary_head.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+// Inverse error function approximation using rational approximation
+// Based on the approximation from numerical recipes
+FLOAT_TYPE erfinv(FLOAT_TYPE x) {
+    const FLOAT_TYPE a = FLOAT_TYPE(0.147);
+    FLOAT_TYPE sign = (x < 0.0) ? FLOAT_TYPE(-1.0) : FLOAT_TYPE(1.0);
+    x = abs(x);
+    
+    FLOAT_TYPE ln1mx = log(FLOAT_TYPE(1.0) - x);
+    FLOAT_TYPE term1 = FLOAT_TYPE(2.0) / (FLOAT_TYPE(3.14159265359) * a);
+    FLOAT_TYPE term2 = ln1mx / FLOAT_TYPE(2.0);
+    FLOAT_TYPE term3 = sqrt(term1 + term2 * term2);
+    FLOAT_TYPE result = sign * sqrt(sqrt(term1 + term2 * term3) - term2);
+    
+    return result;
+}
+
+void main() {
+    const uint idx = get_idx();
+
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const FLOAT_TYPE val = FLOAT_TYPE(data_a[get_aoffset() + src0_idx(idx)]);
+    data_d[get_doffset() + dst_idx(idx)] = D_TYPE(erfinv(val));
+}

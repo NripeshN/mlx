@@ -1197,11 +1197,11 @@ bool try_eval_scan_cumsum_vulkan(
   }
 
 CPU_FALLBACK_STATE(Equal)
-CPU_FALLBACK(Minimum)
-CPU_FALLBACK(Maximum)
 CPU_FALLBACK_STATE(RandomBits)
 
 VULKAN_BINARY_GPU(Add, "add")
+VULKAN_BINARY_GPU(Minimum, "minimum")
+VULKAN_BINARY_GPU(Maximum, "maximum")
 VULKAN_BINARY_GPU(Divide, "div")
 VULKAN_BINARY_GPU(Subtract, "sub")
 VULKAN_BINARY_GPU(Multiply, "mul")
@@ -1254,6 +1254,9 @@ void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 VULKAN_GENERIC_UNARY_RTE_GPU(Exp, "exp")
+
+VULKAN_GENERIC_UNARY_GPU(Erf, "erf")
+VULKAN_GENERIC_UNARY_GPU(ErfInv, "erfinv")
 
 VULKAN_GENERIC_UNARY_GPU(Floor, "floor")
 
@@ -1388,8 +1391,7 @@ CPU_FALLBACK(Cosh)
 CPU_FALLBACK_MULTI(DivMod)
 CPU_FALLBACK(Remainder)
 // Equal has CPU fallback above.
-CPU_FALLBACK(Erf)
-CPU_FALLBACK(ErfInv)
+// Erf and ErfInv implemented above.
 // Exp implemented above.
 CPU_FALLBACK(Expm1)
 CPU_FALLBACK_STATE(FFT)

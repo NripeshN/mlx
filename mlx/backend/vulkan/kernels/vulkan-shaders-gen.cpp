@@ -1445,15 +1445,25 @@ void process_shaders() {
            "mul",
            "div",
            "add_rms",
+           "minimum",
+           "maximum",
        }) {
     for (auto src0_f16 : {false, true}) {
       for (auto src1_f16 : {false, true}) {
         for (auto dst_f16 : {false, true}) {
           for (auto rte : {false, true}) {
-            auto source = op == "add_rms" ? std::string("add") : op;
+            std::string source;
+            std::string add_rms = "0";
+            if (op == "add_rms") {
+              source = "add";
+              add_rms = "1";
+            } else if (op == "minimum" || op == "maximum") {
+              source = op;
+            } else {
+              source = op;
+            }
             auto name = op + get_suffix(src0_f16, src1_f16, dst_f16) +
                 (rte ? "_rte" : "");
-            auto add_rms = op == "add_rms" ? "1" : "0";
             string_to_spv(
                 name.c_str(),
                 source + ".comp",
@@ -1541,6 +1551,16 @@ void process_shaders() {
   string_to_spv(
       "rsqrt_f32",
       "rsqrt.comp",
+      {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+
+  string_to_spv(
+      "erf_f32",
+      "erf.comp",
+      {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+
+  string_to_spv(
+      "erfinv_f32",
+      "erfinv.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
   string_to_spv(

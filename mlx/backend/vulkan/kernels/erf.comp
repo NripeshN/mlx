@@ -1,0 +1,34 @@
+#version 450
+
+#include "generic_unary_head.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+// Error function approximation using Taylor series
+FLOAT_TYPE erf(FLOAT_TYPE x) {
+    const FLOAT_TYPE a1 = FLOAT_TYPE(0.254829592);
+    const FLOAT_TYPE a2 = FLOAT_TYPE(-0.284496736);
+    const FLOAT_TYPE a3 = FLOAT_TYPE(1.421413741);
+    const FLOAT_TYPE a4 = FLOAT_TYPE(-1.453152027);
+    const FLOAT_TYPE a5 = FLOAT_TYPE(1.061405429);
+    const FLOAT_TYPE p = FLOAT_TYPE(0.3275911);
+    
+    FLOAT_TYPE sign = (x < 0.0) ? FLOAT_TYPE(-1.0) : FLOAT_TYPE(1.0);
+    x = abs(x);
+    
+    FLOAT_TYPE t = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + p * x);
+    FLOAT_TYPE y = FLOAT_TYPE(1.0) - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * exp(-x * x);
+    
+    return sign * y;
+}
+
+void main() {
+    const uint idx = get_idx();
+
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const FLOAT_TYPE val = FLOAT_TYPE(data_a[get_aoffset() + src0_idx(idx)]);
+    data_d[get_doffset() + dst_idx(idx)] = D_TYPE(erf(val));
+}
