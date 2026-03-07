@@ -118,11 +118,22 @@ if(Vulkan_FOUND)
   add_custom_target(vulkan_shaders_target DEPENDS ${SHADER_HEADER} ${SHADER_CPP_FILES})
   
   # Vulkan sources
-  target_sources(mlx PRIVATE 
+  target_sources(mlx PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/device_info.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/allocator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/primitives.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/primitives_utils.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/unary.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/reduce.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/softmax.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/gather.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scan.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/arange.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/rope.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/fast.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/random.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/event.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/fence.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/eval.cpp
