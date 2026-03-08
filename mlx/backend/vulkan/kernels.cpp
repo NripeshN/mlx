@@ -238,6 +238,8 @@ enum class KernelSpecId {
   GatherAxis,
   Rope,
   FlashAttention,
+  FlashAttentionSplitKReduce,
+  FlashAttentionMaskOpt,
 };
 
 struct KernelSpec {
@@ -263,7 +265,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 18> kKernelSpecs = {
+const std::array<KernelSpec, 20> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -335,6 +337,14 @@ const std::array<KernelSpec, 18> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 3, 4, 5, 6},
         sizeof(FlashAttentionPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2},
+        sizeof(FlashAttentionSplitKReducePushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1},
+        sizeof(FlashAttentionMaskOptPushConstants),
         DispatchGridKind::Linear1D),
 };
 
@@ -1579,6 +1589,60 @@ void dispatch_flash_attention_op(
       bound_arrays,
       push_constants,
       checked_mul_u32(push_constants.N, push_constants.KV, "flash_attn ne"),
+      cmd_buffer,
+      s,
+      grid,
+      specialization_constants);
+}
+
+void dispatch_flash_attention_split_k_reduce_op(
+    const array& in,
+    const array& sinks,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    const FlashAttentionSplitKReducePushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid,
+    const std::vector<uint32_t>& specialization_constants) {
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&in, "in"},
+      {&sinks, "sinks"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::FlashAttentionSplitKReduce,
+      bound_arrays,
+      push_constants,
+      checked_mul_u32(
+          push_constants.ne1, push_constants.D, "fa_split_reduce ne"),
+      cmd_buffer,
+      s,
+      grid,
+      specialization_constants);
+}
+
+void dispatch_flash_attention_mask_opt_op(
+    const array& mask,
+    array& mask_opt,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    const FlashAttentionMaskOptPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid,
+    const std::vector<uint32_t>& specialization_constants) {
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&mask, "mask"},
+      {&mask_opt, "mask_opt"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::FlashAttentionMaskOpt,
+      bound_arrays,
+      push_constants,
+      checked_mul_u32(
+          push_constants.nem0, push_constants.nem1, "fa_mask_opt ne"),
       cmd_buffer,
       s,
       grid,

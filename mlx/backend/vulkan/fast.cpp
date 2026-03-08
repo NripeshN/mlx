@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -44,6 +45,18 @@ struct FlashAttentionTuningParams {
   uint32_t limit_occupancy_shmem;
 };
 
+struct FlashAttentionExecutionPlan {
+  FlashAttentionTuningParams tuning;
+  bool aligned;
+  bool use_mask_opt;
+  uint32_t split_kv;
+  uint32_t split_k;
+};
+
+constexpr uint32_t kVendorIdAmd = 0x1002u;
+constexpr uint32_t kVendorIdIntel = 0x8086u;
+constexpr uint32_t kVendorIdNvidia = 0x10DEu;
+
 uint32_t lowest_set_bit(uint32_t value) {
   return value & (~value + 1u);
 }
@@ -71,24 +84,126 @@ FlashAttentionTuningParams get_flash_attention_tuning_params(
     uint32_t n_kv) {
   auto [vendor_id, device_subgroup_size] =
       vulkan_device_vendor_and_subgroup_size();
-  (void)vendor_id;
-  (void)hsv;
-  (void)n_kv;
   const uint32_t subgroup_size = std::max(device_subgroup_size, 1u);
+  const bool unified_memory = vulkan::VulkanContext::get().is_unified_memory();
+  const uint32_t d = hsk | hsv;
 
   FlashAttentionTuningParams result{};
-  result.workgroup_size = 128u;
-  result.row_split = 1u;
-  result.block_rows = (n_rows <= 1) ? 1u : ((n_rows <= 4) ? 4u : 8u);
-  result.block_cols = 32u;
-
-  const uint32_t d_lsb = lowest_set_bit(hsk);
-  result.d_split = std::min(8u, d_lsb / 4u);
   result.subgroup_size = subgroup_size;
-  result.shmem_staging = 0u;
+
+  uint32_t row_split_max_hsk = 64u;
+  if (vendor_id == kVendorIdAmd && !unified_memory) {
+    row_split_max_hsk = n_rows <= 8 ? 64u : 128u;
+  }
+  result.row_split = (n_rows < 4 || hsk <= row_split_max_hsk) ? 1u : 4u;
+
+  if (subgroup_size > 32u &&
+      (n_rows < 4 || hsk < (result.row_split == 1 ? 128u : 64u))) {
+    result.workgroup_size = subgroup_size * 2u;
+  } else {
+    result.workgroup_size = subgroup_size * 4u;
+  }
+  result.workgroup_size = std::clamp(result.workgroup_size, 32u, 256u);
+
+  const bool reduce_block_rows =
+      (d & 8u) != 0 || n_kv < 1024u || vendor_id == kVendorIdIntel;
+  if (n_rows == 1) {
+    result.block_rows = 1u;
+    result.block_cols = 64u;
+  } else if (result.row_split == 1u) {
+    result.block_rows =
+        n_rows == 2 ? 2u : ((n_rows <= 4 || reduce_block_rows) ? 4u : 8u);
+    result.block_cols = (d & 8u) ? 64u : 32u;
+  } else {
+    result.block_rows =
+        n_rows <= 4 ? 4u : ((n_rows <= 8 || reduce_block_rows) ? 8u : 16u);
+    result.block_cols = (d & 8u) ? 64u : 32u;
+  }
+
+  const uint32_t d_lsb = lowest_set_bit(d);
+  result.d_split = std::min(std::min(subgroup_size, 8u), d_lsb / 4u);
+  result.shmem_staging =
+      (vendor_id == kVendorIdNvidia && hsk < 256u && hsv < 256u) ? 1u : 0u;
   result.limit_occupancy_shmem = 0u;
 
   return result;
+}
+
+uint32_t round_up_multiple(uint32_t value, uint32_t multiple) {
+  if (multiple == 0) {
+    return value;
+  }
+  return ((value + multiple - 1u) / multiple) * multiple;
+}
+
+FlashAttentionExecutionPlan make_flash_attention_execution_plan(
+    uint32_t hsk,
+    uint32_t hsv,
+    uint32_t q_len,
+    uint32_t q_heads,
+    uint32_t kv_len,
+    uint32_t batch,
+    bool has_mask,
+    uint32_t q_stride,
+    uint32_t k_stride,
+    uint32_t v_stride) {
+  auto tuning = get_flash_attention_tuning_params(hsk, hsv, q_len, kv_len);
+  const bool aligned = (kv_len % tuning.block_cols) == 0 &&
+      (q_stride & 7u) == 0 && (k_stride & 7u) == 0 && (v_stride & 7u) == 0;
+
+  FlashAttentionExecutionPlan plan{
+      tuning,
+      aligned,
+      false,
+      kv_len,
+      1u,
+  };
+
+  if (has_mask) {
+    plan.use_mask_opt = q_len >= 32u && kv_len >= 128u &&
+        static_cast<uint64_t>(q_len) * static_cast<uint64_t>(kv_len) >= 32768u;
+  }
+
+  const uint32_t tr = (q_len + tuning.block_rows - 1u) / tuning.block_rows;
+  const uint32_t total_wgs_no_split = std::max(tr * q_heads * batch, 1u);
+  const uint32_t target_workgroups = 32u;
+  uint32_t split_k = total_wgs_no_split < target_workgroups
+      ? (target_workgroups + total_wgs_no_split - 1u) / total_wgs_no_split
+      : 1u;
+  split_k = std::min(split_k, 8u);
+  if (has_mask && split_k > 1u) {
+    split_k = std::min(split_k, 4u);
+  }
+  if (split_k > 1u && kv_len >= 2u * tuning.block_cols) {
+    uint32_t split_kv =
+        round_up_multiple(std::max(1u, kv_len / split_k), tuning.block_cols);
+    split_k = (kv_len + split_kv - 1u) / split_kv;
+    if (split_k > 1u) {
+      plan.split_kv = split_kv;
+      plan.split_k = split_k;
+    }
+  }
+
+  return plan;
+}
+
+void insert_compute_barrier(VkCommandBuffer command_buffer) {
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.dstAccessMask =
+      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  vkCmdPipelineBarrier(
+      command_buffer,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      0,
+      1,
+      &barrier,
+      0,
+      nullptr,
+      0,
+      nullptr);
 }
 
 array make_flash_attention_causal_mask(
@@ -119,9 +234,25 @@ bool try_dispatch_flash_attention_native_vulkan(
   const uint32_t kv_len = checked_u32_size(k.shape(2), "flash_attn kv_len");
   const uint32_t hsv = checked_u32_size(v.shape(3), "flash_attn hsv");
   const bool has_mask = mask != nullptr;
+  const uint32_t q_stride =
+      checked_u32_size(q.strides(2), "flash_attn q_stride");
+  const uint32_t k_stride =
+      checked_u32_size(k.strides(2), "flash_attn k_stride");
+  const uint32_t v_stride =
+      checked_u32_size(v.strides(2), "flash_attn v_stride");
 
-  const auto tuning =
-      get_flash_attention_tuning_params(hsk, hsv, q_len, kv_len);
+  const auto plan = make_flash_attention_execution_plan(
+      hsk,
+      hsv,
+      q_len,
+      q_heads,
+      kv_len,
+      batch,
+      has_mask,
+      q_stride,
+      k_stride,
+      v_stride);
+  const auto& tuning = plan.tuning;
   if (tuning.d_split == 0 || tuning.block_rows == 0 || tuning.block_cols == 0 ||
       tuning.row_split == 0 || hsk % tuning.d_split != 0 ||
       hsv % tuning.d_split != 0 ||
@@ -131,14 +262,6 @@ bool try_dispatch_flash_attention_native_vulkan(
     return false;
   }
 
-  const uint32_t q_stride =
-      checked_u32_size(q.strides(2), "flash_attn q_stride");
-  const uint32_t k_stride =
-      checked_u32_size(k.strides(2), "flash_attn k_stride");
-  const uint32_t v_stride =
-      checked_u32_size(v.strides(2), "flash_attn v_stride");
-  const bool aligned = (kv_len % tuning.block_cols) == 0 &&
-      (q_stride & 7u) == 0 && (k_stride & 7u) == 0 && (v_stride & 7u) == 0;
   auto stride_bytes = [](const array& arr, int axis, const char* name) {
     return checked_u32_size(
         static_cast<int64_t>(arr.strides(axis)) * size_of(arr.dtype()), name);
@@ -181,8 +304,42 @@ bool try_dispatch_flash_attention_native_vulkan(
   push_constants.m0 = 0.0f;
   push_constants.m1 = 0.0f;
   push_constants.gqa_ratio = 1u;
-  push_constants.split_kv = kv_len;
-  push_constants.k_num = 1u;
+  push_constants.split_kv = plan.split_kv;
+  push_constants.k_num = plan.split_k;
+
+  std::optional<array> mask_opt;
+  if (plan.use_mask_opt) {
+    const uint32_t mask_opt_num_dwords =
+        (kv_len + 16u * tuning.block_cols - 1u) / (16u * tuning.block_cols);
+    const uint32_t mask_rows =
+        (push_constants.nem1 + tuning.block_rows - 1u) / tuning.block_rows;
+    const uint64_t mask_opt_elems = static_cast<uint64_t>(mask_opt_num_dwords) *
+        mask_rows * push_constants.nem2 * push_constants.nem3;
+    if (mask_opt_elems >
+        static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+      return false;
+    }
+    mask_opt = array({static_cast<int>(mask_opt_elems)}, uint32, nullptr, {});
+    mask_opt->set_status(array::Status::available);
+    mask_opt->set_data(allocator::malloc(mask_opt->nbytes()));
+  }
+
+  std::optional<array> split_k_tmp;
+  if (plan.split_k > 1u) {
+    const uint64_t out_elems =
+        static_cast<uint64_t>(hsv) * q_heads * q_len * batch;
+    const uint64_t lm_elems =
+        static_cast<uint64_t>(q_heads) * 2u * q_len * batch;
+    const uint64_t split_k_elems = (out_elems + lm_elems) * plan.split_k;
+    if (split_k_elems >
+        static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+      return false;
+    }
+    split_k_tmp =
+        array({static_cast<int>(split_k_elems)}, float32, nullptr, {});
+    split_k_tmp->set_status(array::Status::available);
+    split_k_tmp->set_data(allocator::malloc(split_k_tmp->nbytes()));
+  }
 
   const std::vector<uint32_t> specialization_constants = {
       tuning.workgroup_size,
@@ -190,31 +347,100 @@ bool try_dispatch_flash_attention_native_vulkan(
       tuning.block_cols,
       hsk,
       hsv,
-      aligned ? 0u : 1u,
+      plan.aligned ? 0u : 1u,
       tuning.d_split,
       tuning.row_split,
       tuning.subgroup_size,
       tuning.shmem_staging,
-      has_mask ? 2u : 0u,
+      (plan.use_mask_opt ? 1u : 0u) | (has_mask ? 2u : 0u),
       tuning.limit_occupancy_shmem,
   };
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
+
+    if (plan.use_mask_opt) {
+      vulkan::FlashAttentionMaskOptPushConstants mask_opt_push_constants{};
+      mask_opt_push_constants.nem0 = kv_len;
+      mask_opt_push_constants.nem1 = push_constants.nem1;
+      mask_opt_push_constants.nem2 = push_constants.nem2;
+      mask_opt_push_constants.nbm1 =
+          checked_u32_size((*mask).strides(2), "flash_attn mask_nbm1");
+      mask_opt_push_constants.nbm2 =
+          checked_u32_size((*mask).strides(1), "flash_attn mask_nbm2");
+      mask_opt_push_constants.nbm3 =
+          checked_u32_size((*mask).strides(0), "flash_attn mask_nbm3");
+      mask_opt_push_constants.nbd1 =
+          (kv_len + 16u * tuning.block_cols - 1u) / (16u * tuning.block_cols);
+      mask_opt_push_constants.nbd2 = mask_opt_push_constants.nbd1 *
+          ((push_constants.nem1 + tuning.block_rows - 1u) / tuning.block_rows);
+      mask_opt_push_constants.nbd3 =
+          mask_opt_push_constants.nbd2 * push_constants.nem2;
+
+      vulkan::dispatch_flash_attention_mask_opt_op(
+          *mask,
+          *mask_opt,
+          "fa_mask_opt",
+          command_buffer,
+          s,
+          mask_opt_push_constants,
+          {
+              mask_opt_push_constants.nbd1,
+              (push_constants.nem1 + tuning.block_rows - 1u) /
+                  tuning.block_rows,
+              push_constants.nem2 * push_constants.nem3,
+          },
+          {
+              128u,
+              std::max(1u, 128u / std::max(tuning.subgroup_size, 1u)),
+              tuning.block_rows,
+              tuning.block_cols,
+          });
+      insert_compute_barrier(command_buffer);
+    }
+
+    array& flash_output = plan.split_k > 1u ? *split_k_tmp : out_storage;
     vulkan::dispatch_flash_attention_op(
         q,
         k,
         v,
         has_mask ? *mask : q,
         q,
-        out_storage,
-        q,
+        flash_output,
+        plan.use_mask_opt ? *mask_opt : q,
         "flash_attn_f32_f16_f16_fp32",
         command_buffer,
         s,
         push_constants,
-        {(q_len + tuning.block_rows - 1u) / tuning.block_rows, q_heads, batch},
+        {
+            ((q_len + tuning.block_rows - 1u) / tuning.block_rows) *
+                plan.split_k,
+            q_heads,
+            batch,
+        },
         specialization_constants);
+
+    if (plan.split_k > 1u) {
+      insert_compute_barrier(command_buffer);
+      vulkan::FlashAttentionSplitKReducePushConstants reduce_push_constants{};
+      reduce_push_constants.D = hsv;
+      reduce_push_constants.ne1 = q_heads;
+      reduce_push_constants.ne2 = q_len;
+      reduce_push_constants.ne3 = batch;
+      reduce_push_constants.k_num = plan.split_k;
+      reduce_push_constants.sinks = 0u;
+      vulkan::dispatch_flash_attention_split_k_reduce_op(
+          *split_k_tmp,
+          q,
+          out_storage,
+          "fa_split_k_reduce",
+          command_buffer,
+          s,
+          reduce_push_constants,
+          {q_heads, (hsv + 31u) / 32u, q_len * batch},
+          {32u});
+    }
+
     vulkan::end_command_recording(s.index);
     return true;
   } catch (const std::runtime_error& e) {

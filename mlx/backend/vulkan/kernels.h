@@ -256,6 +256,27 @@ struct FlashAttentionPushConstants {
   uint32_t k_num;
 };
 
+struct FlashAttentionSplitKReducePushConstants {
+  uint32_t D;
+  uint32_t ne1;
+  uint32_t ne2;
+  uint32_t ne3;
+  uint32_t k_num;
+  uint32_t sinks;
+};
+
+struct FlashAttentionMaskOptPushConstants {
+  uint32_t nem0;
+  uint32_t nem1;
+  uint32_t nem2;
+  uint32_t nbm1;
+  uint32_t nbm2;
+  uint32_t nbm3;
+  uint32_t nbd1;
+  uint32_t nbd2;
+  uint32_t nbd3;
+};
+
 struct MatmulPushConstants {
   uint32_t M;
   uint32_t N;
@@ -439,6 +460,27 @@ void dispatch_flash_attention_op(
     const FlashAttentionPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid,
     const std::vector<uint32_t>& specialization_constants);
+
+void dispatch_flash_attention_split_k_reduce_op(
+    const array& in,
+    const array& sinks,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    const FlashAttentionSplitKReducePushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid,
+    const std::vector<uint32_t>& specialization_constants = {});
+
+void dispatch_flash_attention_mask_opt_op(
+    const array& mask,
+    array& mask_opt,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    const FlashAttentionMaskOptPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid,
+    const std::vector<uint32_t>& specialization_constants = {});
 
 void dispatch_cumsum_op(
     const array& in,
