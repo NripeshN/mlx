@@ -263,6 +263,32 @@ struct GatherAxisPushConstants {
   uint32_t idx_axis_size;
 };
 
+struct RopePushConstants {
+  uint32_t rope_mode;
+  uint32_t nrows;
+  uint32_t n_dims;
+  float freq_scale;
+  float freq_base;
+  float ext_factor;
+  float attn_factor;
+  float corr_dims[2];
+  float theta_scale;
+  uint32_t has_ff;
+  int32_t sections[4];
+  uint32_t is_imrope;
+  uint32_t is_back;
+  uint32_t set_rows_stride;
+  uint32_t ne00;
+  uint32_t ne01;
+  uint32_t ne02;
+  uint32_t nb01;
+  uint32_t nb02;
+  uint32_t nb03;
+  uint32_t nb11;
+  uint32_t nb12;
+  uint32_t nb13;
+};
+
 enum class BinaryDispatchVariant {
   Standard,
   AddWithPartials,
@@ -393,6 +419,18 @@ void dispatch_gather_axis_op(
     uint32_t size_axis,
     uint32_t size_post,
     uint32_t idx_axis_size);
+
+void dispatch_rope_op(
+    const array& in,
+    const array& positions,
+    const array& freqs,
+    array& out,
+    const array& indices,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    const RopePushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid);
 
 // Get workgroup dimensions for element-wise operations.
 // Returns (workgroup_count_x, workgroup_count_y, workgroup_count_z)

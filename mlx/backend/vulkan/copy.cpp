@@ -290,6 +290,7 @@ void concatenate_gpu(
     array& out,
     int axis,
     const Stream& s) {
+  ::mlx::core::gpu::synchronize(s);
   auto cpu_stream = default_stream(Device::cpu);
   Concatenate cpu_concatenate(cpu_stream, axis);
   cpu_concatenate.eval_cpu(inputs, out);

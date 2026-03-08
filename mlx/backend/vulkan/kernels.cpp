@@ -235,6 +235,7 @@ enum class KernelSpecId {
   RandomBits,
   Gather,
   GatherAxis,
+  Rope,
 };
 
 struct KernelSpec {
@@ -257,7 +258,7 @@ constexpr KernelSpec make_kernel_spec(
   return {bindings, binding_count, push_constant_size, grid_kind};
 }
 
-constexpr std::array<KernelSpec, 15> kKernelSpecs = {
+constexpr std::array<KernelSpec, 16> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 0, 0, 0},
         3,
@@ -333,6 +334,11 @@ constexpr std::array<KernelSpec, 15> kKernelSpecs = {
         3,
         sizeof(GatherAxisPushConstants),
         DispatchGridKind::ElementWise),
+    make_kernel_spec(
+        {0, 1, 2, 3, 4, 0},
+        5,
+        sizeof(RopePushConstants),
+        DispatchGridKind::Linear1D),
 };
 
 size_t kernel_spec_index(KernelSpecId id) {
@@ -1747,6 +1753,35 @@ void dispatch_gather_axis_op(
       push_constants.ne,
       cmd_buffer,
       s);
+}
+
+void dispatch_rope_op(
+    const array& in,
+    const array& positions,
+    const array& freqs,
+    array& out,
+    const array& indices,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    const RopePushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  const std::array<BoundArray, 5> bound_arrays = {{
+      {&in, "src0"},
+      {&positions, "positions"},
+      {&freqs, "freqs"},
+      {&out, "dst"},
+      {&indices, "indices"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::Rope,
+      bound_arrays,
+      push_constants,
+      push_constants.nrows,
+      cmd_buffer,
+      s,
+      grid);
 }
 
 } // namespace mlx::core::vulkan

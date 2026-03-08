@@ -22,8 +22,14 @@ void eval(array& arr) {
 
   vulkan::end_primitive_tracking(s, arr.inputs(), outputs);
 
+  auto donated_data = arr.data_shared_ptr();
   for (const auto& in : arr.inputs()) {
-    vulkan::retain_array_for_stream(s, in);
+    if (in.data_shared_ptr() != donated_data) {
+      vulkan::retain_array_for_stream(s, in);
+    }
+  }
+  for (const auto& sibling : arr.siblings()) {
+    vulkan::retain_array_for_stream(s, sibling);
   }
   for (const auto& out : outputs) {
     vulkan::retain_array_for_stream(s, out);

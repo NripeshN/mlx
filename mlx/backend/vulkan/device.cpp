@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "mlx/backend/common/utils.h"
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/vulkan.h"
@@ -33,9 +34,9 @@ bool deferred_submission_enabled() {
       return std::string(env) != "0";
     }
 
-    // Deferred submission is enabled by default. Set
-    // MLX_VULKAN_DEFERRED_SUBMISSION=0 to disable.
-    return true;
+    // Keep deferred submission opt-in until alias-aware hazard tracking covers
+    // donation and shared-buffer view creation reliably.
+    return false;
   }();
   return enabled;
 }
@@ -221,6 +222,7 @@ struct StreamData {
   std::vector<std::shared_ptr<array::Data>> recording_refs;
   std::unordered_set<const array::Data*> recording_ref_ids;
   std::vector<std::shared_ptr<array::Data>> in_flight_refs;
+  std::unordered_set<const array::Data*> in_flight_ref_ids;
   std::vector<BufferAccessRange> unsynced_reads;
   std::vector<BufferAccessRange> unsynced_writes;
 };
@@ -287,6 +289,7 @@ class VulkanDevice {
     stream->has_pending_work = false;
     stream->pending_epoch = 0;
     stream->in_flight_refs.clear();
+    stream->in_flight_ref_ids.clear();
     stream->unsynced_reads.clear();
     stream->unsynced_writes.clear();
     if (trace_sync_enabled()) {
@@ -323,6 +326,7 @@ class VulkanDevice {
       stream->recording_refs.clear();
       stream->recording_ref_ids.clear();
       stream->in_flight_refs.clear();
+      stream->in_flight_ref_ids.clear();
       stream->unsynced_reads.clear();
       stream->unsynced_writes.clear();
       stream->has_pending_work = false;
@@ -333,17 +337,21 @@ class VulkanDevice {
 
   void retain_array(int stream_index, const array& arr) {
     auto* stream = get_stream(stream_index);
-    if (!stream->recording) {
-      return;
-    }
-
     auto data = arr.data_shared_ptr();
     if (!data) {
       return;
     }
 
-    if (stream->recording_ref_ids.insert(data.get()).second) {
-      stream->recording_refs.push_back(std::move(data));
+    if (stream->recording) {
+      if (stream->recording_ref_ids.insert(data.get()).second) {
+        stream->recording_refs.push_back(std::move(data));
+      }
+      return;
+    }
+
+    if (stream->has_pending_work &&
+        stream->in_flight_ref_ids.insert(data.get()).second) {
+      stream->in_flight_refs.push_back(std::move(data));
     }
   }
 
@@ -372,7 +380,9 @@ class VulkanDevice {
     }
 
     const auto reads = make_access_ranges(inputs);
-    const auto writes = make_access_ranges(outputs);
+    auto writes = make_access_ranges(outputs);
+    auto donation_writes = make_potential_donation_writes(inputs, outputs);
+    writes.insert(writes.end(), donation_writes.begin(), donation_writes.end());
     if (!has_access_hazard(stream, reads, writes)) {
       return;
     }
@@ -447,6 +457,7 @@ class VulkanDevice {
         stream->has_pending_work = false;
         stream->pending_epoch = 0;
         stream->in_flight_refs.clear();
+        stream->in_flight_ref_ids.clear();
         stream->unsynced_reads.clear();
         stream->unsynced_writes.clear();
       }
@@ -559,6 +570,31 @@ class VulkanDevice {
     }
 
     return ranges;
+  }
+
+  static std::vector<BufferAccessRange> make_potential_donation_writes(
+      const std::vector<array>& inputs,
+      const std::vector<array>& outputs) {
+    std::vector<BufferAccessRange> writes;
+    writes.reserve(inputs.size());
+
+    for (const auto& in : inputs) {
+      bool can_donate = false;
+      for (const auto& out : outputs) {
+        if (is_donatable(in, out)) {
+          can_donate = true;
+          break;
+        }
+      }
+      if (!can_donate) {
+        continue;
+      }
+
+      auto input_writes = make_access_ranges({in});
+      writes.insert(writes.end(), input_writes.begin(), input_writes.end());
+    }
+
+    return writes;
   }
 
   static bool overlaps(const BufferAccessRange& a, const BufferAccessRange& b) {
@@ -737,6 +773,7 @@ class VulkanDevice {
       stream->recording_refs.clear();
       stream->recording_ref_ids.clear();
       stream->in_flight_refs.clear();
+      stream->in_flight_ref_ids.clear();
       stream->unsynced_reads.clear();
       stream->unsynced_writes.clear();
       stream->has_pending_work = false;
@@ -830,6 +867,7 @@ class VulkanDevice {
     stream->pending_epoch = stream->recording_epoch;
     stream->recording_epoch = 0;
     stream->in_flight_refs = std::move(stream->recording_refs);
+    stream->in_flight_ref_ids = std::move(stream->recording_ref_ids);
     stream->recording_ref_ids.clear();
     stream->recording_refs.clear();
     stream->unsynced_reads.clear();
