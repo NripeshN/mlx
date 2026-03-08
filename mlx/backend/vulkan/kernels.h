@@ -62,6 +62,9 @@ class KernelManager {
       int stream_index,
       uint64_t submission_epoch,
       VkDescriptorSet set);
+  void reclaim_descriptor_set_epoch(
+      int stream_index,
+      uint64_t submission_epoch);
   void reclaim_descriptor_sets(int stream_index);
   void reclaim_descriptor_sets(int stream_index, uint64_t completed_epoch);
   void reclaim_all_descriptor_sets();

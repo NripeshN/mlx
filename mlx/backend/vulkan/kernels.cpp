@@ -957,6 +957,46 @@ void KernelManager::reclaim_descriptor_sets(int stream_index) {
   reclaim_descriptor_sets(stream_index, std::numeric_limits<uint64_t>::max());
 }
 
+void KernelManager::reclaim_descriptor_set_epoch(
+    int stream_index,
+    uint64_t submission_epoch) {
+  std::vector<VkDescriptorSet> sets;
+  {
+    std::lock_guard<std::mutex> lock(deferred_descriptor_sets_mutex_);
+    auto it = deferred_descriptor_sets_.find(stream_index);
+    if (it == deferred_descriptor_sets_.end()) {
+      return;
+    }
+
+    auto& epoch_map = it->second;
+    auto epoch_it = epoch_map.find(submission_epoch);
+    if (epoch_it == epoch_map.end()) {
+      return;
+    }
+
+    auto& epoch_sets = epoch_it->second;
+    sets.insert(
+        sets.end(),
+        std::make_move_iterator(epoch_sets.begin()),
+        std::make_move_iterator(epoch_sets.end()));
+    epoch_map.erase(epoch_it);
+    if (epoch_map.empty()) {
+      deferred_descriptor_sets_.erase(it);
+    }
+  }
+
+  if (sets.empty() || descriptor_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+
+  VkDevice device = VulkanContext::get().device();
+  vkFreeDescriptorSets(
+      device,
+      descriptor_pool_,
+      static_cast<uint32_t>(sets.size()),
+      sets.data());
+}
+
 void KernelManager::reclaim_descriptor_sets(
     int stream_index,
     uint64_t completed_epoch) {

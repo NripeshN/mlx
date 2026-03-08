@@ -3,6 +3,8 @@
 #pragma once
 
 #include <vulkan/vulkan.h>
+#include <functional>
+#include <memory>
 
 #include <vector>
 
@@ -15,6 +17,10 @@ namespace mlx::core::vulkan {
 VkCommandBuffer begin_command_recording(int stream_index);
 void end_command_recording(int stream_index);
 void retain_array_for_stream(const Stream& s, const array& arr);
+void retain_shared_for_stream(const Stream& s, std::shared_ptr<void> resource);
+void add_completion_callback_for_stream(
+    const Stream& s,
+    std::function<void()> callback);
 uint64_t descriptor_epoch_for_stream(const Stream& s);
 
 // Primitive-level hazard tracking for deferred recording

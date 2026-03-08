@@ -6,6 +6,7 @@
 #include <mutex>
 
 #include "mlx/backend/gpu/eval.h"
+#include "mlx/backend/vulkan/device.h"
 #include "mlx/scheduler.h"
 
 namespace mlx::core {
@@ -79,8 +80,10 @@ void Fence::update(Stream stream, const array&, bool) {
   }
 
   // Signal only after prior work in the stream is complete.
-  gpu::synchronize(stream);
-  signal_fence_value(fence_, target);
+  vulkan::add_completion_callback_for_stream(
+      stream, [fence = fence_, target]() mutable {
+        signal_fence_value(fence, target);
+      });
 }
 
 } // namespace mlx::core
