@@ -165,6 +165,28 @@ void copy_gpu_inplace(
       o_offset == 0 && full_tensor_copy && is_supported_copy_layout(in) &&
       is_supported_copy_layout(out) && !get_copy_shader_name(in, out).empty();
 
+  const bool staging_scalar_fill = ctype == CopyType::Scalar &&
+      !dynamic_i_offset && !dynamic_o_offset && i_offset == 0 &&
+      o_offset == 0 && out.flags().contiguous &&
+      out.data_size() == out.size() &&
+      !vulkan::VulkanContext::get().is_unified_memory();
+
+  if (staging_scalar_fill) {
+    std::vector<char> host_fill(out.nbytes());
+    const char* scalar_ptr = static_cast<const char*>(in.data<void>());
+    const size_t scalar_size = size_of(in.dtype());
+    for (size_t offset = 0; offset < host_fill.size(); offset += scalar_size) {
+      std::memcpy(host_fill.data() + offset, scalar_ptr, scalar_size);
+    }
+
+    auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
+    vulkan::enqueue_owned_staging_upload(
+        s, host_fill.data(), host_fill.size(), out_buf->buffer, out.offset());
+    vulkan::retain_array_for_stream(s, in);
+    vulkan::retain_array_for_stream(s, out);
+    return;
+  }
+
   if (!raw_buffer_copy && !shader_copy) {
     gpu::synchronize(s);
     auto cpu_stream = default_stream(Device::cpu);

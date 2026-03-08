@@ -603,3 +603,37 @@ TEST_CASE("test memory info") {
   clear_cache();
   CHECK_EQ(get_cache_memory(), 0);
 }
+
+TEST_CASE("test gpu deferred slice update alias hazard") {
+  auto src_gpu = arange(0.0f, 8.0f, 1.0f, float32, Device::gpu);
+  auto upd_gpu = slice(src_gpu, {1}, {5}, Device::gpu);
+  auto out_gpu =
+      slice_update(src_gpu, upd_gpu, Shape{0}, Shape{4}, Device::gpu);
+
+  auto src_cpu = arange(0.0f, 8.0f, 1.0f, float32, Device::cpu);
+  auto upd_cpu = slice(src_cpu, {1}, {5}, Device::cpu);
+  auto out_cpu =
+      slice_update(src_cpu, upd_cpu, Shape{0}, Shape{4}, Device::cpu);
+
+  const bool equal = array_equal(out_gpu, out_cpu, Device::cpu).item<bool>();
+  CHECK(equal);
+}
+
+TEST_CASE("test gpu deferred scalar upload") {
+  auto gpu = full({3, 4}, 7.0f, float32, Device::gpu);
+  auto cpu = full({3, 4}, 7.0f, float32, Device::cpu);
+  CHECK(array_equal(gpu, cpu, Device::cpu).item<bool>());
+}
+
+TEST_CASE("test gpu deferred multi-submit retirement") {
+  auto gpu_x = arange(0.0f, 1024.0f, 1.0f, float32, Device::gpu);
+  auto cpu_x = arange(0.0f, 1024.0f, 1.0f, float32, Device::cpu);
+  array one(1.0f);
+
+  for (int i = 0; i < 48; ++i) {
+    gpu_x = add(cos(gpu_x, Device::gpu), one, Device::gpu);
+    cpu_x = add(cos(cpu_x, Device::cpu), one, Device::cpu);
+  }
+
+  CHECK(allclose(gpu_x, cpu_x, 1e-5f, 1e-5f, false, Device::cpu).item<bool>());
+}

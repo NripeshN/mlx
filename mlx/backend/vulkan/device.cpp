@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <iostream>
@@ -227,6 +228,22 @@ struct SubmissionRecord {
   std::vector<std::function<void()>> completion_callbacks;
   std::string submit_reason;
 };
+
+std::shared_ptr<array::Data> make_owned_staging_allocation(size_t size) {
+  auto data = std::make_shared<array::Data>(allocator::malloc(size));
+  auto* buffer = static_cast<VulkanBuffer*>(data->buffer.ptr());
+  if (buffer == nullptr || buffer->buffer == VK_NULL_HANDLE ||
+      buffer->mapped_ptr == nullptr) {
+    throw std::runtime_error(
+        "[vulkan::staging] Failed to allocate host-visible staging buffer.");
+  }
+  return data;
+}
+
+const VulkanBuffer* get_vulkan_buffer(
+    const std::shared_ptr<array::Data>& data) {
+  return data ? static_cast<const VulkanBuffer*>(data->buffer.ptr()) : nullptr;
+}
 
 struct StreamData {
   std::unique_ptr<SubmissionResources> recording_resources;
@@ -1060,6 +1077,10 @@ void end_command_recording(int stream_index) {
   VulkanDevice::get().end_recording(stream_index);
 }
 
+bool deferred_submission_active() {
+  return deferred_submission_enabled();
+}
+
 void retain_array_for_stream(const Stream& s, const array& arr) {
   VulkanDevice::get().retain_array(s.index, arr);
 }
@@ -1072,6 +1093,85 @@ void add_completion_callback_for_stream(
     const Stream& s,
     std::function<void()> callback) {
   VulkanDevice::get().add_completion_callback(s.index, std::move(callback));
+}
+
+void enqueue_owned_staging_upload(
+    const Stream& s,
+    const void* src,
+    size_t size,
+    VkBuffer dst_buffer,
+    uint64_t dst_offset) {
+  if (size == 0) {
+    return;
+  }
+  if (src == nullptr) {
+    throw std::invalid_argument(
+        "[vulkan::enqueue_owned_staging_upload] Null host source.");
+  }
+  if (dst_buffer == VK_NULL_HANDLE) {
+    throw std::invalid_argument(
+        "[vulkan::enqueue_owned_staging_upload] Null destination buffer.");
+  }
+
+  auto staging = make_owned_staging_allocation(size);
+  auto* staging_buffer = get_vulkan_buffer(staging);
+  std::memcpy(
+      static_cast<char*>(staging_buffer->mapped_ptr),
+      src,
+      static_cast<size_t>(size));
+
+  VkCommandBuffer command_buffer = begin_command_recording(s.index);
+  VkBufferCopy copy_region{};
+  copy_region.srcOffset = 0;
+  copy_region.dstOffset = static_cast<VkDeviceSize>(dst_offset);
+  copy_region.size = static_cast<VkDeviceSize>(size);
+  vkCmdCopyBuffer(
+      command_buffer, staging_buffer->buffer, dst_buffer, 1, &copy_region);
+
+  retain_shared_for_stream(s, std::static_pointer_cast<void>(staging));
+  end_command_recording(s.index);
+}
+
+void enqueue_owned_staging_readback(
+    const Stream& s,
+    VkBuffer src_buffer,
+    uint64_t src_offset,
+    size_t size,
+    std::function<void(const void*, size_t)> completion) {
+  if (size == 0) {
+    completion(nullptr, 0);
+    return;
+  }
+  if (!completion) {
+    throw std::invalid_argument(
+        "[vulkan::enqueue_owned_staging_readback] Missing completion callback.");
+  }
+  if (src_buffer == VK_NULL_HANDLE) {
+    throw std::invalid_argument(
+        "[vulkan::enqueue_owned_staging_readback] Null source buffer.");
+  }
+
+  auto staging = make_owned_staging_allocation(size);
+  auto* staging_buffer = get_vulkan_buffer(staging);
+
+  VkCommandBuffer command_buffer = begin_command_recording(s.index);
+  VkBufferCopy copy_region{};
+  copy_region.srcOffset = static_cast<VkDeviceSize>(src_offset);
+  copy_region.dstOffset = 0;
+  copy_region.size = static_cast<VkDeviceSize>(size);
+  vkCmdCopyBuffer(
+      command_buffer, src_buffer, staging_buffer->buffer, 1, &copy_region);
+
+  retain_shared_for_stream(s, std::static_pointer_cast<void>(staging));
+  add_completion_callback_for_stream(
+      s,
+      [staging = std::move(staging),
+       size,
+       completion = std::move(completion)]() {
+        auto* completed_buffer = get_vulkan_buffer(staging);
+        completion(completed_buffer->mapped_ptr, size);
+      });
+  end_command_recording(s.index);
 }
 
 uint64_t descriptor_epoch_for_stream(const Stream& s) {
