@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/kernels.h"
@@ -107,6 +108,7 @@ bool try_dispatch_flash_attention_native_vulkan(
     const array& q,
     const array& k,
     const array& v,
+    const array* mask,
     array& out_storage,
     Stream s) {
   const uint32_t batch = checked_u32_size(q.shape(0), "flash_attn batch");
@@ -116,6 +118,7 @@ bool try_dispatch_flash_attention_native_vulkan(
   const uint32_t kv_heads = checked_u32_size(k.shape(1), "flash_attn kv_heads");
   const uint32_t kv_len = checked_u32_size(k.shape(2), "flash_attn kv_len");
   const uint32_t hsv = checked_u32_size(v.shape(3), "flash_attn hsv");
+  const bool has_mask = mask != nullptr;
 
   const auto tuning =
       get_flash_attention_tuning_params(hsk, hsv, q_len, kv_len);
@@ -153,9 +156,15 @@ bool try_dispatch_flash_attention_native_vulkan(
   push_constants.nek3 = batch;
   push_constants.nev2 = checked_u32_size(v.shape(1), "flash_attn v_heads");
   push_constants.nev3 = checked_u32_size(v.shape(0), "flash_attn v_batch");
-  push_constants.nem1 = 1u;
-  push_constants.nem2 = 1u;
-  push_constants.nem3 = 1u;
+  push_constants.nem1 = has_mask
+      ? checked_u32_size((*mask).shape(2), "flash_attn mask_rows")
+      : 1u;
+  push_constants.nem2 = has_mask
+      ? checked_u32_size((*mask).shape(1), "flash_attn mask_heads")
+      : 1u;
+  push_constants.nem3 = has_mask
+      ? checked_u32_size((*mask).shape(0), "flash_attn mask_batch")
+      : 1u;
   push_constants.nb01 = q_stride;
   push_constants.nb02 = stride_bytes(q, 1, "flash_attn q_nb02");
   push_constants.nb03 = stride_bytes(q, 0, "flash_attn q_nb03");
@@ -186,7 +195,7 @@ bool try_dispatch_flash_attention_native_vulkan(
       tuning.row_split,
       tuning.subgroup_size,
       tuning.shmem_staging,
-      0u,
+      has_mask ? 2u : 0u,
       tuning.limit_occupancy_shmem,
   };
 
@@ -196,7 +205,7 @@ bool try_dispatch_flash_attention_native_vulkan(
         q,
         k,
         v,
-        q,
+        has_mask ? *mask : q,
         q,
         out_storage,
         q,
@@ -287,91 +296,18 @@ bool try_eval_flash_attention_vulkan(
   out_storage.set_data(allocator::malloc(out_storage.nbytes()));
 
   try {
-    if (do_causal) {
-      if (batch != 1) {
+    std::optional<array> causal_mask;
+    if (do_causal && q_len > 1) {
+      causal_mask = make_flash_attention_causal_mask(q, k, s);
+      *causal_mask = make_contiguous_zero_offset(*causal_mask);
+      eval(*causal_mask);
+      if (causal_mask->dtype() != float16) {
         return false;
       }
-
-      const int n_past = static_cast<int>(kv_len) - static_cast<int>(q_len);
-      std::vector<array> row_outputs;
-      row_outputs.reserve(q_len);
-
-      for (uint32_t row = 0; row < q_len; ++row) {
-        const int kv_limit = n_past + static_cast<int>(row) + 1;
-        if (kv_limit <= 0 || kv_limit > static_cast<int>(kv_len)) {
-          return false;
-        }
-
-        array q_row = slice(
-            q,
-            {0, 0, static_cast<int>(row), 0},
-            {static_cast<int>(batch),
-             static_cast<int>(q_heads),
-             static_cast<int>(row + 1),
-             static_cast<int>(hsk)},
-            s);
-        array k_row = kv_limit == static_cast<int>(kv_len)
-            ? k
-            : slice(
-                  k,
-                  {0, 0, 0, 0},
-                  {static_cast<int>(batch),
-                   static_cast<int>(kv_heads),
-                   kv_limit,
-                   static_cast<int>(hsk)},
-                  s);
-        array v_row = kv_limit == static_cast<int>(kv_len)
-            ? v
-            : slice(
-                  v,
-                  {0, 0, 0, 0},
-                  {static_cast<int>(batch),
-                   static_cast<int>(kv_heads),
-                   kv_limit,
-                   static_cast<int>(hsv)},
-                  s);
-
-        q_row = make_contiguous_zero_offset(q_row);
-        k_row = make_contiguous_zero_offset(k_row);
-        v_row = make_contiguous_zero_offset(v_row);
-        eval(q_row);
-        eval(k_row);
-        eval(v_row);
-
-        array row_storage(
-            {1, 1, static_cast<int>(q_heads), static_cast<int>(hsv)},
-            float32,
-            nullptr,
-            {});
-        row_storage.set_status(array::Status::available);
-        row_storage.set_data(allocator::malloc(row_storage.nbytes()));
-        if (!try_dispatch_flash_attention_native_vulkan(
-                q_row, k_row, v_row, row_storage, s)) {
-          return false;
-        }
-
-        array row_out = swapaxes(row_storage, 1, 2, s);
-        eval(row_out);
-        array row_final(
-            {1, static_cast<int>(q_heads), 1, static_cast<int>(hsv)},
-            float32,
-            nullptr,
-            {});
-        copy_gpu(row_out, row_final, CopyType::General, s);
-        eval(row_final);
-        row_outputs.push_back(row_final);
-      }
-
-      array out_final = concatenate(row_outputs, 2, s);
-      if (out.dtype() != float32) {
-        out_final = astype(out_final, out.dtype(), s);
-      }
-      eval(out_final);
-      copy_gpu(out_final, out, CopyType::General, s);
-      return true;
     }
 
-    if (!try_dispatch_flash_attention_native_vulkan(q, k, v, out_storage, s)) {
+    if (!try_dispatch_flash_attention_native_vulkan(
+            q, k, v, causal_mask ? &(*causal_mask) : nullptr, out_storage, s)) {
       return false;
     }
 
