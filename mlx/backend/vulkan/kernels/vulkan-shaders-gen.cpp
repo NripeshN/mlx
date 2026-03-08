@@ -1215,6 +1215,8 @@ void process_shaders() {
   string_to_spv("gather_f32_i32", "gather.comp", {{"VALUE_TYPE", "float"}});
   string_to_spv("gather_f16_i32", "gather.comp", {{"VALUE_TYPE", "float16_t"}});
   string_to_spv("gather_bf16_i32", "gather.comp", {{"VALUE_TYPE", "uint16_t"}});
+  string_to_spv("gather_i32_i32", "gather.comp", {{"VALUE_TYPE", "int"}});
+  string_to_spv("gather_u32_i32", "gather.comp", {{"VALUE_TYPE", "uint"}});
   string_to_spv(
       "gather_f32_i64",
       "gather.comp",
@@ -1228,6 +1230,14 @@ void process_shaders() {
       "gather.comp",
       {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_I64", "1"}});
   string_to_spv(
+      "gather_i32_i64",
+      "gather.comp",
+      {{"VALUE_TYPE", "int"}, {"INDEX_IS_I64", "1"}});
+  string_to_spv(
+      "gather_u32_i64",
+      "gather.comp",
+      {{"VALUE_TYPE", "uint"}, {"INDEX_IS_I64", "1"}});
+  string_to_spv(
       "gather_f32_u32",
       "gather.comp",
       {{"VALUE_TYPE", "float"}, {"INDEX_IS_UNSIGNED", "1"}});
@@ -1239,6 +1249,14 @@ void process_shaders() {
       "gather_bf16_u32",
       "gather.comp",
       {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_i32_u32",
+      "gather.comp",
+      {{"VALUE_TYPE", "int"}, {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_u32_u32",
+      "gather.comp",
+      {{"VALUE_TYPE", "uint"}, {"INDEX_IS_UNSIGNED", "1"}});
   string_to_spv(
       "gather_f32_u64",
       "gather.comp",
@@ -1257,6 +1275,18 @@ void process_shaders() {
       {{"VALUE_TYPE", "uint16_t"},
        {"INDEX_IS_I64", "1"},
        {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_i32_u64",
+      "gather.comp",
+      {{"VALUE_TYPE", "int"},
+       {"INDEX_IS_I64", "1"},
+       {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_u32_u64",
+      "gather.comp",
+      {{"VALUE_TYPE", "uint"},
+       {"INDEX_IS_I64", "1"},
+       {"INDEX_IS_UNSIGNED", "1"}});
 
   string_to_spv(
       "gather_axis_f32_i32", "gather_axis.comp", {{"VALUE_TYPE", "float"}});
@@ -1264,6 +1294,10 @@ void process_shaders() {
       "gather_axis_f16_i32", "gather_axis.comp", {{"VALUE_TYPE", "float16_t"}});
   string_to_spv(
       "gather_axis_bf16_i32", "gather_axis.comp", {{"VALUE_TYPE", "uint16_t"}});
+  string_to_spv(
+      "gather_axis_i32_i32", "gather_axis.comp", {{"VALUE_TYPE", "int"}});
+  string_to_spv(
+      "gather_axis_u32_i32", "gather_axis.comp", {{"VALUE_TYPE", "uint"}});
   string_to_spv(
       "gather_axis_f32_i64",
       "gather_axis.comp",
@@ -1277,6 +1311,14 @@ void process_shaders() {
       "gather_axis.comp",
       {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_I64", "1"}});
   string_to_spv(
+      "gather_axis_i32_i64",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "int"}, {"INDEX_IS_I64", "1"}});
+  string_to_spv(
+      "gather_axis_u32_i64",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "uint"}, {"INDEX_IS_I64", "1"}});
+  string_to_spv(
       "gather_axis_f32_u32",
       "gather_axis.comp",
       {{"VALUE_TYPE", "float"}, {"INDEX_IS_UNSIGNED", "1"}});
@@ -1288,6 +1330,14 @@ void process_shaders() {
       "gather_axis_bf16_u32",
       "gather_axis.comp",
       {{"VALUE_TYPE", "uint16_t"}, {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_axis_i32_u32",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "int"}, {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_axis_u32_u32",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "uint"}, {"INDEX_IS_UNSIGNED", "1"}});
   string_to_spv(
       "gather_axis_f32_u64",
       "gather_axis.comp",
@@ -1304,6 +1354,18 @@ void process_shaders() {
       "gather_axis_bf16_u64",
       "gather_axis.comp",
       {{"VALUE_TYPE", "uint16_t"},
+       {"INDEX_IS_I64", "1"},
+       {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_axis_i32_u64",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "int"},
+       {"INDEX_IS_I64", "1"},
+       {"INDEX_IS_UNSIGNED", "1"}});
+  string_to_spv(
+      "gather_axis_u32_u64",
+      "gather_axis.comp",
+      {{"VALUE_TYPE", "uint"},
        {"INDEX_IS_I64", "1"},
        {"INDEX_IS_UNSIGNED", "1"}});
 

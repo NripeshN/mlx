@@ -90,6 +90,26 @@ std::string dtype_suffix(Dtype dtype) {
       return "f16";
     case float32:
       return "f32";
+    case bfloat16:
+      return "bf16";
+    case int8:
+      return "i8";
+    case int16:
+      return "i16";
+    case int32:
+      return "i32";
+    case int64:
+      return "i64";
+    case uint8:
+      return "u8";
+    case uint16:
+      return "u16";
+    case uint32:
+      return "u32";
+    case uint64:
+      return "u64";
+    case bool_:
+      return "bool";
     default:
       return {};
   }
@@ -112,9 +132,6 @@ std::string gather_index_suffix(Dtype dtype) {
 
 std::string gather_shader_name(Dtype value_dtype, Dtype index_dtype) {
   auto value_suffix = dtype_suffix(value_dtype);
-  if (value_dtype == bfloat16) {
-    value_suffix = "bf16";
-  }
   auto index_suffix = gather_index_suffix(index_dtype);
   if (value_suffix.empty() || index_suffix.empty()) {
     return {};
@@ -124,9 +141,6 @@ std::string gather_shader_name(Dtype value_dtype, Dtype index_dtype) {
 
 std::string gather_axis_shader_name(Dtype value_dtype, Dtype index_dtype) {
   auto value_suffix = dtype_suffix(value_dtype);
-  if (value_dtype == bfloat16) {
-    value_suffix = "bf16";
-  }
   auto index_suffix = gather_index_suffix(index_dtype);
   if (value_suffix.empty() || index_suffix.empty()) {
     return {};
