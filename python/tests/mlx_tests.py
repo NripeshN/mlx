@@ -30,10 +30,24 @@ class MLXTestRunner(unittest.TestProgram):
         else:
             device = mx.default_device()
 
-        if not (device == mx.gpu and not mx.metal.is_available()):
+        is_cuda = device == mx.gpu and not mx.metal.is_available()
+        is_vulkan = (
+            device == mx.gpu
+            and mx.metal.is_available()
+            and mx.device_info().get("architecture") == "Vulkan"
+        )
+
+        if not (is_cuda or is_vulkan):
             return
 
-        from cuda_skip import cuda_skip
+        if is_cuda:
+            from cuda_skip import cuda_skip
+
+            skip_list = cuda_skip
+        elif is_vulkan:
+            from vulkan_skip import vulkan_skip
+
+            skip_list = vulkan_skip
 
         filtered_suite = unittest.TestSuite()
 
@@ -43,7 +57,7 @@ class MLXTestRunner(unittest.TestProgram):
                     filter_and_add(sub_t)
             else:
                 t_id = ".".join(t.id().split(".")[-2:])
-                if t_id in cuda_skip:
+                if t_id in skip_list:
                     print(f"Skipping {t_id}")
                 else:
                     filtered_suite.addTest(t)
