@@ -37,9 +37,7 @@ bool deferred_submission_enabled() {
       return std::string(env) != "0";
     }
 
-    // Keep deferred submission opt-in until alias-aware hazard tracking covers
-    // donation and shared-buffer view creation reliably.
-    return false;
+    return true;
   }();
   return enabled;
 }
