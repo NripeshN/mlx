@@ -128,6 +128,28 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             rtol=5e-2,
         )
 
+    def test_scaled_dot_product_attention_qwen_shape_regression(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.fast.scaled_dot_product_attention(
+                mx.arange(
+                    1, 1 + int(np.prod((1, 16, 8, 128))), dtype=mx.float16
+                ).reshape(1, 16, 8, 128)
+                / 64.0,
+                mx.arange(
+                    1, 1 + int(np.prod((1, 8, 8, 128))), dtype=mx.float16
+                ).reshape(1, 8, 8, 128)
+                / 48.0,
+                mx.arange(
+                    1, 1 + int(np.prod((1, 8, 8, 128))), dtype=mx.float16
+                ).reshape(1, 8, 8, 128)
+                / 32.0,
+                scale=128**-0.5,
+                mask="causal",
+            ).astype(mx.float32),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
 
 def _cases():
     return [

@@ -5,6 +5,7 @@
 
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/fast_primitives.h"
+#include "mlx/transforms_impl.h"
 
 namespace mlx::core {
 
@@ -97,6 +98,7 @@ array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s) {
   eval(scores);
 
   array masked(scores.shape(), float32, nullptr, {});
+  masked.set_status(array::Status::available);
   masked.set_data(allocator::malloc(masked.nbytes()));
 
   auto command_buffer = vulkan::begin_command_recording(s.index);
@@ -264,7 +266,7 @@ bool ScaledDotProductAttention::supports_bool_mask() {
 }
 
 bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {
-  if (trace_fallback_enabled()) {
+  if (detail::in_grad_tracing() && trace_fallback_enabled()) {
     std::ostringstream oss;
     oss << "q_shape=" << q.shape();
     trace_use_fallback(
@@ -322,17 +324,12 @@ void ScaledDotProductAttention::eval_gpu(
     const int n_repeats = n_q_heads / n_kv_heads;
 
     if (n_repeats > 1) {
-      q = reshape_in_eval(
-          q,
-          Shape{q.shape(0), n_kv_heads, n_repeats, q.shape(2), q.shape(3)},
-          s);
-      k = reshape_in_eval(
-          k, Shape{k.shape(0), k.shape(1), 1, k.shape(2), k.shape(3)}, s);
-      v = reshape_in_eval(
-          v, Shape{v.shape(0), v.shape(1), 1, v.shape(2), v.shape(3)}, s);
+      q = unflatten(q, 1, {n_kv_heads, n_repeats}, s);
+      k = expand_dims(k, 2, s);
+      v = expand_dims(v, 2, s);
     }
 
-    auto scores = matmul(q, swapaxes_in_eval(k, -1, -2), s);
+    auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
     if (do_causal_) {
       if (scores.dtype() != float32) {
         scores = astype(scores, float32, s);
@@ -341,7 +338,16 @@ void ScaledDotProductAttention::eval_gpu(
       scores = apply_diag_mask_inf_vulkan(scores, n_past, s);
     }
 
+    const Shape scores_shape = scores.shape();
+    const bool collapsed_scores = scores.ndim() > 4;
+    if (collapsed_scores) {
+      scores = flatten(scores, 0, scores.ndim() - 3, s);
+    }
     scores = softmax(scores, std::vector<int>{-1}, true, s);
+    if (collapsed_scores) {
+      scores = unflatten(
+          scores, 0, Shape(scores_shape.begin(), scores_shape.end() - 2), s);
+    }
 
     array v_work = v;
     if (v_work.dtype() != scores.dtype()) {
@@ -350,7 +356,7 @@ void ScaledDotProductAttention::eval_gpu(
 
     auto out = matmul(scores, v_work, s);
     if (n_repeats > 1) {
-      out = reshape_in_eval(out, outputs[0].shape(), s);
+      out = flatten(out, 1, 2, s);
     }
     if (out.dtype() != outputs[0].dtype()) {
       out = astype(out, outputs[0].dtype(), s);
