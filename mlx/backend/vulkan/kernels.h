@@ -215,6 +215,47 @@ struct DiagMaskInfPushConstants {
   uint32_t n_past;
 };
 
+struct FlashAttentionPushConstants {
+  uint32_t N;
+  uint32_t KV;
+
+  uint32_t ne1;
+  uint32_t ne2;
+  uint32_t ne3;
+
+  uint32_t neq2;
+  uint32_t neq3;
+  uint32_t nek2;
+  uint32_t nek3;
+  uint32_t nev2;
+  uint32_t nev3;
+  uint32_t nem1;
+  uint32_t nem2;
+  uint32_t nem3;
+
+  uint32_t nb01;
+  uint32_t nb02;
+  uint32_t nb03;
+  uint32_t nb11;
+  uint32_t nb12;
+  uint32_t nb13;
+  uint32_t nb21;
+  uint32_t nb22;
+  uint32_t nb23;
+
+  float scale;
+  float max_bias;
+  float logit_softcap;
+
+  uint32_t mask_n_head_log2;
+  float m0;
+  float m1;
+
+  uint32_t gqa_ratio;
+  uint32_t split_kv;
+  uint32_t k_num;
+};
+
 struct MatmulPushConstants {
   uint32_t M;
   uint32_t N;
@@ -383,6 +424,21 @@ void dispatch_diag_mask_inf_op(
     const Stream& s,
     uint32_t rows_per_channel,
     uint32_t n_past);
+
+void dispatch_flash_attention_op(
+    const array& q,
+    const array& k,
+    const array& v,
+    const array& mask,
+    const array& sinks,
+    array& out,
+    const array& mask_opt,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    const FlashAttentionPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid,
+    const std::vector<uint32_t>& specialization_constants);
 
 void dispatch_cumsum_op(
     const array& in,

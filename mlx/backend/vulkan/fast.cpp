@@ -1,10 +1,16 @@
 // Copyright © 2024 Apple Inc.
 
 #include <array>
+#include <cmath>
+#include <cstdlib>
 #include <limits>
 
+#include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/fast_primitives.h"
+#include "mlx/ops.h"
 #include "mlx/transforms_impl.h"
 
 namespace mlx::core {
@@ -12,6 +18,383 @@ namespace mlx::core {
 namespace fast {
 
 namespace {
+
+array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s);
+
+bool experimental_flash_attention_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_EXPERIMENTAL_FLASH_ATTN");
+        env != nullptr) {
+      return std::string(env) != "0";
+    }
+    return true;
+  }();
+  return enabled;
+}
+
+struct FlashAttentionTuningParams {
+  uint32_t workgroup_size;
+  uint32_t block_rows;
+  uint32_t block_cols;
+  uint32_t d_split;
+  uint32_t row_split;
+  uint32_t subgroup_size;
+  uint32_t shmem_staging;
+  uint32_t limit_occupancy_shmem;
+};
+
+uint32_t lowest_set_bit(uint32_t value) {
+  return value & (~value + 1u);
+}
+
+std::pair<uint32_t, uint32_t> vulkan_device_vendor_and_subgroup_size() {
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(
+      vulkan::VulkanContext::get().physical_device(), &props);
+
+  VkPhysicalDeviceSubgroupProperties subgroup_props{};
+  subgroup_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+  VkPhysicalDeviceProperties2 props2{};
+  props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  props2.pNext = &subgroup_props;
+  vkGetPhysicalDeviceProperties2(
+      vulkan::VulkanContext::get().physical_device(), &props2);
+
+  return {props.vendorID, subgroup_props.subgroupSize};
+}
+
+FlashAttentionTuningParams get_flash_attention_tuning_params(
+    uint32_t hsk,
+    uint32_t hsv,
+    uint32_t n_rows,
+    uint32_t n_kv) {
+  auto [vendor_id, device_subgroup_size] =
+      vulkan_device_vendor_and_subgroup_size();
+  (void)vendor_id;
+  (void)hsv;
+  (void)n_kv;
+  const uint32_t subgroup_size = std::max(device_subgroup_size, 1u);
+
+  FlashAttentionTuningParams result{};
+  result.workgroup_size = 128u;
+  result.row_split = 1u;
+  result.block_rows = (n_rows <= 1) ? 1u : ((n_rows <= 4) ? 4u : 8u);
+  result.block_cols = 32u;
+
+  const uint32_t d_lsb = lowest_set_bit(hsk);
+  result.d_split = std::min(8u, d_lsb / 4u);
+  result.subgroup_size = subgroup_size;
+  result.shmem_staging = 0u;
+  result.limit_occupancy_shmem = 0u;
+
+  return result;
+}
+
+array make_flash_attention_causal_mask(
+    const array& q,
+    const array& k,
+    Stream s) {
+  array mask = zeros({q.shape(0), 1, q.shape(2), k.shape(2)}, float32, s);
+  if (mask.dtype() != float32) {
+    throw std::runtime_error("Unexpected causal mask dtype.");
+  }
+  const int n_past = k.shape(2) - q.shape(2);
+  mask = apply_diag_mask_inf_vulkan(mask, n_past, s);
+  return astype(mask, float16, s);
+}
+
+bool try_dispatch_flash_attention_native_vulkan(
+    const array& q,
+    const array& k,
+    const array& v,
+    array& out_storage,
+    Stream s) {
+  const uint32_t batch = checked_u32_size(q.shape(0), "flash_attn batch");
+  const uint32_t q_heads = checked_u32_size(q.shape(1), "flash_attn q_heads");
+  const uint32_t q_len = checked_u32_size(q.shape(2), "flash_attn q_len");
+  const uint32_t hsk = checked_u32_size(q.shape(3), "flash_attn hsk");
+  const uint32_t kv_heads = checked_u32_size(k.shape(1), "flash_attn kv_heads");
+  const uint32_t kv_len = checked_u32_size(k.shape(2), "flash_attn kv_len");
+  const uint32_t hsv = checked_u32_size(v.shape(3), "flash_attn hsv");
+
+  const auto tuning =
+      get_flash_attention_tuning_params(hsk, hsv, q_len, kv_len);
+  if (tuning.d_split == 0 || tuning.block_rows == 0 || tuning.block_cols == 0 ||
+      tuning.row_split == 0 || hsk % tuning.d_split != 0 ||
+      hsv % tuning.d_split != 0 ||
+      tuning.block_cols %
+              (tuning.workgroup_size / tuning.d_split / tuning.row_split) !=
+          0) {
+    return false;
+  }
+
+  const uint32_t q_stride =
+      checked_u32_size(q.strides(2), "flash_attn q_stride");
+  const uint32_t k_stride =
+      checked_u32_size(k.strides(2), "flash_attn k_stride");
+  const uint32_t v_stride =
+      checked_u32_size(v.strides(2), "flash_attn v_stride");
+  const bool aligned = (kv_len % tuning.block_cols) == 0 &&
+      (q_stride & 7u) == 0 && (k_stride & 7u) == 0 && (v_stride & 7u) == 0;
+  auto stride_bytes = [](const array& arr, int axis, const char* name) {
+    return checked_u32_size(
+        static_cast<int64_t>(arr.strides(axis)) * size_of(arr.dtype()), name);
+  };
+
+  vulkan::FlashAttentionPushConstants push_constants{};
+  push_constants.N = q_len;
+  push_constants.KV = kv_len;
+  push_constants.ne1 = q_heads;
+  push_constants.ne2 = q_len;
+  push_constants.ne3 = batch;
+  push_constants.neq2 = q_heads;
+  push_constants.neq3 = batch;
+  push_constants.nek2 = kv_heads;
+  push_constants.nek3 = batch;
+  push_constants.nev2 = checked_u32_size(v.shape(1), "flash_attn v_heads");
+  push_constants.nev3 = checked_u32_size(v.shape(0), "flash_attn v_batch");
+  push_constants.nem1 = 1u;
+  push_constants.nem2 = 1u;
+  push_constants.nem3 = 1u;
+  push_constants.nb01 = q_stride;
+  push_constants.nb02 = stride_bytes(q, 1, "flash_attn q_nb02");
+  push_constants.nb03 = stride_bytes(q, 0, "flash_attn q_nb03");
+  push_constants.nb11 = k_stride;
+  push_constants.nb12 = stride_bytes(k, 1, "flash_attn k_nb12");
+  push_constants.nb13 = stride_bytes(k, 0, "flash_attn k_nb13");
+  push_constants.nb21 = v_stride;
+  push_constants.nb22 = stride_bytes(v, 1, "flash_attn v_nb22");
+  push_constants.nb23 = stride_bytes(v, 0, "flash_attn v_nb23");
+  push_constants.scale = 1.0f;
+  push_constants.max_bias = 0.0f;
+  push_constants.logit_softcap = 0.0f;
+  push_constants.mask_n_head_log2 = 0u;
+  push_constants.m0 = 0.0f;
+  push_constants.m1 = 0.0f;
+  push_constants.gqa_ratio = 1u;
+  push_constants.split_kv = kv_len;
+  push_constants.k_num = 1u;
+
+  const std::vector<uint32_t> specialization_constants = {
+      tuning.workgroup_size,
+      tuning.block_rows,
+      tuning.block_cols,
+      hsk,
+      hsv,
+      aligned ? 0u : 1u,
+      tuning.d_split,
+      tuning.row_split,
+      tuning.subgroup_size,
+      tuning.shmem_staging,
+      0u,
+      tuning.limit_occupancy_shmem,
+  };
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_flash_attention_op(
+        q,
+        k,
+        v,
+        q,
+        q,
+        out_storage,
+        q,
+        "flash_attn_f32_f16_f16_fp32",
+        command_buffer,
+        s,
+        push_constants,
+        {(q_len + tuning.block_rows - 1u) / tuning.block_rows, q_heads, batch},
+        specialization_constants);
+    vulkan::end_command_recording(s.index);
+    return true;
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "flash_attn_dispatch_failed reason=" << e.what();
+      trace_fallback(oss.str());
+    }
+    return false;
+  }
+}
+
+bool try_eval_flash_attention_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    float scale,
+    bool do_causal,
+    Stream s) {
+  if (inputs.size() != 3) {
+    return false;
+  }
+  if (!experimental_flash_attention_enabled()) {
+    return false;
+  }
+
+  array q = inputs[0];
+  array k = inputs[1];
+  array v = inputs[2];
+
+  if (k.dtype() != float16 || v.dtype() != float16 || out.ndim() != 4 ||
+      q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
+    return false;
+  }
+
+  const uint32_t batch = checked_u32_size(q.shape(0), "flash_attn batch");
+  const uint32_t q_heads = checked_u32_size(q.shape(1), "flash_attn q_heads");
+  const uint32_t q_len = checked_u32_size(q.shape(2), "flash_attn q_len");
+  const uint32_t hsk = checked_u32_size(q.shape(3), "flash_attn hsk");
+  const uint32_t kv_heads = checked_u32_size(k.shape(1), "flash_attn kv_heads");
+  const uint32_t kv_len = checked_u32_size(k.shape(2), "flash_attn kv_len");
+  const uint32_t hsv = checked_u32_size(v.shape(3), "flash_attn hsv");
+
+  if (batch == 0 || q_heads == 0 || q_len == 0 || hsk == 0 || kv_heads == 0 ||
+      kv_len == 0 || hsv == 0 || hsk % 4 != 0 || hsv % 4 != 0 ||
+      q_heads % kv_heads != 0) {
+    return false;
+  }
+
+  q = multiply(array(scale, q.dtype()), q, s);
+  if (q.dtype() != float32) {
+    q = astype(q, float32, s);
+  }
+
+  auto make_contiguous_zero_offset = [&](array x) {
+    if (!x.flags().row_contiguous || x.strides().back() != 1 ||
+        x.offset() != 0) {
+      x = contiguous_copy_gpu(x, s);
+    }
+    return x;
+  };
+
+  q = make_contiguous_zero_offset(q);
+  k = make_contiguous_zero_offset(k);
+  v = make_contiguous_zero_offset(v);
+  eval(q);
+  eval(k);
+  eval(v);
+
+  if (q.dtype() != float32 || k.dtype() != float16 || v.dtype() != float16) {
+    return false;
+  }
+
+  array out_storage(
+      {out.shape(0), out.shape(2), out.shape(1), out.shape(3)},
+      float32,
+      nullptr,
+      {});
+  out_storage.set_status(array::Status::available);
+  out_storage.set_data(allocator::malloc(out_storage.nbytes()));
+
+  try {
+    if (do_causal) {
+      if (batch != 1) {
+        return false;
+      }
+
+      const int n_past = static_cast<int>(kv_len) - static_cast<int>(q_len);
+      std::vector<array> row_outputs;
+      row_outputs.reserve(q_len);
+
+      for (uint32_t row = 0; row < q_len; ++row) {
+        const int kv_limit = n_past + static_cast<int>(row) + 1;
+        if (kv_limit <= 0 || kv_limit > static_cast<int>(kv_len)) {
+          return false;
+        }
+
+        array q_row = slice(
+            q,
+            {0, 0, static_cast<int>(row), 0},
+            {static_cast<int>(batch),
+             static_cast<int>(q_heads),
+             static_cast<int>(row + 1),
+             static_cast<int>(hsk)},
+            s);
+        array k_row = kv_limit == static_cast<int>(kv_len)
+            ? k
+            : slice(
+                  k,
+                  {0, 0, 0, 0},
+                  {static_cast<int>(batch),
+                   static_cast<int>(kv_heads),
+                   kv_limit,
+                   static_cast<int>(hsk)},
+                  s);
+        array v_row = kv_limit == static_cast<int>(kv_len)
+            ? v
+            : slice(
+                  v,
+                  {0, 0, 0, 0},
+                  {static_cast<int>(batch),
+                   static_cast<int>(kv_heads),
+                   kv_limit,
+                   static_cast<int>(hsv)},
+                  s);
+
+        q_row = make_contiguous_zero_offset(q_row);
+        k_row = make_contiguous_zero_offset(k_row);
+        v_row = make_contiguous_zero_offset(v_row);
+        eval(q_row);
+        eval(k_row);
+        eval(v_row);
+
+        array row_storage(
+            {1, 1, static_cast<int>(q_heads), static_cast<int>(hsv)},
+            float32,
+            nullptr,
+            {});
+        row_storage.set_status(array::Status::available);
+        row_storage.set_data(allocator::malloc(row_storage.nbytes()));
+        if (!try_dispatch_flash_attention_native_vulkan(
+                q_row, k_row, v_row, row_storage, s)) {
+          return false;
+        }
+
+        array row_out = swapaxes(row_storage, 1, 2, s);
+        eval(row_out);
+        array row_final(
+            {1, static_cast<int>(q_heads), 1, static_cast<int>(hsv)},
+            float32,
+            nullptr,
+            {});
+        copy_gpu(row_out, row_final, CopyType::General, s);
+        eval(row_final);
+        row_outputs.push_back(row_final);
+      }
+
+      array out_final = concatenate(row_outputs, 2, s);
+      if (out.dtype() != float32) {
+        out_final = astype(out_final, out.dtype(), s);
+      }
+      eval(out_final);
+      copy_gpu(out_final, out, CopyType::General, s);
+      return true;
+    }
+
+    if (!try_dispatch_flash_attention_native_vulkan(q, k, v, out_storage, s)) {
+      return false;
+    }
+
+    vulkan::synchronize_stream(s);
+
+    array out_transposed = swapaxes(out_storage, 1, 2, s);
+    eval(out_transposed);
+    array out_final = out_transposed;
+    if (out.dtype() != float32) {
+      out_final = astype(out_final, out.dtype(), s);
+    }
+    eval(out_final);
+    copy_gpu(out_final, out, CopyType::General, s);
+    return true;
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "flash_attn_dispatch_failed reason=" << e.what();
+      trace_fallback(oss.str());
+    }
+    return false;
+  }
+}
 
 bool sdpa_vulkan_supported(
     const array& q,
@@ -314,6 +697,11 @@ void ScaledDotProductAttention::eval_gpu(
 
   try {
     auto s = stream();
+
+    if (try_eval_flash_attention_vulkan(
+            inputs, outputs[0], scale_, do_causal_, s)) {
+      return;
+    }
 
     array q = multiply(array(scale_, q_in.dtype()), q_in, s);
     array k = k_in;

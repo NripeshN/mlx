@@ -237,10 +237,11 @@ enum class KernelSpecId {
   Gather,
   GatherAxis,
   Rope,
+  FlashAttention,
 };
 
 struct KernelSpec {
-  std::array<uint32_t, 6> bindings{};
+  std::vector<uint32_t> bindings;
   uint32_t binding_count{0};
   uint32_t push_constant_size{0};
   DispatchGridKind grid_kind{DispatchGridKind::ElementWise};
@@ -251,99 +252,89 @@ struct BoundArray {
   const char* name;
 };
 
-constexpr KernelSpec make_kernel_spec(
-    std::array<uint32_t, 6> bindings,
-    uint32_t binding_count,
+KernelSpec make_kernel_spec(
+    std::initializer_list<uint32_t> bindings,
     uint32_t push_constant_size,
     DispatchGridKind grid_kind) {
-  return {bindings, binding_count, push_constant_size, grid_kind};
+  return {
+      std::vector<uint32_t>(bindings),
+      static_cast<uint32_t>(bindings.size()),
+      push_constant_size,
+      grid_kind};
 }
 
-constexpr std::array<KernelSpec, 17> kKernelSpecs = {
+const std::array<KernelSpec, 18> kKernelSpecs = {
     make_kernel_spec(
-        {0, 1, 2, 0, 0, 0},
-        3,
+        {0, 1, 2},
         sizeof(BinaryPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
-        {0, 1, 2, 3, 0, 0},
-        4,
+        {0, 1, 2, 3},
         sizeof(BinaryPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
-        {0, 1, 0, 0, 0, 0},
-        2,
+        {0, 1},
         sizeof(UnaryPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
-        {0, 1, 0, 0, 0, 0},
-        2,
+        {0, 1},
         sizeof(GenericPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
-        {0, 0, 0, 0, 0, 0},
-        1,
+        {0},
         sizeof(GenericPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
-        {0, 1, 0, 0, 0, 0},
-        2,
+        {0, 1},
         sizeof(SumRowsPushConstants),
         DispatchGridKind::RowWise),
     make_kernel_spec(
-        {0, 1, 0, 0, 0, 0},
-        2,
+        {0, 1},
         sizeof(GenericPushConstants),
         DispatchGridKind::RowWise),
     make_kernel_spec(
-        {0, 1, 2, 3, 0, 0},
-        4,
+        {0, 1, 2, 3},
         sizeof(SoftmaxPushConstants),
         DispatchGridKind::RowWise),
     make_kernel_spec(
         {0, 1, 2, 3, 4, 5},
-        6,
         sizeof(SoftmaxPushConstants),
         DispatchGridKind::RowWise),
     make_kernel_spec(
-        {0, 1, 0, 0, 0, 0},
-        2,
+        {0, 1},
         sizeof(DiagMaskInfPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
-        {0, 1, 2, 0, 0, 0},
-        3,
+        {0, 1, 2},
         sizeof(SumRowsPushConstants),
         DispatchGridKind::RowWise),
     make_kernel_spec(
-        {0, 1, 2, 3, 4, 0},
-        5,
+        {0, 1, 2, 3, 4},
         sizeof(MatVecPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
-        {0, 1, 2, 0, 0, 0},
-        3,
+        {0, 1, 2},
         sizeof(MatmulPushConstants),
         DispatchGridKind::Linear1D),
     make_kernel_spec(
-        {0, 1, 0, 0, 0, 0},
-        2,
+        {0, 1},
         sizeof(RandomBitsPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
-        {0, 1, 2, 0, 0, 0},
-        3,
+        {0, 1, 2},
         sizeof(GatherPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
-        {0, 1, 2, 0, 0, 0},
-        3,
+        {0, 1, 2},
         sizeof(GatherAxisPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
-        {0, 1, 2, 3, 4, 0},
-        5,
+        {0, 1, 2, 3, 4},
         sizeof(RopePushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3, 4, 5, 6},
+        sizeof(FlashAttentionPushConstants),
         DispatchGridKind::Linear1D),
 };
 
@@ -618,8 +609,8 @@ void dispatch_with_spec(
     trace_descriptor_epochs(oss.str());
   }
 
-  std::array<VkDescriptorBufferInfo, 6> descriptor_infos{};
-  std::array<VkWriteDescriptorSet, 6> descriptor_writes{};
+  std::vector<VkDescriptorBufferInfo> descriptor_infos(bound_arrays.size());
+  std::vector<VkWriteDescriptorSet> descriptor_writes(bound_arrays.size());
 
   for (size_t i = 0; i < bound_arrays.size(); ++i) {
     if (bound_arrays[i].arr == nullptr) {
@@ -1557,6 +1548,41 @@ void dispatch_diag_mask_inf_op(
       cmd_buffer,
       s,
       grid);
+}
+
+void dispatch_flash_attention_op(
+    const array& q,
+    const array& k,
+    const array& v,
+    const array& mask,
+    const array& sinks,
+    array& out,
+    const array& mask_opt,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    const FlashAttentionPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid,
+    const std::vector<uint32_t>& specialization_constants) {
+  const std::array<BoundArray, 7> bound_arrays = {{
+      {&q, "q"},
+      {&k, "k"},
+      {&v, "v"},
+      {&mask, "mask"},
+      {&sinks, "sinks"},
+      {&out, "dst"},
+      {&mask_opt, "mask_opt"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::FlashAttention,
+      bound_arrays,
+      push_constants,
+      checked_mul_u32(push_constants.N, push_constants.KV, "flash_attn ne"),
+      cmd_buffer,
+      s,
+      grid,
+      specialization_constants);
 }
 
 void dispatch_cumsum_op(
