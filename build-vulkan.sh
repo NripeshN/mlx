@@ -27,6 +27,7 @@ else
 fi
 
 CMAKE_ARGS="-DMLX_BUILD_VULKAN=ON -DCMAKE_VERBOSE_MAKEFILE=${CMAKE_VERBOSE_MAKEFILE} -DMLX_USE_CCACHE=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+CMAKE_ARGS="-DMLX_BUILD_TESTS=ON $CMAKE_ARGS"
 
 if command -v ccache >/dev/null 2>&1; then
   export CCACHE_BASEDIR="$(pwd)"
@@ -43,10 +44,17 @@ if [ "$BUILD_WHEEL" = "1" ]; then
   ln -sf wheelhouse/*.whl mlx-0.31.1-cp313-cp313-linux_x86_64.whl
 else
   if [ -n "${PIP_VERBOSE_FLAG}" ]; then
-    CMAKE_ARGS="$CMAKE_ARGS" pip install "$PIP_VERBOSE_FLAG" -e .
+    CMAKE_ARGS="$CMAKE_ARGS" pip install "$PIP_VERBOSE_FLAG" -e . \
+      --config-settings=build_ext.build-temp=build \
+      --config-settings=build_ext.build-lib=build/lib
   else
-    CMAKE_ARGS="$CMAKE_ARGS" pip install -e .
+    CMAKE_ARGS="$CMAKE_ARGS" pip install -e . \
+      --config-settings=build_ext.build-temp=build \
+      --config-settings=build_ext.build-lib=build/lib
   fi
+  # Build C++ tests
+  echo "Building C++ tests..."
+  cmake --build build --target tests -j$(nproc)
 fi
 
 if command -v ccache >/dev/null 2>&1; then
