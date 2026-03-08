@@ -26,12 +26,6 @@ bool try_eval_gather_vulkan(
     trace_vulkan_unsupported("Gather", "axis is out of range");
     return false;
   }
-  if (axis != 0) {
-    trace_vulkan_unsupported(
-        "Gather", "non-zero axis gather currently falls back to CPU");
-    return false;
-  }
-
   for (int i = 0; i < src_input.ndim(); ++i) {
     const int64_t expected = (i == axis) ? 1 : src_input.shape(i);
     if (slice_sizes[i] != expected) {
@@ -47,12 +41,6 @@ bool try_eval_gather_vulkan(
         "Gather",
         "value/index dtype combination is not supported by Vulkan gather");
     return false;
-  }
-
-  array src = src_input;
-  if (!src.flags().contiguous || src.offset() != 0 ||
-      src.strides().back() != 1) {
-    src = contiguous_copy_gpu(src, s);
   }
 
   if (!idx.flags().contiguous || idx.offset() != 0 ||
@@ -72,8 +60,32 @@ bool try_eval_gather_vulkan(
     return true;
   }
 
-  array src_2d = reshape_in_eval(
-      src, Shape{static_cast<int>(axis_size), static_cast<int>(slice_size)}, s);
+  array src_2d(
+      Shape{static_cast<int>(axis_size), static_cast<int>(slice_size)},
+      src_input.dtype(),
+      nullptr,
+      {});
+  if (axis == 0) {
+    array src = src_input;
+    if (!src.flags().contiguous || src.offset() != 0 ||
+        src.strides().back() != 1) {
+      src = contiguous_copy_gpu(src, s);
+    }
+    src_2d = reshape_in_eval(
+        src,
+        Shape{static_cast<int>(axis_size), static_cast<int>(slice_size)},
+        s);
+  } else {
+    std::vector<int> perm(src_input.ndim());
+    perm[0] = axis;
+    int dst_axis = 1;
+    for (int src_axis = 0; src_axis < src_input.ndim(); ++src_axis) {
+      if (src_axis != axis) {
+        perm[dst_axis++] = src_axis;
+      }
+    }
+    copy_gpu(transpose(src_input, perm, s), src_2d, CopyType::General, s);
+  }
   array idx_1d = reshape_in_eval(idx, Shape{static_cast<int>(index_count)}, s);
   array out_2d(
       Shape{static_cast<int>(index_count), static_cast<int>(slice_size)},
