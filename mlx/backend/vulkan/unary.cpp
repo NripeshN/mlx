@@ -77,19 +77,21 @@ bool try_eval_unary_op_vulkan(
   }
 }
 
-template <typename Primitive>
+template <typename Primitive, typename... FallbackArgs>
 void eval_unary_vulkan_or_cpu(
     const std::vector<array>& inputs,
     array& out,
     const std::string& shader_name,
     Stream s,
     float param1 = 0.0f,
-    float param2 = 0.0f) {
+    float param2 = 0.0f,
+    FallbackArgs&&... fallback_args) {
   if (try_eval_unary_op_vulkan<Primitive>(
           inputs, out, shader_name, s, param1, param2)) {
     return;
   }
-  eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
+  eval_cpu_fallback_on_stream<Primitive>(
+      inputs, out, s, std::forward<FallbackArgs>(fallback_args)...);
 }
 
 template <typename Primitive>
@@ -310,7 +312,13 @@ void Sqrt::eval_gpu(const std::vector<array>& inputs, array& out) {
       (inputs[0].dtype() == float32 || inputs[0].dtype() == bfloat16) &&
       out.dtype() == inputs[0].dtype()) {
     eval_unary_vulkan_or_cpu<Sqrt>(
-        inputs, out, state() ? "rsqrt_f32" : "sqrt_f32", stream());
+        inputs,
+        out,
+        state() ? "rsqrt_f32" : "sqrt_f32",
+        stream(),
+        0.0f,
+        0.0f,
+        state());
     return;
   }
   eval_cpu_fallback_on_stream<Sqrt>(inputs, out, stream(), state());
