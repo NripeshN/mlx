@@ -229,6 +229,7 @@ enum class KernelSpecId {
   Argmax,
   Softmax,
   SoftmaxLarge,
+  DiagMaskInf,
   CumsumMultipass,
   MatVec,
   Matmul,
@@ -258,7 +259,7 @@ constexpr KernelSpec make_kernel_spec(
   return {bindings, binding_count, push_constant_size, grid_kind};
 }
 
-constexpr std::array<KernelSpec, 16> kKernelSpecs = {
+constexpr std::array<KernelSpec, 17> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 0, 0, 0},
         3,
@@ -304,6 +305,11 @@ constexpr std::array<KernelSpec, 16> kKernelSpecs = {
         6,
         sizeof(SoftmaxPushConstants),
         DispatchGridKind::RowWise),
+    make_kernel_spec(
+        {0, 1, 0, 0, 0, 0},
+        2,
+        sizeof(DiagMaskInfPushConstants),
+        DispatchGridKind::ElementWise),
     make_kernel_spec(
         {0, 1, 2, 0, 0, 0},
         3,
@@ -1488,6 +1494,69 @@ void dispatch_softmax_large_op(
       s,
       grid,
       {128u, 4u});
+}
+
+void dispatch_diag_mask_inf_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t rows_per_channel,
+    uint32_t n_past) {
+  if (out.size() == 0) {
+    return;
+  }
+
+  if (in.ndim() == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] DiagMaskInf requires input rank >= 1.");
+  }
+  if (in.dtype() != float32 || out.dtype() != float32) {
+    throw std::runtime_error(
+        "[vulkan::kernels] DiagMaskInf currently requires float32 IO.");
+  }
+
+  const uint32_t ncols =
+      checked_u32(in.shape(in.ndim() - 1), "diag_mask_inf ncols");
+  if (ncols == 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] DiagMaskInf requires non-zero column count.");
+  }
+
+  const uint32_t total_elements =
+      checked_u32(out.size(), "diag_mask_inf elements");
+  if (total_elements % ncols != 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] DiagMaskInf elements are not divisible by ncols.");
+  }
+
+  DiagMaskInfPushConstants push_constants{};
+  push_constants.ncols = ncols;
+  push_constants.rows_per_channel = rows_per_channel;
+  push_constants.n_past = n_past;
+
+  const std::array<BoundArray, 2> bound_arrays = {{
+      {&in, "src0"},
+      {&out, "dst"},
+  }};
+
+  const uint32_t row_count = total_elements / ncols;
+  const std::array<uint32_t, 3> grid = {
+      row_count,
+      (ncols + 511u) / 512u,
+      1u,
+  };
+
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::DiagMaskInf,
+      bound_arrays,
+      push_constants,
+      total_elements,
+      cmd_buffer,
+      s,
+      grid);
 }
 
 void dispatch_cumsum_op(

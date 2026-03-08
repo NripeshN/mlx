@@ -97,6 +97,37 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
                     rtol=rtol,
                 )
 
+    def test_scaled_dot_product_attention_causal_gqa(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.fast.scaled_dot_product_attention(
+                mx.arange(1, 1 + 1 * 4 * 8 * 16, dtype=mx.float16).reshape(1, 4, 8, 16)
+                / 64.0,
+                mx.arange(1, 1 + 1 * 2 * 8 * 16, dtype=mx.float16).reshape(1, 2, 8, 16)
+                / 48.0,
+                mx.arange(1, 1 + 1 * 2 * 8 * 16, dtype=mx.float16).reshape(1, 2, 8, 16)
+                / 32.0,
+                scale=16**-0.5,
+                mask="causal",
+            ).astype(mx.float32),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+    def test_scaled_dot_product_attention_decode_gqa(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.fast.scaled_dot_product_attention(
+                mx.arange(1, 1 + 1 * 4 * 1 * 16, dtype=mx.float16).reshape(1, 4, 1, 16)
+                / 64.0,
+                mx.arange(1, 1 + 1 * 2 * 8 * 16, dtype=mx.float16).reshape(1, 2, 8, 16)
+                / 48.0,
+                mx.arange(1, 1 + 1 * 2 * 8 * 16, dtype=mx.float16).reshape(1, 2, 8, 16)
+                / 32.0,
+                scale=16**-0.5,
+            ).astype(mx.float32),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
 
 def _cases():
     return [

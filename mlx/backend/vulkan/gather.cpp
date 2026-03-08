@@ -84,7 +84,9 @@ bool try_eval_gather_vulkan(
         perm[dst_axis++] = src_axis;
       }
     }
-    copy_gpu(transpose(src_input, perm, s), src_2d, CopyType::General, s);
+    auto transposed = transpose(src_input, perm, s);
+    eval(transposed);
+    copy_gpu(transposed, src_2d, CopyType::General, s);
   }
   array idx_1d = reshape_in_eval(idx, Shape{static_cast<int>(index_count)}, s);
   array out_2d(

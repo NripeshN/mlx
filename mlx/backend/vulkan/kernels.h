@@ -209,6 +209,12 @@ struct SoftmaxPushConstants {
   uint32_t has_sinks;
 };
 
+struct DiagMaskInfPushConstants {
+  uint32_t ncols;
+  uint32_t rows_per_channel;
+  uint32_t n_past;
+};
+
 struct MatmulPushConstants {
   uint32_t M;
   uint32_t N;
@@ -368,6 +374,15 @@ void dispatch_softmax_large_op(
     const std::string& shader_name_pass3,
     VkCommandBuffer cmd_buffer,
     const Stream& s);
+
+void dispatch_diag_mask_inf_op(
+    const array& in,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t rows_per_channel,
+    uint32_t n_past);
 
 void dispatch_cumsum_op(
     const array& in,
