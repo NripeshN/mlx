@@ -1384,9 +1384,9 @@ void dispatch_softmax_large_op(
   const auto push_constants =
       make_softmax_push_constants(in, row_width, row_count);
 
-  const uint32_t elems_per_workgroup = 128u * 4u;
-  const uint32_t num_workgroups_x =
-      (row_width + elems_per_workgroup - 1) / elems_per_workgroup;
+  const uint32_t block_size = 128u;
+  const uint32_t elems_per_workgroup = block_size * 4u;
+  const uint32_t num_workgroups_x = (row_width + block_size - 1) / block_size;
   if (num_workgroups_x == 0) {
     return;
   }
@@ -1515,9 +1515,9 @@ void dispatch_cumsum_op(
 
   const auto push_constants = make_sum_rows_push_constants(in, out, 1.0f);
 
-  const uint32_t elems_per_workgroup = 128u * 4u;
-  const uint32_t num_workgroups_x =
-      (row_width + elems_per_workgroup - 1) / elems_per_workgroup;
+  const uint32_t block_size = 128u;
+  const uint32_t elems_per_workgroup = block_size * 4u;
+  const uint32_t num_workgroups_x = (row_width + block_size - 1) / block_size;
 
   if (num_workgroups_x <= 1) {
     const std::array<BoundArray, 2> bound_arrays = {{

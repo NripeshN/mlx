@@ -13,5 +13,37 @@ void main() {
     }
 
     const FLOAT_TYPE val = FLOAT_TYPE(data_a[get_aoffset() + src0_idx(idx)]);
-    data_d[get_doffset() + dst_idx(idx)] = D_TYPE(cos(val));
+
+    const float q = round(float(val) * 0.63661977236758134);
+    float r = fma(-q, 1.5707962512969971, float(val));
+    r = fma(-q, 7.5497894158615964e-08, r);
+
+    const float r2 = r * r;
+    float sin_poly = -2.3889859e-08;
+    sin_poly = sin_poly * r2 + 2.7525562e-06;
+    sin_poly = sin_poly * r2 - 1.9840874e-04;
+    sin_poly = sin_poly * r2 + 8.3333310e-03;
+    sin_poly = sin_poly * r2 - 1.6666667e-01;
+    sin_poly = sin_poly * (r2 * r) + r;
+
+    float cos_poly = -2.6051615e-07;
+    cos_poly = cos_poly * r2 + 2.4760495e-05;
+    cos_poly = cos_poly * r2 - 1.3888378e-03;
+    cos_poly = cos_poly * r2 + 4.1666638e-02;
+    cos_poly = cos_poly * r2 - 5.0000000e-01;
+    cos_poly = cos_poly * r2 + 1.0;
+
+    const int quadrant = int(q) & 3;
+    float result = 0.0;
+    if (quadrant == 0) {
+        result = cos_poly;
+    } else if (quadrant == 1) {
+        result = -sin_poly;
+    } else if (quadrant == 2) {
+        result = -cos_poly;
+    } else {
+        result = sin_poly;
+    }
+
+    data_d[get_doffset() + dst_idx(idx)] = D_TYPE(result);
 }

@@ -3,10 +3,6 @@
 #include "types.glsl"
 #include "sum_rows.glsl"
 
-#extension GL_EXT_control_flow_attributes : enable
-#extension GL_KHR_shader_subgroup_arithmetic : enable
-#extension GL_KHR_shader_subgroup_basic : enable
-
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
@@ -14,11 +10,8 @@ layout (binding = 1) buffer D {D_TYPE data_d[];};
 layout (binding = 2) readonly buffer T {D_TYPE data_t[];};
 
 layout (constant_id = 0) const uint BLOCK_SIZE = 128;
-layout (constant_id = 1) const uint SUBGROUP_SIZE = 32;
-
-#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
-
-shared FLOAT_TYPE temp[BLOCK_SIZE / SUBGROUP_SIZE];
+shared FLOAT_TYPE temp[BLOCK_SIZE];
+shared FLOAT_TYPE block_prefix;
 
 void main() {
     const uint row = gl_WorkGroupID.y;
@@ -34,33 +27,36 @@ void main() {
 
     const uint col = gl_GlobalInvocationID.x;
 
-    float v = 0;
+    FLOAT_TYPE v = 0;
     // prefetch value we're adding to
     if (col < p.n_cols) {
-        v = data_d[dst_idx + col];
+        v = FLOAT_TYPE(data_d[dst_idx + col]);
     }
 
     // compute the sum of all previous blocks
     uint c = tid;
-    float sum = 0;
+    FLOAT_TYPE sum = 0;
     while (c < gl_WorkGroupID.x) {
-        sum += data_t[c + gl_NumWorkGroups.x * row];
+        sum += FLOAT_TYPE(data_t[c + gl_NumWorkGroups.x * row]);
         c += BLOCK_SIZE;
     }
 
-    sum = subgroupAdd(sum);
-    if (gl_SubgroupInvocationID == 0) {
-        temp[gl_SubgroupID] = sum;
+    temp[tid] = sum;
+    barrier();
+
+    for (uint offset = BLOCK_SIZE >> 1; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            temp[tid] += temp[tid + offset];
+        }
+        barrier();
+    }
+    if (tid == 0) {
+        block_prefix = temp[0];
     }
     barrier();
-    sum = 0;
-    [[unroll]] for (uint s = 0; s < BLOCK_SIZE / SUBGROUP_SIZE; ++s) {
-        sum += temp[s];
-    }
 
     // Add the sum to what the first pass computed
     if (col < p.n_cols) {
-        data_d[dst_idx + col] = v + sum;
+        data_d[dst_idx + col] = D_TYPE(v + block_prefix);
     }
 }
-
