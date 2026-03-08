@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -305,7 +306,9 @@ void dispatch_binary_op(
     const std::string& shader_name,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
-    BinaryDispatchVariant variant = BinaryDispatchVariant::Standard);
+    BinaryDispatchVariant variant = BinaryDispatchVariant::Standard,
+    std::optional<std::array<uint32_t, 3>> explicit_grid = std::nullopt,
+    const std::vector<uint32_t>& specialization_constants = {});
 
 void dispatch_unary_op(
     const array& in,

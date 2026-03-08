@@ -80,6 +80,23 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             raise
         self._assert_outputs_close(gpu_out, cpu_out, atol=atol, rtol=rtol)
 
+    def test_fast_rms_norm_low_precision_regression(self):
+        for dtype, atol, rtol in (
+            (mx.float16, 5e-2, 5e-2),
+            (mx.bfloat16, 7e-2, 7e-2),
+        ):
+            with self.subTest(dtype=str(dtype)):
+                self._assert_cpu_gpu_same(
+                    lambda dtype=dtype: mx.fast.rms_norm(
+                        mx.arange(1, 1 + 2 * 16 * 128, dtype=dtype).reshape(2, 16, 128)
+                        / 128.0,
+                        mx.linspace(0.5, 1.5, 128, dtype=dtype),
+                        1e-5,
+                    ).astype(mx.float32),
+                    atol=atol,
+                    rtol=rtol,
+                )
+
 
 def _cases():
     return [

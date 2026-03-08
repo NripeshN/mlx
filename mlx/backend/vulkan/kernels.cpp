@@ -1125,7 +1125,9 @@ void dispatch_binary_op(
     const std::string& shader_name,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
-    BinaryDispatchVariant variant) {
+    BinaryDispatchVariant variant,
+    std::optional<std::array<uint32_t, 3>> explicit_grid,
+    const std::vector<uint32_t>& specialization_constants) {
   const auto push_constants = make_binary_push_constants(a, b, out);
   const auto spec_id = kernel_spec_id_for_binary_variant(variant);
 
@@ -1143,7 +1145,9 @@ void dispatch_binary_op(
         push_constants,
         push_constants.ne,
         cmd_buffer,
-        s);
+        s,
+        explicit_grid,
+        specialization_constants);
     return;
   }
 
@@ -1159,7 +1163,9 @@ void dispatch_binary_op(
       push_constants,
       push_constants.ne,
       cmd_buffer,
-      s);
+      s,
+      explicit_grid,
+      specialization_constants);
 }
 
 void dispatch_unary_op(
