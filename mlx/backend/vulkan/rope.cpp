@@ -4,7 +4,10 @@
 #include <cstring>
 
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/vulkan/allocator.h"
+#include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/fast_primitives.h"
 
 namespace mlx::core {
@@ -21,6 +24,48 @@ std::string rope_shader_name(Dtype dtype, bool traditional) {
     return traditional ? "rope_norm_f16_rte" : "rope_neox_f16_rte";
   }
   return {};
+}
+
+bool readback_array_bytes(
+    const array& input,
+    Stream s,
+    std::vector<char>& bytes) {
+  auto input_eval = input;
+  if (input_eval.status() == array::Status::unscheduled) {
+    return false;
+  }
+  input_eval.wait();
+
+  bytes.resize(input_eval.nbytes());
+  if (bytes.empty()) {
+    return true;
+  }
+
+  if (vulkan::VulkanContext::get().is_unified_memory()) {
+    const auto* src = input_eval.data<char>();
+    if (src == nullptr) {
+      return false;
+    }
+    std::memcpy(bytes.data(), src, bytes.size());
+    return true;
+  }
+
+  auto* src_buffer = static_cast<vulkan::VulkanBuffer*>(
+      const_cast<void*>(static_cast<const void*>(input_eval.buffer().ptr())));
+  if (src_buffer == nullptr || src_buffer->buffer == VK_NULL_HANDLE) {
+    return false;
+  }
+
+  vulkan::enqueue_owned_staging_readback(
+      s,
+      src_buffer->buffer,
+      static_cast<uint64_t>(input_eval.offset()),
+      bytes.size(),
+      [&bytes](const void* src, size_t size) {
+        std::memcpy(bytes.data(), src, size);
+      });
+  vulkan::synchronize_stream(s);
+  return true;
 }
 
 bool normalize_rope_input(
@@ -73,12 +118,12 @@ bool make_rope_positions(
     const array& offset,
     uint32_t batch,
     uint32_t steps,
-    array& positions) {
+    array& positions,
+    Stream s) {
   auto offset_eval = offset;
   if (offset_eval.status() == array::Status::unscheduled) {
     return false;
   }
-  offset_eval.wait();
   if (offset_eval.dtype() != int32 || offset_eval.ndim() > 1 ||
       offset_eval.offset() != 0 || !offset_eval.flags().row_contiguous) {
     return false;
@@ -92,10 +137,12 @@ bool make_rope_positions(
   positions.set_data(allocator::malloc(positions.nbytes()));
 
   auto* dst = positions.data<int32_t>();
-  const auto* src = offset_eval.data<int32_t>();
-  if ((dst == nullptr || src == nullptr) && positions.size() != 0) {
+  std::vector<char> src_bytes;
+  if ((dst == nullptr && positions.size() != 0) ||
+      !readback_array_bytes(offset_eval, s, src_bytes)) {
     return false;
   }
+  const auto* src = reinterpret_cast<const int32_t*>(src_bytes.data());
 
   if (offset_eval.size() == 1) {
     const int32_t base = src[0];
@@ -116,12 +163,11 @@ bool make_rope_positions(
   return true;
 }
 
-bool stage_rope_freqs(const array& input, int dims, array& freqs) {
+bool stage_rope_freqs(const array& input, int dims, array& freqs, Stream s) {
   auto input_eval = input;
   if (input_eval.status() == array::Status::unscheduled) {
     return false;
   }
-  input_eval.wait();
   if (input_eval.dtype() != float32 || input_eval.ndim() != 1 ||
       input_eval.shape(0) != dims / 2 || input_eval.offset() != 0 ||
       !input_eval.flags().row_contiguous) {
@@ -132,11 +178,12 @@ bool stage_rope_freqs(const array& input, int dims, array& freqs) {
   freqs.set_data(allocator::malloc(freqs.nbytes()));
 
   auto* dst = freqs.data<float>();
-  const auto* src = input_eval.data<float>();
-  if ((dst == nullptr || src == nullptr) && freqs.size() != 0) {
+  std::vector<char> src_bytes;
+  if ((dst == nullptr && freqs.size() != 0) ||
+      !readback_array_bytes(input_eval, s, src_bytes)) {
     return false;
   }
-  std::memcpy(dst, src, freqs.nbytes());
+  std::memcpy(dst, src_bytes.data(), freqs.nbytes());
   return true;
 }
 
@@ -242,13 +289,13 @@ bool try_eval_rope_vulkan(
   const uint32_t steps = checked_u32_size(x_norm.shape(2), "rope steps");
 
   array positions = offset;
-  if (!make_rope_positions(offset, batch, steps, positions)) {
+  if (!make_rope_positions(offset, batch, steps, positions, s)) {
     return false;
   }
 
   array freqs = positions;
   const bool has_freqs = inputs.size() == 3;
-  if (has_freqs && !stage_rope_freqs(inputs[2], dims, freqs)) {
+  if (has_freqs && !stage_rope_freqs(inputs[2], dims, freqs, s)) {
     return false;
   }
 

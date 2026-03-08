@@ -625,6 +625,25 @@ TEST_CASE("test gpu deferred scalar upload") {
   CHECK(array_equal(gpu, cpu, Device::cpu).item<bool>());
 }
 
+TEST_CASE("test gpu deferred rope readback") {
+  auto x_gpu =
+      reshape(arange(0.0f, 32.0f, 1.0f, float32, Device::gpu), {2, 2, 8});
+  auto x_cpu =
+      reshape(arange(0.0f, 32.0f, 1.0f, float32, Device::cpu), {2, 2, 8});
+  auto offset_gpu = array({1, 3}, int32);
+  auto offset_cpu = array({1, 3}, int32);
+  auto freqs_gpu = arange(1.0f, 5.0f, 1.0f, float32, Device::gpu);
+  auto freqs_cpu = arange(1.0f, 5.0f, 1.0f, float32, Device::cpu);
+
+  auto out_gpu = fast::rope(
+      x_gpu, 8, false, std::nullopt, 1.0f, offset_gpu, freqs_gpu, Device::gpu);
+  auto out_cpu = fast::rope(
+      x_cpu, 8, false, std::nullopt, 1.0f, offset_cpu, freqs_cpu, Device::cpu);
+
+  CHECK(allclose(out_gpu, out_cpu, 1e-5f, 1e-5f, false, Device::cpu)
+            .item<bool>());
+}
+
 TEST_CASE("test gpu deferred multi-submit retirement") {
   auto gpu_x = arange(0.0f, 1024.0f, 1.0f, float32, Device::gpu);
   auto cpu_x = arange(0.0f, 1024.0f, 1.0f, float32, Device::cpu);
