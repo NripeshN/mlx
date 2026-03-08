@@ -415,8 +415,7 @@ TEST_CASE("test gpu unary ops") {
   }
 
   {
-    auto x =
-        array({-0.999f, -0.5f, 0.0f, 0.5f, 0.999f}, {5}, float32, Device::cpu);
+    auto x = array({-0.999f, -0.5f, 0.0f, 0.5f, 0.999f}, {5}, float32);
     auto out_gpu = erfinv(x, Device::gpu);
     auto out_cpu = erfinv(x, Device::cpu);
     CHECK(allclose(out_gpu, out_cpu, 1e-5, 1e-5, false, Device::cpu)
