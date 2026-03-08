@@ -136,29 +136,40 @@ bool make_rope_positions(
       {static_cast<int>(batch), static_cast<int>(steps)}, int32, nullptr, {});
   positions.set_data(allocator::malloc(positions.nbytes()));
 
-  auto* dst = positions.data<int32_t>();
   std::vector<char> src_bytes;
-  if ((dst == nullptr && positions.size() != 0) ||
-      !readback_array_bytes(offset_eval, s, src_bytes)) {
+  if (!readback_array_bytes(offset_eval, s, src_bytes)) {
     return false;
   }
   const auto* src = reinterpret_cast<const int32_t*>(src_bytes.data());
+  std::vector<int32_t> host_positions(batch * steps, 0);
 
   if (offset_eval.size() == 1) {
     const int32_t base = src[0];
     for (uint32_t b = 0; b < batch; ++b) {
       for (uint32_t t = 0; t < steps; ++t) {
-        dst[b * steps + t] = base + static_cast<int32_t>(t);
+        host_positions[b * steps + t] = base + static_cast<int32_t>(t);
       }
     }
   } else {
     for (uint32_t b = 0; b < batch; ++b) {
       const int32_t base = src[b];
       for (uint32_t t = 0; t < steps; ++t) {
-        dst[b * steps + t] = base + static_cast<int32_t>(t);
+        host_positions[b * steps + t] = base + static_cast<int32_t>(t);
       }
     }
   }
+
+  auto* dst_buffer =
+      static_cast<vulkan::VulkanBuffer*>(positions.buffer().ptr());
+  if (dst_buffer == nullptr || dst_buffer->buffer == VK_NULL_HANDLE) {
+    return false;
+  }
+  vulkan::enqueue_owned_staging_upload(
+      s,
+      host_positions.data(),
+      host_positions.size() * sizeof(int32_t),
+      dst_buffer->buffer,
+      positions.offset());
 
   return true;
 }
@@ -177,13 +188,16 @@ bool stage_rope_freqs(const array& input, int dims, array& freqs, Stream s) {
   freqs = array({static_cast<int>(input_eval.shape(0))}, float32, nullptr, {});
   freqs.set_data(allocator::malloc(freqs.nbytes()));
 
-  auto* dst = freqs.data<float>();
   std::vector<char> src_bytes;
-  if ((dst == nullptr && freqs.size() != 0) ||
-      !readback_array_bytes(input_eval, s, src_bytes)) {
+  if (!readback_array_bytes(input_eval, s, src_bytes)) {
     return false;
   }
-  std::memcpy(dst, src_bytes.data(), freqs.nbytes());
+  auto* dst_buffer = static_cast<vulkan::VulkanBuffer*>(freqs.buffer().ptr());
+  if (dst_buffer == nullptr || dst_buffer->buffer == VK_NULL_HANDLE) {
+    return false;
+  }
+  vulkan::enqueue_owned_staging_upload(
+      s, src_bytes.data(), freqs.nbytes(), dst_buffer->buffer, freqs.offset());
   return true;
 }
 
@@ -254,16 +268,7 @@ bool try_eval_rope_vulkan(
   if (x.size() != 0) {
     array x_private(x.shape(), x.dtype(), nullptr, {});
     x_private.set_data(allocator::malloc(x_private.nbytes()));
-    if (x.flags().row_contiguous && x.offset() == 0) {
-      auto* dst = x_private.data<char>();
-      const auto* src = x.data<char>();
-      if ((dst == nullptr || src == nullptr) && x_private.nbytes() != 0) {
-        return false;
-      }
-      std::memcpy(dst, src, x_private.nbytes());
-    } else {
-      copy_gpu(x, x_private, CopyType::General, s);
-    }
+    copy_gpu(x, x_private, CopyType::General, s);
     x = x_private;
   }
 
@@ -312,7 +317,6 @@ bool try_eval_rope_vulkan(
   if (x_kernel.offset() != 0 || out_kernel.offset() != 0) {
     return false;
   }
-
   auto pc = make_rope_push_constants(
       x_kernel, out_kernel, dims, base, scale, forward, has_freqs);
   const std::array<uint32_t, 3> grid = {
@@ -358,19 +362,6 @@ bool RoPE::use_fallback(Stream s) {
 void RoPE::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  assert(outputs.size() == 1);
-  if (try_eval_rope_vulkan(
-          inputs,
-          outputs[0],
-          dims_,
-          traditional_,
-          base_,
-          scale_,
-          forward_,
-          stream())) {
-    return;
-  }
-
   ::mlx::core::gpu::synchronize(stream());
   auto fallback_outputs = fallback_(inputs);
   if (fallback_outputs.size() != outputs.size()) {

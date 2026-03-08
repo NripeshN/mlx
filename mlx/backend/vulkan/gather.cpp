@@ -26,6 +26,11 @@ bool try_eval_gather_vulkan(
     trace_vulkan_unsupported("Gather", "axis is out of range");
     return false;
   }
+  if (axis != 0) {
+    trace_vulkan_unsupported(
+        "Gather", "non-zero axis gather currently falls back to CPU");
+    return false;
+  }
 
   for (int i = 0; i < src_input.ndim(); ++i) {
     const int64_t expected = (i == axis) ? 1 : src_input.shape(i);
@@ -45,17 +50,6 @@ bool try_eval_gather_vulkan(
   }
 
   array src = src_input;
-  if (axis != 0) {
-    std::vector<int> perm(src.ndim());
-    perm[0] = axis;
-    int dst_axis = 1;
-    for (int src_axis = 0; src_axis < src.ndim(); ++src_axis) {
-      if (src_axis != axis) {
-        perm[dst_axis++] = src_axis;
-      }
-    }
-    src = transpose(src, perm, s);
-  }
   if (!src.flags().contiguous || src.offset() != 0 ||
       src.strides().back() != 1) {
     src = contiguous_copy_gpu(src, s);
@@ -79,14 +73,10 @@ bool try_eval_gather_vulkan(
   }
 
   array src_2d = reshape_in_eval(
-      src,
-      Shape{static_cast<int64_t>(axis_size), static_cast<int64_t>(slice_size)},
-      s);
-  array idx_1d =
-      reshape_in_eval(idx, Shape{static_cast<int64_t>(index_count)}, s);
+      src, Shape{static_cast<int>(axis_size), static_cast<int>(slice_size)}, s);
+  array idx_1d = reshape_in_eval(idx, Shape{static_cast<int>(index_count)}, s);
   array out_2d(
-      Shape{
-          static_cast<int64_t>(index_count), static_cast<int64_t>(slice_size)},
+      Shape{static_cast<int>(index_count), static_cast<int>(slice_size)},
       out.dtype(),
       nullptr,
       {});
@@ -194,23 +184,23 @@ bool try_eval_gather_axis_vulkan(
   array src_flat = reshape_in_eval(
       src,
       Shape{
-          static_cast<int64_t>(size_pre),
-          static_cast<int64_t>(size_axis),
-          static_cast<int64_t>(size_post)},
+          static_cast<int>(size_pre),
+          static_cast<int>(size_axis),
+          static_cast<int>(size_post)},
       s);
   array idx_flat = reshape_in_eval(
       idx,
       Shape{
-          static_cast<int64_t>(size_pre),
-          static_cast<int64_t>(idx_axis_size),
-          static_cast<int64_t>(size_post)},
+          static_cast<int>(size_pre),
+          static_cast<int>(idx_axis_size),
+          static_cast<int>(size_post)},
       s);
   array out_flat = reshape_in_eval(
       out_work,
       Shape{
-          static_cast<int64_t>(size_pre),
-          static_cast<int64_t>(idx_axis_size),
-          static_cast<int64_t>(size_post)},
+          static_cast<int>(size_pre),
+          static_cast<int>(idx_axis_size),
+          static_cast<int>(size_post)},
       s);
 
   try {
