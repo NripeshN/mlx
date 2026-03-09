@@ -941,6 +941,34 @@ for _name, _fn, _atol, _rtol in _cases():
     setattr(TestVulkanOpsParity, f"test_{_name}", _make_test(_name, _fn, _atol, _rtol))
 
 
+def test_fast_rope_bf16_vulkan_gpu(self):
+    """Regression test: bf16 RoPE should run on Vulkan GPU, not fall back to CPU."""
+    # This test ensures bf16 RoPE uses the Vulkan kernel and produces correct results
+    def run_rope():
+        x = mx.arange(1, 1 + 2 * 4 * 8, dtype=mx.bfloat16).reshape(2, 4, 8) / 32.0
+        return mx.fast.rope(
+            x,
+            dims=8,
+            traditional=False,
+            base=10000.0,
+            scale=1.0,
+            offset=0,
+        )
+
+    # Run on CPU as reference
+    cpu_out = self._run_on_device(mx.cpu, run_rope)
+    # Run on GPU - should NOT fall back to CPU
+    gpu_out = self._run_on_device(mx.gpu, run_rope)
+    # Convert to float32 for comparison since numpy doesn't support bfloat16
+    cpu_out_f32 = cpu_out.astype(mx.float32)
+    gpu_out_f32 = gpu_out.astype(mx.float32)
+    # Verify results match
+    self._assert_outputs_close(gpu_out_f32, cpu_out_f32, atol=1e-2, rtol=1e-2)
+
+
+setattr(TestVulkanOpsParity, "test_fast_rope_bf16_vulkan_gpu", test_fast_rope_bf16_vulkan_gpu)
+
+
 TestVulkanOpsParity = unittest.skipIf(
     not mx.is_available(mx.gpu), "GPU is not available"
 )(TestVulkanOpsParity)

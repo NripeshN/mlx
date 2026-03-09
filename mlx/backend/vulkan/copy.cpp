@@ -222,15 +222,10 @@ void copy_gpu_inplace(
   const bool shader_copy_type =
       ctype == CopyType::General || ctype == CopyType::GeneralGeneral;
 
-  const bool safe_bf16_f32_copy = !(in.dtype() == mlx::core::bfloat16 &&
-                                    out.dtype() == mlx::core::float32) ||
-      (in.flags().row_contiguous && out.flags().row_contiguous &&
-       in.offset() == 0 && out.offset() == 0);
-
   const bool shader_copy = shader_copy_type && !dynamic_i_offset &&
       !dynamic_o_offset && i_offset == 0 && o_offset == 0 && full_tensor_copy &&
-      safe_bf16_f32_copy && is_supported_copy_layout(in) &&
-      is_supported_copy_layout(out) && !shader_name.empty();
+      is_supported_copy_layout(in) && is_supported_copy_layout(out) &&
+      !shader_name.empty();
 
   const bool staging_scalar_fill = ctype == CopyType::Scalar &&
       !dynamic_i_offset && !dynamic_o_offset && i_offset == 0 &&

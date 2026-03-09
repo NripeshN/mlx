@@ -2156,7 +2156,19 @@ void process_shaders() {
       "rope_norm_f32_f16_rte",
       "rope_norm.comp",
       {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"RTE16", "1"}});
-  // Note: rope_norm_bf16 not registered - bf16 RoPE falls back to CPU
+  string_to_spv(
+      "rope_norm_bf16",
+      "rope_norm.comp",
+      {{"A_TYPE", "uint16_t"},
+       {"ROPE_D_TYPE", "uint16_t"},
+       {"BF16_TYPE", "1"}});
+  string_to_spv(
+      "rope_norm_bf16_rte",
+      "rope_norm.comp",
+      {{"A_TYPE", "uint16_t"},
+       {"ROPE_D_TYPE", "uint16_t"},
+       {"RTE16", "1"},
+       {"BF16_TYPE", "1"}});
 
   string_to_spv(
       "rope_neox_f32",
@@ -2178,7 +2190,19 @@ void process_shaders() {
       "rope_neox_f32_f16_rte",
       "rope_neox.comp",
       {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"RTE16", "1"}});
-  // Note: rope_neox_bf16 not registered - bf16 RoPE falls back to CPU
+  string_to_spv(
+      "rope_neox_bf16",
+      "rope_neox.comp",
+      {{"A_TYPE", "uint16_t"},
+       {"ROPE_D_TYPE", "uint16_t"},
+       {"BF16_TYPE", "1"}});
+  string_to_spv(
+      "rope_neox_bf16_rte",
+      "rope_neox.comp",
+      {{"A_TYPE", "uint16_t"},
+       {"ROPE_D_TYPE", "uint16_t"},
+       {"RTE16", "1"},
+       {"BF16_TYPE", "1"}});
 
   string_to_spv(
       "rope_multi_f32",
