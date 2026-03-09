@@ -66,6 +66,7 @@ CPU_FALLBACK_STATE(Equal)
 void Compiled::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  vulkan::ScopedSyncLabel sync_label("compiled_cpu_fallback");
   ::mlx::core::gpu::synchronize(stream());
   auto cpu_stream = default_stream(Device::cpu);
   Compiled cpu_compiled(cpu_stream, inputs_, outputs_, tape_, constant_ids_);
@@ -74,6 +75,7 @@ void Compiled::eval_gpu(
 }
 
 void Load::eval_gpu(const std::vector<array>& inputs, array& out) {
+  vulkan::ScopedSyncLabel sync_label("load_cpu_fallback");
   ::mlx::core::gpu::synchronize(stream());
   auto cpu_stream = default_stream(Device::cpu);
   Load cpu_load(cpu_stream, reader_, offset_, swap_endianness_);

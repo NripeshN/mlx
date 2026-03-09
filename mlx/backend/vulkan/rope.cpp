@@ -286,6 +286,7 @@ void RoPE::eval_gpu(
     return;
   }
 
+  vulkan::ScopedSyncLabel sync_label("rope_cpu_fallback");
   ::mlx::core::gpu::synchronize(stream());
   auto fallback_outputs = fallback_(inputs);
   if (fallback_outputs.size() != outputs.size()) {

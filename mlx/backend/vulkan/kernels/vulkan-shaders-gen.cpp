@@ -1471,6 +1471,14 @@ void process_shaders() {
       "copy.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}});
   string_to_spv(
+      "cpy_bf16_f32",
+      "copy.comp",
+      {{"A_TYPE", "uint16_t"}, {"D_TYPE", "float"}, {"DATA_A_BF16", "1"}});
+  string_to_spv(
+      "cpy_bf16_bf16",
+      "copy.comp",
+      {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}, {"DATA_A_BF16", "1"}});
+  string_to_spv(
       "contig_cpy_f32_f32",
       "contig_copy.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
@@ -1502,6 +1510,14 @@ void process_shaders() {
       "contig_cpy_f32_bf16",
       "contig_copy.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "uint16_t"}, {"DATA_D_BF16", "1"}});
+  string_to_spv(
+      "contig_cpy_bf16_f32",
+      "contig_copy.comp",
+      {{"A_TYPE", "uint16_t"}, {"D_TYPE", "float"}, {"DATA_A_BF16", "1"}});
+  string_to_spv(
+      "contig_cpy_bf16_bf16",
+      "contig_copy.comp",
+      {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}, {"DATA_A_BF16", "1"}});
   string_to_spv(
       "cpy_f32_i32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "int"}});
   string_to_spv(

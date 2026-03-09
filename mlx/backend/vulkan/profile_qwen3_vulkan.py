@@ -209,10 +209,15 @@ class SyncTraceAnalyzer:
             avg_ops = (
                 sum(submit_ops) / len(submit_ops) if submit_ops else 0.0
             )
+            explicit_sync = sum(
+                count
+                for (p, reason), count in self.submit_counts.items()
+                if p == phase and reason.startswith("explicit synchronize")
+            )
             lines.append(
                 f"{phase:<12} {submit_total:<8} {avg_ops:<8.2f} "
                 f"{self.submit_counts[(phase, 'hazard overlap')]:<8} "
-                f"{self.submit_counts[(phase, 'explicit synchronize')]:<8} "
+                f"{explicit_sync:<8} "
                 f"{self.submit_counts[(phase, 'finalize')]:<8} "
                 f"{self.submit_counts[(phase, 'threshold reached')]:<8} "
                 f"{self.barrier_counts[(phase, 'hazard-overlap')]:<8} "
@@ -229,6 +234,25 @@ class SyncTraceAnalyzer:
             lines.append(
                 f"{phase:<12} submit={self.hazard_boundary_counts[(phase, 'submit')]} barrier={self.hazard_boundary_counts[(phase, 'barrier')]}"
             )
+
+        lines.append("")
+        lines.append("EXPLICIT SYNC REASONS")
+        lines.append("-" * 100)
+        for phase in phases:
+            phase_reasons = sorted(
+                (
+                    (reason, count)
+                    for (p, reason), count in self.submit_counts.items()
+                    if p == phase and reason.startswith("explicit synchronize")
+                ),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            if not phase_reasons:
+                continue
+            lines.append(f"{phase}:")
+            for reason, count in phase_reasons[:8]:
+                lines.append(f"  {reason:<60} {count}")
 
         lines.append("=" * 100)
         return "\n".join(lines)

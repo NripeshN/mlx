@@ -12,6 +12,7 @@
 #include "mlx/stream.h"
 
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <string>
 
@@ -34,6 +35,34 @@ std::string copy_dtype_suffix(Dtype dtype) {
   }
 }
 
+const char* copy_type_name(mlx::core::CopyType ctype) {
+  switch (ctype) {
+    case mlx::core::CopyType::Scalar:
+      return "scalar";
+    case mlx::core::CopyType::Vector:
+      return "vector";
+    case mlx::core::CopyType::General:
+      return "general";
+    case mlx::core::CopyType::GeneralGeneral:
+      return "general_general";
+  }
+  return "unknown";
+}
+
+template <typename Seq>
+std::string seq_to_string(const Seq& seq) {
+  std::ostringstream oss;
+  oss << "[";
+  for (size_t i = 0; i < seq.size(); ++i) {
+    if (i > 0) {
+      oss << ", ";
+    }
+    oss << seq[i];
+  }
+  oss << "]";
+  return oss.str();
+}
+
 bool is_supported_copy_layout(const mlx::core::array& arr) {
   if (arr.ndim() > 4 || arr.size() > std::numeric_limits<uint32_t>::max()) {
     return false;
@@ -54,6 +83,14 @@ bool is_supported_copy_layout(const mlx::core::array& arr) {
   return true;
 }
 
+bool trace_copy_dispatch_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_VULKAN_TRACE_COPY_DISPATCH");
+    return env != nullptr && std::string(env) != "0";
+  }();
+  return enabled;
+}
+
 std::string get_copy_shader_name(
     const mlx::core::array& in,
     mlx::core::array& out) {
@@ -72,6 +109,22 @@ std::string get_copy_shader_name(
     }
   }
 
+  if (in.offset() == 0 && out.offset() == 0 && in.flags().row_contiguous &&
+      out.flags().row_contiguous) {
+    if (in.dtype() == mlx::core::float32 &&
+        out.dtype() == mlx::core::bfloat16) {
+      return "contig_cpy_f32_bf16";
+    }
+    if (in.dtype() == mlx::core::bfloat16 &&
+        out.dtype() == mlx::core::float32) {
+      return "contig_cpy_bf16_f32";
+    }
+    if (in.dtype() == mlx::core::bfloat16 &&
+        out.dtype() == mlx::core::bfloat16) {
+      return "contig_cpy_bf16_bf16";
+    }
+  }
+
   auto src_suffix = copy_dtype_suffix(in.dtype());
   auto dst_suffix = copy_dtype_suffix(out.dtype());
   if (src_suffix.empty() || dst_suffix.empty()) {
@@ -83,6 +136,10 @@ std::string get_copy_shader_name(
       (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::float16) ||
       (in.dtype() == mlx::core::float16 && out.dtype() == mlx::core::float16) ||
       (in.dtype() == mlx::core::float16 && out.dtype() == mlx::core::float32) ||
+      (in.dtype() == mlx::core::bfloat16 &&
+       out.dtype() == mlx::core::float32) ||
+      (in.dtype() == mlx::core::bfloat16 &&
+       out.dtype() == mlx::core::bfloat16) ||
       (in.dtype() == mlx::core::float32 &&
        out.dtype() == mlx::core::bfloat16) ||
       (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::int32) ||
@@ -159,11 +216,20 @@ void copy_gpu_inplace(
       data_shape == out.shape() && i_strides == in.strides() &&
       o_strides == out.strides();
 
-  const bool shader_copy =
-      (ctype == CopyType::General || ctype == CopyType::GeneralGeneral) &&
-      !dynamic_i_offset && !dynamic_o_offset && i_offset == 0 &&
-      o_offset == 0 && full_tensor_copy && is_supported_copy_layout(in) &&
-      is_supported_copy_layout(out) && !get_copy_shader_name(in, out).empty();
+  const auto shader_name = get_copy_shader_name(in, out);
+
+  const bool shader_copy_type =
+      ctype == CopyType::General || ctype == CopyType::GeneralGeneral;
+
+  const bool safe_bf16_f32_copy = !(in.dtype() == mlx::core::bfloat16 &&
+                                    out.dtype() == mlx::core::float32) ||
+      (in.flags().row_contiguous && out.flags().row_contiguous &&
+       in.offset() == 0 && out.offset() == 0);
+
+  const bool shader_copy = shader_copy_type && !dynamic_i_offset &&
+      !dynamic_o_offset && i_offset == 0 && o_offset == 0 && full_tensor_copy &&
+      safe_bf16_f32_copy && is_supported_copy_layout(in) &&
+      is_supported_copy_layout(out) && !shader_name.empty();
 
   const bool staging_scalar_fill = ctype == CopyType::Scalar &&
       !dynamic_i_offset && !dynamic_o_offset && i_offset == 0 &&
@@ -188,6 +254,14 @@ void copy_gpu_inplace(
   }
 
   if (!raw_buffer_copy && !shader_copy) {
+    std::ostringstream sync_reason;
+    sync_reason << "copy_cpu_fallback:" << copy_type_name(ctype) << ":"
+                << copy_dtype_suffix(in.dtype()) << "->"
+                << copy_dtype_suffix(out.dtype())
+                << ":full=" << (full_tensor_copy ? 1 : 0)
+                << ":src_rc=" << (in.flags().row_contiguous ? 1 : 0)
+                << ":dst_rc=" << (out.flags().row_contiguous ? 1 : 0);
+    vulkan::ScopedSyncLabel sync_label(sync_reason.str());
     gpu::synchronize(s);
     auto cpu_stream = default_stream(Device::cpu);
     copy_cpu_inplace(
@@ -229,11 +303,27 @@ void copy_gpu_inplace(
     vulkan::retain_array_for_stream(s, out);
 
   } else if (shader_copy) {
-    auto shader_name = get_copy_shader_name(in, out);
+    if (trace_copy_dispatch_enabled() &&
+        (shader_name == "cpy_bf16_f32" || shader_name == "cpy_bf16_bf16")) {
+      std::cerr << "[vulkan-copy] shader=" << shader_name
+                << " ctype=" << copy_type_name(ctype)
+                << " in_shape=" << seq_to_string(in.shape())
+                << " out_shape=" << seq_to_string(out.shape())
+                << " in_offset=" << in.offset()
+                << " out_offset=" << out.offset() << " i_offset=" << i_offset
+                << " o_offset=" << o_offset
+                << " in_strides=" << seq_to_string(in.strides())
+                << " out_strides=" << seq_to_string(out.strides()) << "\n";
+    }
     try {
       vulkan::dispatch_unary_op(in, out, shader_name, cmd_buffer, s);
     } catch (const std::runtime_error&) {
       vulkan::end_command_recording(s.index);
+      std::ostringstream sync_reason;
+      sync_reason << "copy_dispatch_cpu_fallback:" << copy_type_name(ctype)
+                  << ":" << copy_dtype_suffix(in.dtype()) << "->"
+                  << copy_dtype_suffix(out.dtype());
+      vulkan::ScopedSyncLabel sync_label(sync_reason.str());
       gpu::synchronize(s);
       auto cpu_stream = default_stream(Device::cpu);
       copy_cpu_inplace(
@@ -312,6 +402,10 @@ void concatenate_gpu(
     array& out,
     int axis,
     const Stream& s) {
+  std::ostringstream sync_reason;
+  sync_reason << "concatenate_cpu_fallback:" << copy_dtype_suffix(out.dtype())
+              << ":axis=" << axis;
+  vulkan::ScopedSyncLabel sync_label(sync_reason.str());
   ::mlx::core::gpu::synchronize(s);
   auto cpu_stream = default_stream(Device::cpu);
   Concatenate cpu_concatenate(cpu_stream, axis);

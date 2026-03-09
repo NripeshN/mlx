@@ -97,6 +97,8 @@ void eval_cpu_fallback_on_stream(
     array& out,
     Stream stream,
     Args&&... args) {
+  vulkan::ScopedSyncLabel sync_label(
+      std::string("cpu_fallback:") + typeid(Primitive).name());
   ::mlx::core::gpu::synchronize(stream);
   eval_cpu_fallback<Primitive>(inputs, out, std::forward<Args>(args)...);
 }
@@ -124,6 +126,8 @@ void eval_cpu_fallback_multi_on_stream(
     std::vector<array>& outputs,
     Stream stream,
     Args&&... args) {
+  vulkan::ScopedSyncLabel sync_label(
+      std::string("cpu_fallback_multi:") + typeid(Primitive).name());
   ::mlx::core::gpu::synchronize(stream);
   eval_cpu_fallback_multi<Primitive>(
       inputs, outputs, std::forward<Args>(args)...);

@@ -10,6 +10,7 @@ void eval(array& arr) {
   auto outputs = arr.outputs();
   auto s = arr.primitive().stream();
 
+  vulkan::record_primitive_for_stream(s, arr.primitive().name());
   vulkan::begin_primitive_tracking(s, arr.inputs(), outputs);
   {
     // Keep tracer inputs alive so they are not donated.

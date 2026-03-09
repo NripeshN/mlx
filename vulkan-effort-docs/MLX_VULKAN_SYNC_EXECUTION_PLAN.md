@@ -21,7 +21,7 @@ This document tracks the work needed to move MLX Vulkan from a submit-on-hazard 
 - [x] Step 8 - Make Vulkan `gpu::finalize()` submit deferred work without turning it into a full stream synchronize.
 - [x] Step 9 - Route Vulkan event/fence waits through stream retirement so async finalize still signals completion callbacks correctly.
 - [x] Step 10 - Revalidate Qwen3 and focused tests after reducing finalize-driven explicit synchronize submits.
-- [ ] Step 11 - Attribute the remaining explicit synchronize submits to concrete call sites in Vulkan/Qwen3 inference.
+- [x] Step 11 - Attribute the remaining explicit synchronize submits to concrete call sites in Vulkan/Qwen3 inference.
 - [ ] Step 12 - Remove or narrow the hottest remaining synchronize callers without regressing correctness.
 - [ ] Step 13 - Revalidate the reduced-sync path with the same focused suites and the Qwen3 profiler.
 
@@ -43,3 +43,5 @@ This document tracks the work needed to move MLX Vulkan from a submit-on-hazard 
 - Validation for this run used Vulkan rebuilds, focused CPU/GPU unit coverage, the Vulkan parity suite, C++ RoPE coverage, and repeated short Qwen3 profiler passes.
 - The next bottleneck is explicit synchronize traffic driven by Vulkan `gpu::finalize()`, which still behaves like a blocking synchronize instead of a non-blocking commit.
 - Vulkan `gpu::finalize()` now submits without waiting, and Vulkan event/fence waits retire the source stream on demand. That change is correct, but short Qwen3 profiling shows only a small shift from `explicit synchronize` submits to `finalize`, so more sync-site attribution is still needed.
+- Sync attribution now identifies the dominant remaining reasons as BF16 copy fallbacks, concatenate fallback on axis 3, RoPE fallback, compiled fallback, and a smaller matmul fallback slice.
+- BF16 copy support is now always on for stable paths: contiguous `bf16 -> f32`, contiguous `bf16 -> bf16`, and the default deferred-op threshold is reduced to `8`, which keeps Qwen3 stable on the current Radeon path while preserving the new BF16 copy coverage.

@@ -24,6 +24,7 @@
 
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/vulkan/allocator.h"
+#include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/stream.h"
@@ -52,10 +53,10 @@ uint32_t max_deferred_ops() {
         const int parsed = std::stoi(env);
         return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
       } catch (...) {
-        return 32u;
+        return 8u;
       }
     }
-    return 32u;
+    return 8u;
   }();
   return value;
 }
@@ -199,6 +200,22 @@ void throw_if_vk_error(VkResult result, const std::string& context) {
   }
 }
 
+thread_local std::vector<std::string> sync_label_stack;
+
+std::string current_sync_label() {
+  return sync_label_stack.empty() ? std::string{} : sync_label_stack.back();
+}
+
+void push_sync_label(std::string label) {
+  sync_label_stack.push_back(std::move(label));
+}
+
+void pop_sync_label() {
+  if (!sync_label_stack.empty()) {
+    sync_label_stack.pop_back();
+  }
+}
+
 } // namespace
 
 // Stream data structure for Vulkan
@@ -298,6 +315,7 @@ struct StreamData {
   std::vector<BufferAccessRange> unsynced_reads;
   std::vector<BufferAccessRange> unsynced_writes;
   std::unordered_map<std::string, ScratchSlot> scratch_slots;
+  std::deque<std::string> recent_primitives;
 };
 
 class VulkanDevice {
@@ -332,10 +350,18 @@ class VulkanDevice {
           << " rec_epoch=" << stream->recording_epoch
           << " inflight=" << stream->in_flight_submissions.size()
           << " rec_ops=" << stream->recorded_ops;
+      auto label = current_sync_label();
+      if (!label.empty()) {
+        oss << " label='" << label << "'";
+      }
       trace_sync(oss.str());
     }
     if (stream->recording) {
-      submit_commands(stream, "explicit synchronize");
+      auto label = current_sync_label();
+      submit_commands(
+          stream,
+          label.empty() ? std::string("explicit synchronize")
+                        : std::string("explicit synchronize:") + label);
     }
 
     retire_submissions(stream, true);
@@ -504,6 +530,15 @@ class VulkanDevice {
     auto it = stream->scratch_slots.find(lane);
     if (it != stream->scratch_slots.end()) {
       it->second.needs_barrier = true;
+    }
+  }
+
+  void record_primitive(const Stream& s, std::string name) {
+    auto* stream = get_stream(s.index);
+    stream->recent_primitives.push_back(std::move(name));
+    constexpr size_t kRecentPrimitiveLimit = 8;
+    while (stream->recent_primitives.size() > kRecentPrimitiveLimit) {
+      stream->recent_primitives.pop_front();
     }
   }
 
@@ -976,7 +1011,7 @@ class VulkanDevice {
     return stream;
   }
 
-  void submit_commands(StreamData* stream, const char* submit_reason) {
+  void submit_commands(StreamData* stream, std::string submit_reason) {
     if (!stream->recording) {
       return;
     }
@@ -999,6 +1034,16 @@ class VulkanDevice {
           << " rec_ops=" << stream->recorded_ops
           << " inflight=" << stream->in_flight_submissions.size() << " reason='"
           << submit_reason << "'";
+      if (!stream->recent_primitives.empty()) {
+        oss << " recent_primitives='";
+        for (size_t i = 0; i < stream->recent_primitives.size(); ++i) {
+          if (i > 0) {
+            oss << ",";
+          }
+          oss << stream->recent_primitives[i];
+        }
+        oss << "'";
+      }
       trace_sync(oss.str());
     }
 
@@ -1024,6 +1069,7 @@ class VulkanDevice {
       stream->unsynced_reads.clear();
       stream->unsynced_writes.clear();
       clear_scratch_barriers(stream);
+      stream->recent_primitives.clear();
       stream->recording_resources.reset();
       KernelManager::get().reclaim_descriptor_set_epoch(
           stream->stream_index, submit_rec_epoch);
@@ -1053,6 +1099,16 @@ class VulkanDevice {
               << " submit_reason='" << submit_reason << "'"
               << " reset_pool=" << format_vk_result(reset_pool_result)
               << " device='" << props.deviceName << "'";
+      if (!stream->recent_primitives.empty()) {
+        details << " recent_primitives='";
+        for (size_t i = 0; i < stream->recent_primitives.size(); ++i) {
+          if (i > 0) {
+            details << ",";
+          }
+          details << stream->recent_primitives[i];
+        }
+        details << "'";
+      }
 
       trace_sync(context + details.str());
 
@@ -1132,7 +1188,7 @@ class VulkanDevice {
         std::move(stream->recording_keepalive_resources);
     submission.completion_callbacks =
         std::move(stream->recording_completion_callbacks);
-    submission.submit_reason = submit_reason;
+    submission.submit_reason = std::move(submit_reason);
 
     stream->recording_resources.reset();
     stream->recording_refs.clear();
@@ -1142,6 +1198,7 @@ class VulkanDevice {
     stream->unsynced_reads.clear();
     stream->unsynced_writes.clear();
     clear_scratch_barriers(stream);
+    stream->recent_primitives.clear();
     stream->in_flight_submissions.push_back(std::move(submission));
 
     if (trace_sync_enabled()) {
@@ -1175,6 +1232,18 @@ void synchronize(Stream s) {
 } // namespace mlx::core::gpu
 
 namespace mlx::core::vulkan {
+
+ScopedSyncLabel::ScopedSyncLabel(std::string label) : active_(!label.empty()) {
+  if (active_) {
+    push_sync_label(std::move(label));
+  }
+}
+
+ScopedSyncLabel::~ScopedSyncLabel() {
+  if (active_) {
+    pop_sync_label();
+  }
+}
 
 // Expose VulkanDevice methods to other files
 VkCommandBuffer begin_command_recording(int stream_index) {
@@ -1296,6 +1365,10 @@ array acquire_scratch_array(
 
 void mark_scratch_array_written(const Stream& s, const std::string& lane) {
   VulkanDevice::get().mark_scratch_written(s, lane);
+}
+
+void record_primitive_for_stream(const Stream& s, std::string name) {
+  VulkanDevice::get().record_primitive(s, std::move(name));
 }
 
 void begin_primitive_tracking(

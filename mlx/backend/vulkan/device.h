@@ -15,6 +15,15 @@
 
 namespace mlx::core::vulkan {
 
+class ScopedSyncLabel {
+ public:
+  explicit ScopedSyncLabel(std::string label);
+  ~ScopedSyncLabel();
+
+ private:
+  bool active_{false};
+};
+
 // Command buffer management
 VkCommandBuffer begin_command_recording(int stream_index);
 void end_command_recording(int stream_index);
@@ -43,6 +52,7 @@ array acquire_scratch_array(
     Shape shape,
     Dtype dtype);
 void mark_scratch_array_written(const Stream& s, const std::string& lane);
+void record_primitive_for_stream(const Stream& s, std::string name);
 
 // Primitive-level hazard tracking for deferred recording
 void begin_primitive_tracking(

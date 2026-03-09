@@ -982,6 +982,7 @@ void RMSNormVJP::eval_gpu(
 void ConvertFP8::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  vulkan::ScopedSyncLabel sync_label("convert_fp8_cpu_fallback");
   ::mlx::core::gpu::synchronize(stream());
   auto cpu_stream = default_stream(Device::cpu);
   fast::ConvertFP8 cpu_convert(cpu_stream, state());
@@ -992,6 +993,7 @@ void ConvertFP8::eval_gpu(
 void Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  vulkan::ScopedSyncLabel sync_label("quantize_cpu_fallback");
   ::mlx::core::gpu::synchronize(stream());
   auto fallback_outputs = fallback_(inputs);
   if (fallback_outputs.size() != outputs.size()) {
