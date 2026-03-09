@@ -537,14 +537,13 @@ bool try_eval_flash_attention_vulkan(
       return false;
     }
 
-    vulkan::synchronize_stream(s);
-
-    array out_transposed = swapaxes(out_storage, 1, 2, s);
-    eval(out_transposed);
-    array out_final = out_transposed;
-    if (out.dtype() != float32) {
-      out_final = astype(out_final, out.dtype(), s);
+    array out_transposed = swapaxes_in_eval(out_storage, 1, 2);
+    if (out.dtype() == float32) {
+      copy_gpu(out_transposed, out, CopyType::General, s);
+      return true;
     }
+
+    array out_final = astype(out_transposed, out.dtype(), s);
     eval(out_final);
     copy_gpu(out_final, out, CopyType::General, s);
     return true;
