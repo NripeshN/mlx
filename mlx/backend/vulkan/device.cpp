@@ -65,12 +65,9 @@ bool submit_on_hazard_boundary() {
       return std::string(env) != "0";
     }
 
-    // Submit on detected read/write hazards by default. A plain pipeline
-    // barrier is not sufficient for some decode workloads that update and then
-    // reuse KV cache buffers across deferred graph construction steps. Keeping
-    // deferred submission enabled still lets hazard-free command streams batch
-    // normally.
-    return true;
+    // Barrier-first by default. Keep submit-on-hazard available as an explicit
+    // escape hatch while we validate and tighten the Vulkan dependency model.
+    return false;
   }();
   return enabled;
 }

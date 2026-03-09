@@ -751,6 +751,8 @@ def main():
         print(
             f"MLX_VULKAN_DEFERRED_SUBMISSION: {os.environ['MLX_VULKAN_DEFERRED_SUBMISSION']}"
         )
+    if os.environ.get("MLX_VULKAN_SUBMIT_ON_HAZARD"):
+        print(f"MLX_VULKAN_SUBMIT_ON_HAZARD: {os.environ['MLX_VULKAN_SUBMIT_ON_HAZARD']}")
     if os.environ.get("MLX_VULKAN_TRACE_FALLBACKS"):
         print(f"MLX_VULKAN_TRACE_FALLBACKS: {os.environ['MLX_VULKAN_TRACE_FALLBACKS']}")
     if os.environ.get("MLX_VULKAN_TRACE_SYNC"):
@@ -822,6 +824,11 @@ Deferred submission is ENABLED by default.
 To disable deferred submission (use immediate submission):
 
   MLX_VULKAN_DEFERRED_SUBMISSION=0 python mlx/backend/vulkan/profile_qwen3_vulkan.py
+
+Barrier-first hazard handling is now the default.
+To temporarily restore the old submit-on-hazard behavior:
+
+  MLX_VULKAN_SUBMIT_ON_HAZARD=1 python mlx/backend/vulkan/profile_qwen3_vulkan.py
 """)
     print("=" * 100)
 
