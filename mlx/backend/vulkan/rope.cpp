@@ -21,6 +21,9 @@ std::string rope_shader_name(Dtype dtype, bool traditional) {
   if (dtype == float16) {
     return traditional ? "rope_norm_f16_rte" : "rope_neox_f16_rte";
   }
+  if (dtype == bfloat16) {
+    return traditional ? "rope_norm_bf16_rte" : "rope_neox_bf16_rte";
+  }
   return {};
 }
 

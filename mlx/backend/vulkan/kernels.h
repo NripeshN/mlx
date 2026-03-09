@@ -380,6 +380,20 @@ void dispatch_binary_op(
     std::optional<std::array<uint32_t, 3>> explicit_grid = std::nullopt,
     const std::vector<uint32_t>& specialization_constants = {});
 
+void dispatch_binary_op(
+    const array& a,
+    const array& b,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    BinaryDispatchVariant variant,
+    std::optional<std::array<uint32_t, 3>> explicit_grid,
+    const std::vector<uint32_t>& specialization_constants,
+    float param1,
+    float param2 = 0.0f,
+    int32_t param3 = 0);
+
 void dispatch_unary_op(
     const array& in,
     array& out,

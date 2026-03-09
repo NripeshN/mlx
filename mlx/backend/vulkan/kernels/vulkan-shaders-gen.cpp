@@ -1477,7 +1477,10 @@ void process_shaders() {
   string_to_spv(
       "cpy_bf16_bf16",
       "copy.comp",
-      {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}, {"DATA_A_BF16", "1"}});
+      {{"A_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"DATA_A_BF16", "1"},
+       {"DATA_D_BF16", "1"}});
   string_to_spv(
       "contig_cpy_f32_f32",
       "contig_copy.comp",
@@ -1517,7 +1520,10 @@ void process_shaders() {
   string_to_spv(
       "contig_cpy_bf16_bf16",
       "contig_copy.comp",
-      {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}, {"DATA_A_BF16", "1"}});
+      {{"A_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"DATA_A_BF16", "1"},
+       {"DATA_D_BF16", "1"}});
   string_to_spv(
       "cpy_f32_i32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "int"}});
   string_to_spv(
@@ -1774,6 +1780,13 @@ void process_shaders() {
       "concat_i32",
       "concat.comp",
       {{"A_TYPE", "int"}, {"B_TYPE", "int"}, {"D_TYPE", "int"}});
+  string_to_spv(
+      "concat_bf16",
+      "concat.comp",
+      {{"A_TYPE", "uint16_t"},
+       {"B_TYPE", "uint16_t"},
+       {"D_TYPE", "uint16_t"},
+       {"OPTIMIZATION_ERROR_WORKAROUND", "1"}});
 
   string_to_spv(
       "upscale_f32",
@@ -2137,6 +2150,14 @@ void process_shaders() {
       "rope_norm_f32_f16_rte",
       "rope_norm.comp",
       {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"RTE16", "1"}});
+  string_to_spv(
+      "rope_norm_bf16",
+      "rope_norm.comp",
+      {{"A_TYPE", "uint16_t"}, {"ROPE_D_TYPE", "uint16_t"}});
+  string_to_spv(
+      "rope_norm_bf16_rte",
+      "rope_norm.comp",
+      {{"A_TYPE", "uint16_t"}, {"ROPE_D_TYPE", "uint16_t"}, {"RTE16", "1"}});
 
   string_to_spv(
       "rope_neox_f32",
@@ -2158,6 +2179,14 @@ void process_shaders() {
       "rope_neox_f32_f16_rte",
       "rope_neox.comp",
       {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"RTE16", "1"}});
+  string_to_spv(
+      "rope_neox_bf16",
+      "rope_neox.comp",
+      {{"A_TYPE", "uint16_t"}, {"ROPE_D_TYPE", "uint16_t"}});
+  string_to_spv(
+      "rope_neox_bf16_rte",
+      "rope_neox.comp",
+      {{"A_TYPE", "uint16_t"}, {"ROPE_D_TYPE", "uint16_t"}, {"RTE16", "1"}});
 
   string_to_spv(
       "rope_multi_f32",

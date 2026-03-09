@@ -45,12 +45,12 @@ if [ "$BUILD_WHEEL" = "1" ]; then
 else
   if [ -n "${PIP_VERBOSE_FLAG}" ]; then
     CMAKE_ARGS="$CMAKE_ARGS" pip install "$PIP_VERBOSE_FLAG" -e . \
-      --config-settings=build_ext.build-temp=build \
-      --config-settings=build_ext.build-lib=build/lib
+      --config-settings=build_ext.build-temp=$PWD/build \
+      --config-settings=build_ext.build-lib=$PWD/build/lib
   else
     CMAKE_ARGS="$CMAKE_ARGS" pip install -e . \
-      --config-settings=build_ext.build-temp=build \
-      --config-settings=build_ext.build-lib=build/lib
+      --config-settings=build_ext.build-temp=$PWD/build \
+      --config-settings=build_ext.build-lib=$PWD/build/lib
   fi
   # Build C++ tests
   echo "Building C++ tests..."

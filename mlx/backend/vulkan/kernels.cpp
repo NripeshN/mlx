@@ -1175,6 +1175,60 @@ void dispatch_binary_op(
       specialization_constants);
 }
 
+void dispatch_binary_op(
+    const array& a,
+    const array& b,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    BinaryDispatchVariant variant,
+    std::optional<std::array<uint32_t, 3>> explicit_grid,
+    const std::vector<uint32_t>& specialization_constants,
+    float param1,
+    float param2,
+    int32_t param3) {
+  const auto push_constants =
+      make_binary_push_constants(a, b, out, param1, param2, param3);
+  const auto spec_id = kernel_spec_id_for_binary_variant(variant);
+
+  if (variant == BinaryDispatchVariant::AddWithPartials) {
+    const std::array<BoundArray, 4> bound_arrays = {{
+        {&a, "src0"},
+        {&b, "src1"},
+        {&out, "dst"},
+        {&out, "partial"},
+    }};
+    dispatch_with_spec(
+        shader_name,
+        spec_id,
+        bound_arrays,
+        push_constants,
+        push_constants.ne,
+        cmd_buffer,
+        s,
+        explicit_grid,
+        specialization_constants);
+    return;
+  }
+
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&a, "src0"},
+      {&b, "src1"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      spec_id,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s,
+      explicit_grid,
+      specialization_constants);
+}
+
 void dispatch_unary_op(
     const array& in,
     array& out,
