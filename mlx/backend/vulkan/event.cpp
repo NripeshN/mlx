@@ -55,7 +55,28 @@ void Event::wait(Stream stream) {
     return;
   }
 
-  wait();
+  auto* counter = static_cast<EventCounter*>(event_.get());
+  {
+    std::lock_guard<std::mutex> lock(counter->mutex);
+    if (counter->value >= value()) {
+      return;
+    }
+  }
+
+  if (stream_.device != Device::gpu) {
+    wait();
+    return;
+  }
+
+  // All Vulkan GPU streams share a single compute queue. Submit the producer
+  // stream now and signal the event from a completion callback so later work
+  // recorded on the consumer stream is naturally ordered behind it without
+  // blocking the host thread inside async_eval().
+  vulkan::add_completion_callback_for_stream(
+      stream_, [event = event_, signal_value = value()]() mutable {
+        set_event_value(event, signal_value);
+      });
+  vulkan::finalize_stream(stream_);
 }
 
 void Event::signal(Stream stream) {

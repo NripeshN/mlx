@@ -89,6 +89,16 @@ class TestEval(mlx_tests.MLXTestCase):
         z = mx.abs(y, stream=s)
         self.assertEqual(z.item(), 5)
 
+    @unittest.skipIf(not mx.is_available(mx.gpu), "GPU is not available")
+    def test_async_eval_into_async_eval_diff_gpu_stream(self):
+        s = mx.new_stream(mx.gpu)
+        x = mx.array(0.0)
+        y = mx.abs(x - 5.0, stream=s)
+        mx.async_eval(y)
+        z = mx.abs(y, stream=mx.default_stream(mx.gpu))
+        mx.async_eval(z)
+        self.assertEqual(z.item(), 5.0)
+
     def test_eval_slow_fast_multi_stream(self):
         x = mx.ones((8000,))
         y = mx.abs(mx.array(-1.0))
