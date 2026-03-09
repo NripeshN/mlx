@@ -8,6 +8,7 @@
 #include <optional>
 
 #include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/backend/vulkan/vulkan.h"
@@ -20,6 +21,10 @@ namespace mlx::core {
 namespace fast {
 
 namespace {
+
+constexpr char kFlashAttnMaskOptScratchLane[] = "flash_attn.mask_opt";
+constexpr char kFlashAttnSplitKScratchLane[] = "flash_attn.split_k";
+constexpr char kFlashAttnOutScratchLane[] = "flash_attn.out_storage";
 
 array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s);
 
@@ -319,9 +324,11 @@ bool try_dispatch_flash_attention_native_vulkan(
         static_cast<uint64_t>(std::numeric_limits<int>::max())) {
       return false;
     }
-    mask_opt = array({static_cast<int>(mask_opt_elems)}, uint32, nullptr, {});
-    mask_opt->set_status(array::Status::available);
-    mask_opt->set_data(allocator::malloc(mask_opt->nbytes()));
+    mask_opt = vulkan::acquire_scratch_array(
+        s,
+        kFlashAttnMaskOptScratchLane,
+        {static_cast<int>(mask_opt_elems)},
+        uint32);
   }
 
   std::optional<array> split_k_tmp;
@@ -335,10 +342,11 @@ bool try_dispatch_flash_attention_native_vulkan(
         static_cast<uint64_t>(std::numeric_limits<int>::max())) {
       return false;
     }
-    split_k_tmp =
-        array({static_cast<int>(split_k_elems)}, float32, nullptr, {});
-    split_k_tmp->set_status(array::Status::available);
-    split_k_tmp->set_data(allocator::malloc(split_k_tmp->nbytes()));
+    split_k_tmp = vulkan::acquire_scratch_array(
+        s,
+        kFlashAttnSplitKScratchLane,
+        {static_cast<int>(split_k_elems)},
+        float32);
   }
 
   const std::vector<uint32_t> specialization_constants = {
@@ -397,6 +405,7 @@ bool try_dispatch_flash_attention_native_vulkan(
               tuning.block_cols,
           });
       insert_compute_barrier(command_buffer);
+      vulkan::mark_scratch_array_written(s, kFlashAttnMaskOptScratchLane);
     }
 
     array& flash_output = plan.split_k > 1u ? *split_k_tmp : out_storage;
@@ -439,6 +448,7 @@ bool try_dispatch_flash_attention_native_vulkan(
           reduce_push_constants,
           {q_heads, (hsv + 31u) / 32u, q_len * batch},
           {32u});
+      vulkan::mark_scratch_array_written(s, kFlashAttnSplitKScratchLane);
     }
 
     vulkan::end_command_recording(s.index);
@@ -513,13 +523,11 @@ bool try_eval_flash_attention_vulkan(
     return false;
   }
 
-  array out_storage(
+  array out_storage = vulkan::acquire_scratch_array(
+      s,
+      kFlashAttnOutScratchLane,
       {out.shape(0), out.shape(2), out.shape(1), out.shape(3)},
-      float32,
-      nullptr,
-      {});
-  out_storage.set_status(array::Status::available);
-  out_storage.set_data(allocator::malloc(out_storage.nbytes()));
+      float32);
 
   try {
     std::optional<array> causal_mask;
@@ -536,6 +544,7 @@ bool try_eval_flash_attention_vulkan(
             q, k, v, causal_mask ? &(*causal_mask) : nullptr, out_storage, s)) {
       return false;
     }
+    vulkan::mark_scratch_array_written(s, kFlashAttnOutScratchLane);
 
     array out_transposed = swapaxes_in_eval(out_storage, 1, 2);
     if (out.dtype() == float32) {

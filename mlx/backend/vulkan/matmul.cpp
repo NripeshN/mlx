@@ -23,6 +23,9 @@ namespace {
 constexpr uint32_t kMulMmTileM = 32;
 constexpr uint32_t kMulMmTileN = 32;
 constexpr uint32_t kMaxGridZ = 65535;
+constexpr char kMatvecVectorCastScratchLane[] = "matvec.vec_f16";
+constexpr char kMatvecOutScratchLane[] = "matvec.out_work";
+constexpr char kMulMmOutScratchLane[] = "mul_mm.out_t";
 
 bool is_supported_matmul_dtype(Dtype dtype) {
   return dtype == float32 || dtype == float16 || dtype == bfloat16;
@@ -200,8 +203,10 @@ bool try_eval_matvec_vulkan(
   }
 
   if (vec.dtype() == bfloat16) {
-    array vec_f16(vec.shape(), float16, nullptr, {});
+    array vec_f16 = vulkan::acquire_scratch_array(
+        s, kMatvecVectorCastScratchLane, vec.shape(), float16);
     copy_gpu(vec, vec_f16, CopyType::General, s);
+    vulkan::mark_scratch_array_written(s, kMatvecVectorCastScratchLane);
     vec = vec_f16;
   }
 
@@ -211,8 +216,8 @@ bool try_eval_matvec_vulkan(
     return false;
   }
 
-  array out_work(out.shape(), float32, nullptr, {});
-  out_work.set_data(allocator::malloc(out_work.nbytes()));
+  array out_work = vulkan::acquire_scratch_array(
+      s, kMatvecOutScratchLane, out.shape(), float32);
   if (out_work.size() == 0) {
     copy_gpu(out_work, out, CopyType::General, s);
     return true;
@@ -233,6 +238,7 @@ bool try_eval_matvec_vulkan(
       }
     }
     if (dispatched) {
+      vulkan::mark_scratch_array_written(s, kMatvecOutScratchLane);
       copy_gpu(out_work, out, CopyType::General, s);
       return true;
     }
@@ -308,8 +314,8 @@ bool try_eval_mul_mm_vulkan(
   Shape out_t_shape = out.shape();
   std::swap(
       out_t_shape[out_t_shape.size() - 1], out_t_shape[out_t_shape.size() - 2]);
-  array out_t(out_t_shape, float32, nullptr, {});
-  out_t.set_data(allocator::malloc(out_t.nbytes()));
+  array out_t = vulkan::acquire_scratch_array(
+      s, kMulMmOutScratchLane, out_t_shape, float32);
 
   const uint32_t m = static_cast<uint32_t>(out.shape(-2));
   const uint32_t n = static_cast<uint32_t>(out.shape(-1));
@@ -410,6 +416,7 @@ bool try_eval_mul_mm_vulkan(
         std::cerr << "[vulkan::mul_mm] shader=" << shader_name
                   << " dispatched\n";
       }
+      vulkan::mark_scratch_array_written(s, kMulMmOutScratchLane);
       try {
         copy_gpu(swapaxes_in_eval(out_t, -1, -2), out, CopyType::General, s);
         return true;

@@ -10,8 +10,10 @@
 #include <deque>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -224,6 +226,12 @@ struct SubmissionRecord {
   std::string submit_reason;
 };
 
+struct ScratchSlot {
+  std::optional<array> owner;
+  size_t bytes{0};
+  bool needs_barrier{false};
+};
+
 std::shared_ptr<array::Data> make_owned_staging_allocation(size_t size) {
   auto data = std::make_shared<array::Data>(allocator::malloc(size));
   auto* buffer = static_cast<VulkanBuffer*>(data->buffer.ptr());
@@ -238,6 +246,40 @@ std::shared_ptr<array::Data> make_owned_staging_allocation(size_t size) {
 const VulkanBuffer* get_vulkan_buffer(
     const std::shared_ptr<array::Data>& data) {
   return data ? static_cast<const VulkanBuffer*>(data->buffer.ptr()) : nullptr;
+}
+
+size_t scratch_nbytes(const Shape& shape, Dtype dtype) {
+  size_t elements = 1;
+  for (auto dim : shape) {
+    elements *= static_cast<size_t>(dim);
+  }
+  return elements * size_of(dtype);
+}
+
+array make_scratch_owner(size_t bytes) {
+  if (bytes > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error(
+        "[vulkan::scratch] Requested scratch allocation exceeds int32 array limit.");
+  }
+  array owner({static_cast<int>(bytes)}, uint8, nullptr, {});
+  owner.set_status(array::Status::available);
+  owner.set_data(allocator::malloc(bytes));
+  return owner;
+}
+
+array make_scratch_view(const array& owner, Shape shape, Dtype dtype) {
+  array scratch(shape, dtype, nullptr, {});
+  auto strides = make_contiguous_strides(shape);
+  auto [data_size, row_contiguous, col_contiguous] =
+      check_contiguity(shape, strides);
+  scratch.set_data(
+      owner.buffer(),
+      data_size,
+      std::move(strides),
+      {true, row_contiguous, col_contiguous},
+      [](allocator::Buffer) {});
+  scratch.set_status(array::Status::available);
+  return scratch;
 }
 
 struct StreamData {
@@ -255,6 +297,7 @@ struct StreamData {
   std::vector<std::function<void()>> recording_completion_callbacks;
   std::vector<BufferAccessRange> unsynced_reads;
   std::vector<BufferAccessRange> unsynced_writes;
+  std::unordered_map<std::string, ScratchSlot> scratch_slots;
 };
 
 class VulkanDevice {
@@ -296,6 +339,7 @@ class VulkanDevice {
     }
 
     retire_submissions(stream, true);
+    clear_scratch_barriers(stream);
     if (trace_sync_enabled()) {
       std::ostringstream oss;
       oss << "sync(stream=" << s.index << ") done inflight=0";
@@ -332,6 +376,7 @@ class VulkanDevice {
       stream->recording_completion_callbacks.clear();
       stream->unsynced_reads.clear();
       stream->unsynced_writes.clear();
+      clear_scratch_barriers(stream.get());
     }
     trace_sync("sync(all) done");
   }
@@ -402,6 +447,40 @@ class VulkanDevice {
       return stream->in_flight_submissions.back().epoch;
     }
     return 0;
+  }
+
+  array acquire_scratch(
+      const Stream& s,
+      const std::string& lane,
+      Shape shape,
+      Dtype dtype) {
+    auto* stream = get_stream(s.index);
+    const size_t bytes = scratch_nbytes(shape, dtype);
+    auto& slot = stream->scratch_slots[lane];
+
+    if (!slot.owner.has_value() || slot.bytes < bytes) {
+      slot.owner = make_scratch_owner(bytes);
+      slot.bytes = bytes;
+      slot.needs_barrier = false;
+    } else if (slot.needs_barrier && stream->recording) {
+      trace_sync(
+          "scratch barrier lane='" + lane +
+          "' bytes=" + std::to_string(slot.bytes));
+      insert_memory_barrier(stream->recording_resources->command_buffer);
+      stream->unsynced_reads.clear();
+      stream->unsynced_writes.clear();
+      slot.needs_barrier = false;
+    }
+
+    return make_scratch_view(*slot.owner, std::move(shape), dtype);
+  }
+
+  void mark_scratch_written(const Stream& s, const std::string& lane) {
+    auto* stream = get_stream(s.index);
+    auto it = stream->scratch_slots.find(lane);
+    if (it != stream->scratch_slots.end()) {
+      it->second.needs_barrier = true;
+    }
   }
 
   void begin_primitive(
@@ -633,6 +712,12 @@ class VulkanDevice {
     }
 
     return writes;
+  }
+
+  static void clear_scratch_barriers(StreamData* stream) {
+    for (auto& [_, slot] : stream->scratch_slots) {
+      slot.needs_barrier = false;
+    }
   }
 
   static bool overlaps(const BufferAccessRange& a, const BufferAccessRange& b) {
@@ -914,6 +999,7 @@ class VulkanDevice {
       stream->recording_completion_callbacks.clear();
       stream->unsynced_reads.clear();
       stream->unsynced_writes.clear();
+      clear_scratch_barriers(stream);
       stream->recording_resources.reset();
       KernelManager::get().reclaim_descriptor_set_epoch(
           stream->stream_index, submit_rec_epoch);
@@ -1031,6 +1117,7 @@ class VulkanDevice {
     stream->recording_completion_callbacks.clear();
     stream->unsynced_reads.clear();
     stream->unsynced_writes.clear();
+    clear_scratch_barriers(stream);
     stream->in_flight_submissions.push_back(std::move(submission));
 
     if (trace_sync_enabled()) {
@@ -1173,6 +1260,18 @@ void enqueue_owned_staging_readback(
 
 uint64_t descriptor_epoch_for_stream(const Stream& s) {
   return VulkanDevice::get().descriptor_epoch(s.index);
+}
+
+array acquire_scratch_array(
+    const Stream& s,
+    const std::string& lane,
+    Shape shape,
+    Dtype dtype) {
+  return VulkanDevice::get().acquire_scratch(s, lane, std::move(shape), dtype);
+}
+
+void mark_scratch_array_written(const Stream& s, const std::string& lane) {
+  VulkanDevice::get().mark_scratch_written(s, lane);
 }
 
 void begin_primitive_tracking(

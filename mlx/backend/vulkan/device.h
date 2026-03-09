@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <string>
 
 #include <vector>
 
@@ -36,6 +37,12 @@ void enqueue_owned_staging_readback(
     size_t size,
     std::function<void(const void*, size_t)> completion);
 uint64_t descriptor_epoch_for_stream(const Stream& s);
+array acquire_scratch_array(
+    const Stream& s,
+    const std::string& lane,
+    Shape shape,
+    Dtype dtype);
+void mark_scratch_array_written(const Stream& s, const std::string& lane);
 
 // Primitive-level hazard tracking for deferred recording
 void begin_primitive_tracking(
