@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <string>
 
 namespace {
@@ -402,77 +403,27 @@ void concatenate_gpu(
     array& out,
     int axis,
     const Stream& s) {
-  // For now, we support Vulkan fast path for exactly 2 inputs
-  // which is the common case in transformer models
-  if (inputs.size() != 2) {
-    std::ostringstream sync_reason;
-    sync_reason << "concatenate_cpu_fallback:" << copy_dtype_suffix(out.dtype())
-                << ":axis=" << axis << ":reason=unsupported_input_count_"
-                << inputs.size();
-    vulkan::ScopedSyncLabel sync_label(sync_reason.str());
-    ::mlx::core::gpu::synchronize(s);
-    auto cpu_stream = default_stream(Device::cpu);
-    Concatenate cpu_concatenate(cpu_stream, axis);
-    cpu_concatenate.eval_cpu(inputs, out);
-    synchronize(cpu_stream);
-    return;
+  std::vector<int> sizes;
+  sizes.push_back(0);
+  for (const auto& in : inputs) {
+    sizes.push_back(in.shape(axis));
   }
+  std::partial_sum(sizes.cbegin(), sizes.cend(), sizes.begin());
 
-  // Get the shader name based on output dtype
-  std::string shader_name = "concat_" + copy_dtype_suffix(out.dtype());
-  if (shader_name == "concat_") {
-    // Unsupported dtype, fall back to CPU
-    std::ostringstream sync_reason;
-    sync_reason << "concatenate_cpu_fallback:unsupported_dtype"
-                << ":axis=" << axis;
-    vulkan::ScopedSyncLabel sync_label(sync_reason.str());
-    ::mlx::core::gpu::synchronize(s);
-    auto cpu_stream = default_stream(Device::cpu);
-    Concatenate cpu_concatenate(cpu_stream, axis);
-    cpu_concatenate.eval_cpu(inputs, out);
-    synchronize(cpu_stream);
-    return;
-  }
-
-  // Handle f16 RTE variant
-  if (out.dtype() == float16) {
-    shader_name += "_rte";
-  }
-
-  const array& a = inputs[0];
-  const array& b = inputs[1];
-
-  // Allocate output
   out.set_data(allocator::malloc(out.nbytes()));
 
-  try {
-    auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_binary_op(
-        a,
-        b,
-        out,
-        shader_name,
-        command_buffer,
-        s,
-        vulkan::BinaryDispatchVariant::Standard,
-        std::nullopt,
-        {},
-        0.0f,
-        0.0f,
-        axis);
-    vulkan::end_command_recording(s.index);
-  } catch (const std::runtime_error& e) {
-    // Vulkan dispatch failed, fall back to CPU
-    std::ostringstream sync_reason;
-    sync_reason << "concatenate_dispatch_failed:"
-                << copy_dtype_suffix(out.dtype()) << ":axis=" << axis
-                << ":reason=" << e.what();
-    vulkan::ScopedSyncLabel sync_label(sync_reason.str());
-    ::mlx::core::gpu::synchronize(s);
-    auto cpu_stream = default_stream(Device::cpu);
-    Concatenate cpu_concatenate(cpu_stream, axis);
-    cpu_concatenate.eval_cpu(inputs, out);
-    synchronize(cpu_stream);
+  auto strides = out.strides();
+  auto flags = out.flags();
+  flags.row_contiguous = false;
+  flags.col_contiguous = false;
+  flags.contiguous = false;
+
+  for (int i = 0; i < inputs.size(); ++i) {
+    array out_slice(inputs[i].shape(), out.dtype(), nullptr, {});
+    size_t data_offset = strides[axis] * sizes[i];
+    out_slice.copy_shared_buffer(
+        out, strides, flags, out_slice.size(), data_offset);
+    copy_gpu_inplace(inputs[i], out_slice, CopyType::GeneralGeneral, s);
   }
 }
 

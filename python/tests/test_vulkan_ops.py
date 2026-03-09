@@ -570,6 +570,42 @@ def _cases():
             0.0,
         ),
         (
+            "concat",
+            lambda: mx.concatenate(
+                [
+                    mx.array([[1.0, 2.0], [3.0, 4.0]], dtype=mx.float32),
+                    mx.array([[5.0, 6.0], [7.0, 8.0]], dtype=mx.float32),
+                ],
+                axis=1,
+            ),
+            0.0,
+            0.0,
+        ),
+        (
+            "concat_f16",
+            lambda: mx.concatenate(
+                [
+                    mx.array([[1.0, 2.0], [3.0, 4.0]], dtype=mx.float16),
+                    mx.array([[5.0, 6.0], [7.0, 8.0]], dtype=mx.float16),
+                ],
+                axis=1,
+            ).astype(mx.float32),
+            1e-3,
+            1e-3,
+        ),
+        (
+            "concat_int32",
+            lambda: mx.concatenate(
+                [
+                    mx.array([[1, 2], [3, 4]], dtype=mx.int32),
+                    mx.array([[5, 6], [7, 8]], dtype=mx.int32),
+                ],
+                axis=1,
+            ),
+            0.0,
+            0.0,
+        ),
+        (
             "where",
             lambda: mx.where(
                 mx.array([[True, False], [False, True]]),

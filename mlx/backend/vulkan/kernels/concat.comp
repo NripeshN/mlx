@@ -13,6 +13,9 @@ void main() {
         return;
     }
 
+    // De-linearize index for row-major layout (last dimension varies fastest)
+    // The push constants store dimensions in reverse order:
+    // ne20 = last dim size, ne21 = second-to-last dim size, etc.
     const uint i3 = idx / (p.ne22*p.ne21*p.ne20);
     const uint i3_offset = i3 * p.ne22*p.ne21*p.ne20;
     const uint i2 = (idx - i3_offset) / (p.ne21*p.ne20);

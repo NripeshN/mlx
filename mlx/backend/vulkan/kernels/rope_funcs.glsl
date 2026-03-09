@@ -101,8 +101,8 @@ void rope_neox(const uint i0, const uint i1, const uint i2, const uint i3, rope_
     }
 
     if (i0 >= p.n_dims) {
-        rope_data_d[idst + i0/2 + 0] = ROPE_D_TYPE(rope_data_a[ix + i0/2 + 0]);
-        rope_data_d[idst + i0/2 + 1] = ROPE_D_TYPE(rope_data_a[ix + i0/2 + 1]);
+        rope_data_d[idst + 0] = ROPE_D_TYPE(rope_data_a[ix + 0]);
+        rope_data_d[idst + p.n_dims/2] = ROPE_D_TYPE(rope_data_a[ix + p.n_dims/2]);
 
         return;
     }
@@ -120,7 +120,6 @@ void rope_neox(const uint i0, const uint i1, const uint i2, const uint i3, rope_
     rope_data_d[idst + 0]          = ROPE_D_TYPE(x0*cos_theta - x1*sin_theta);
     rope_data_d[idst + p.n_dims/2] = ROPE_D_TYPE(x0*sin_theta + x1*cos_theta);
 }
-
 
 void rope_multi(const uint i0, const uint i1, const uint i2, const uint i3, rope_params p) {
     if (i0 >= p.ne00) {
