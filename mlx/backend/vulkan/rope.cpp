@@ -362,6 +362,23 @@ bool RoPE::use_fallback(Stream s) {
 void RoPE::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  if (outputs.size() != 1) {
+    throw std::runtime_error(
+        "[vulkan::RoPE::eval_gpu] Expected exactly one output.");
+  }
+
+  if (try_eval_rope_vulkan(
+          inputs,
+          outputs[0],
+          dims_,
+          traditional_,
+          base_,
+          scale_,
+          forward_,
+          stream())) {
+    return;
+  }
+
   ::mlx::core::gpu::synchronize(stream());
   auto fallback_outputs = fallback_(inputs);
   if (fallback_outputs.size() != outputs.size()) {
