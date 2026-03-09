@@ -446,7 +446,9 @@ class VulkanDevice {
       return;
     }
 
-    trace_sync("hazard boundary action=barrier");
+    trace_sync(
+        "hazard boundary action=barrier reason=overlapping-buffer-range");
+    trace_sync("barrier action=recording-tail reason=deferred-op-boundary");
     insert_memory_barrier(stream->recording_resources->command_buffer);
     stream->unsynced_reads.clear();
     stream->unsynced_writes.clear();
