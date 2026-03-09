@@ -18,6 +18,12 @@ This document tracks the work needed to move MLX Vulkan from a submit-on-hazard 
 - [x] Step 5 - Add a barrier-first hazard mode in `mlx/backend/vulkan/device.cpp`, keeping submit-on-hazard as a fallback escape hatch.
 - [x] Step 6 - Add explicit scratch-lane tracking for the highest-pressure temporary buffers used by matmul and attention paths.
 - [x] Step 7 - Validate the new execution model with focused CPU/GPU tests and the Qwen3 Vulkan profiler.
+- [x] Step 8 - Make Vulkan `gpu::finalize()` submit deferred work without turning it into a full stream synchronize.
+- [x] Step 9 - Route Vulkan event/fence waits through stream retirement so async finalize still signals completion callbacks correctly.
+- [x] Step 10 - Revalidate Qwen3 and focused tests after reducing finalize-driven explicit synchronize submits.
+- [ ] Step 11 - Attribute the remaining explicit synchronize submits to concrete call sites in Vulkan/Qwen3 inference.
+- [ ] Step 12 - Remove or narrow the hottest remaining synchronize callers without regressing correctness.
+- [ ] Step 13 - Revalidate the reduced-sync path with the same focused suites and the Qwen3 profiler.
 
 ## Validation Requirements
 
@@ -35,3 +41,5 @@ This document tracks the work needed to move MLX Vulkan from a submit-on-hazard 
 - Barrier-first hazard handling is now the default, with `MLX_VULKAN_SUBMIT_ON_HAZARD=1` retained as an escape hatch for comparison and rollback testing.
 - Matmul and flash-attention now reuse named per-stream scratch lanes for their hottest temporary buffers instead of repeatedly allocating fresh transient storage.
 - Validation for this run used Vulkan rebuilds, focused CPU/GPU unit coverage, the Vulkan parity suite, C++ RoPE coverage, and repeated short Qwen3 profiler passes.
+- The next bottleneck is explicit synchronize traffic driven by Vulkan `gpu::finalize()`, which still behaves like a blocking synchronize instead of a non-blocking commit.
+- Vulkan `gpu::finalize()` now submits without waiting, and Vulkan event/fence waits retire the source stream on demand. That change is correct, but short Qwen3 profiling shows only a small shift from `explicit synchronize` submits to `finalize`, so more sync-site attribution is still needed.

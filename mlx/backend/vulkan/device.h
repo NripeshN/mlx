@@ -55,6 +55,7 @@ void end_primitive_tracking(
     const std::vector<array>& outputs);
 
 // Stream synchronization
+void finalize_stream(Stream s);
 void synchronize_stream(Stream s);
 void synchronize_all();
 

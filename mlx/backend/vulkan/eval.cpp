@@ -37,7 +37,7 @@ void eval(array& arr) {
 }
 
 void finalize(Stream s) {
-  ::mlx::core::gpu::synchronize(s);
+  vulkan::finalize_stream(s);
 }
 
 } // namespace mlx::core::gpu

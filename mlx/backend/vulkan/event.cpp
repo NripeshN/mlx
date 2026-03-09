@@ -37,6 +37,9 @@ Event::Event(Stream stream) : stream_(stream) {
 
 void Event::wait() {
   auto* counter = static_cast<EventCounter*>(event_.get());
+  if (stream_.device == Device::gpu && counter->value < value()) {
+    vulkan::synchronize_stream(stream_);
+  }
   std::unique_lock<std::mutex> lock(counter->mutex);
   if (counter->value >= value()) {
     return;
@@ -52,7 +55,6 @@ void Event::wait(Stream stream) {
     return;
   }
 
-  // Vulkan stream waits are currently host-mediated.
   wait();
 }
 

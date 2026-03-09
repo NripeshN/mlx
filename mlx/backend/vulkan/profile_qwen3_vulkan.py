@@ -198,7 +198,7 @@ class SyncTraceAnalyzer:
             return "\n".join(lines)
 
         lines.append(
-            f"\n{'Phase':<12} {'Submits':<8} {'AvgOps':<8} {'HazSub':<8} {'ExpSync':<8} {'Thresh':<8} {'HazBar':<8} {'TailBar':<8} {'RAW':<6} {'WAR':<6} {'WAW':<6}"
+            f"\n{'Phase':<12} {'Submits':<8} {'AvgOps':<8} {'HazSub':<8} {'ExpSync':<8} {'Finalize':<8} {'Thresh':<8} {'HazBar':<8} {'TailBar':<8} {'RAW':<6} {'WAR':<6} {'WAW':<6}"
         )
         lines.append("-" * 100)
         for phase in phases:
@@ -213,6 +213,7 @@ class SyncTraceAnalyzer:
                 f"{phase:<12} {submit_total:<8} {avg_ops:<8.2f} "
                 f"{self.submit_counts[(phase, 'hazard overlap')]:<8} "
                 f"{self.submit_counts[(phase, 'explicit synchronize')]:<8} "
+                f"{self.submit_counts[(phase, 'finalize')]:<8} "
                 f"{self.submit_counts[(phase, 'threshold reached')]:<8} "
                 f"{self.barrier_counts[(phase, 'hazard-overlap')]:<8} "
                 f"{self.barrier_counts[(phase, 'recording-tail')]:<8} "

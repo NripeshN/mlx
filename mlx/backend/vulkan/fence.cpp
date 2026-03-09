@@ -16,6 +16,7 @@ namespace {
 struct FenceImpl {
   uint32_t count{0};
   uint32_t value{0};
+  Stream stream{0, Device::cpu};
   std::mutex mutex;
   std::condition_variable cv;
 };
@@ -40,9 +41,10 @@ void wait_fence_value(const std::shared_ptr<void>& fence, uint32_t value) {
 
 } // namespace
 
-Fence::Fence(Stream) {
+Fence::Fence(Stream stream) {
   auto dtor = [](void* ptr) { delete static_cast<FenceImpl*>(ptr); };
   fence_ = std::shared_ptr<void>(new FenceImpl{}, dtor);
+  static_cast<FenceImpl*>(fence_.get())->stream = stream;
 }
 
 void Fence::wait(Stream stream, const array&) {
@@ -60,7 +62,9 @@ void Fence::wait(Stream stream, const array&) {
     return;
   }
 
-  // Vulkan stream waits are currently host-mediated.
+  if (impl->stream.device == Device::gpu) {
+    vulkan::synchronize_stream(impl->stream);
+  }
   wait_fence_value(fence_, target);
 }
 

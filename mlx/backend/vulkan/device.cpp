@@ -347,6 +347,30 @@ class VulkanDevice {
     }
   }
 
+  void finalize(Stream s) {
+    auto* stream = get_stream(s.index);
+    if (trace_sync_enabled()) {
+      std::ostringstream oss;
+      oss << "finalize(stream=" << s.index
+          << ") begin recording=" << stream->recording
+          << " pending=" << !stream->in_flight_submissions.empty()
+          << " rec_epoch=" << stream->recording_epoch
+          << " inflight=" << stream->in_flight_submissions.size()
+          << " rec_ops=" << stream->recorded_ops;
+      trace_sync(oss.str());
+    }
+    if (stream->recording) {
+      submit_commands(stream, "finalize");
+    }
+    retire_submissions(stream, false);
+    if (trace_sync_enabled()) {
+      std::ostringstream oss;
+      oss << "finalize(stream=" << s.index
+          << ") done inflight=" << stream->in_flight_submissions.size();
+      trace_sync(oss.str());
+    }
+  }
+
   void synchronize() {
     trace_sync("sync(all) begin");
     {
@@ -1279,6 +1303,10 @@ void begin_primitive_tracking(
     const std::vector<array>& inputs,
     const std::vector<array>& outputs) {
   VulkanDevice::get().begin_primitive(s, inputs, outputs);
+}
+
+void finalize_stream(Stream s) {
+  VulkanDevice::get().finalize(s);
 }
 
 void end_primitive_tracking(
