@@ -1,8 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
 #include <cmath>
-#include <cstring>
-
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/device.h"
@@ -24,48 +22,6 @@ std::string rope_shader_name(Dtype dtype, bool traditional) {
     return traditional ? "rope_norm_f16_rte" : "rope_neox_f16_rte";
   }
   return {};
-}
-
-bool readback_array_bytes(
-    const array& input,
-    Stream s,
-    std::vector<char>& bytes) {
-  auto input_eval = input;
-  if (input_eval.status() == array::Status::unscheduled) {
-    return false;
-  }
-  input_eval.wait();
-
-  bytes.resize(input_eval.nbytes());
-  if (bytes.empty()) {
-    return true;
-  }
-
-  if (vulkan::VulkanContext::get().is_unified_memory()) {
-    const auto* src = input_eval.data<char>();
-    if (src == nullptr) {
-      return false;
-    }
-    std::memcpy(bytes.data(), src, bytes.size());
-    return true;
-  }
-
-  auto* src_buffer = static_cast<vulkan::VulkanBuffer*>(
-      const_cast<void*>(static_cast<const void*>(input_eval.buffer().ptr())));
-  if (src_buffer == nullptr || src_buffer->buffer == VK_NULL_HANDLE) {
-    return false;
-  }
-
-  vulkan::enqueue_owned_staging_readback(
-      s,
-      src_buffer->buffer,
-      static_cast<uint64_t>(input_eval.offset()),
-      bytes.size(),
-      [&bytes](const void* src, size_t size) {
-        std::memcpy(bytes.data(), src, size);
-      });
-  vulkan::synchronize_stream(s);
-  return true;
 }
 
 bool normalize_rope_input(
@@ -114,91 +70,42 @@ array normalize_rope_output(
   return reshape_in_eval(out, normalized_shape, s);
 }
 
-bool make_rope_positions(
-    const array& offset,
+bool prepare_rope_offsets(
+    const array& input,
     uint32_t batch,
-    uint32_t steps,
-    array& positions,
+    array& offsets,
+    uint32_t& position_stride,
     Stream s) {
-  auto offset_eval = offset;
-  if (offset_eval.status() == array::Status::unscheduled) {
+  if (input.dtype() != int32 || input.ndim() > 1) {
     return false;
   }
-  if (offset_eval.dtype() != int32 || offset_eval.ndim() > 1 ||
-      offset_eval.offset() != 0 || !offset_eval.flags().row_contiguous) {
-    return false;
-  }
-  if (offset_eval.size() != 1 && offset_eval.size() != batch) {
+  if (input.size() != 1 && input.size() != batch) {
     return false;
   }
 
-  positions = array(
-      {static_cast<int>(batch), static_cast<int>(steps)}, int32, nullptr, {});
-  positions.set_data(allocator::malloc(positions.nbytes()));
-
-  std::vector<char> src_bytes;
-  if (!readback_array_bytes(offset_eval, s, src_bytes)) {
+  offsets = input;
+  if (offsets.offset() != 0 || !offsets.flags().row_contiguous) {
+    offsets = contiguous_copy_gpu(offsets, s);
+  }
+  if (offsets.offset() != 0 || !offsets.flags().row_contiguous) {
     return false;
   }
-  const auto* src = reinterpret_cast<const int32_t*>(src_bytes.data());
-  std::vector<int32_t> host_positions(batch * steps, 0);
 
-  if (offset_eval.size() == 1) {
-    const int32_t base = src[0];
-    for (uint32_t b = 0; b < batch; ++b) {
-      for (uint32_t t = 0; t < steps; ++t) {
-        host_positions[b * steps + t] = base + static_cast<int32_t>(t);
-      }
-    }
-  } else {
-    for (uint32_t b = 0; b < batch; ++b) {
-      const int32_t base = src[b];
-      for (uint32_t t = 0; t < steps; ++t) {
-        host_positions[b * steps + t] = base + static_cast<int32_t>(t);
-      }
-    }
-  }
-
-  auto* dst_buffer =
-      static_cast<vulkan::VulkanBuffer*>(positions.buffer().ptr());
-  if (dst_buffer == nullptr || dst_buffer->buffer == VK_NULL_HANDLE) {
-    return false;
-  }
-  vulkan::enqueue_owned_staging_upload(
-      s,
-      host_positions.data(),
-      host_positions.size() * sizeof(int32_t),
-      dst_buffer->buffer,
-      positions.offset());
-
+  position_stride = offsets.size() == 1 ? 0u : 1u;
   return true;
 }
 
-bool stage_rope_freqs(const array& input, int dims, array& freqs, Stream s) {
-  auto input_eval = input;
-  if (input_eval.status() == array::Status::unscheduled) {
-    return false;
-  }
-  if (input_eval.dtype() != float32 || input_eval.ndim() != 1 ||
-      input_eval.shape(0) != dims / 2 || input_eval.offset() != 0 ||
-      !input_eval.flags().row_contiguous) {
+bool prepare_rope_freqs(const array& input, int dims, array& freqs, Stream s) {
+  if (input.dtype() != float32 || input.ndim() != 1 ||
+      input.shape(0) != dims / 2) {
     return false;
   }
 
-  freqs = array({static_cast<int>(input_eval.shape(0))}, float32, nullptr, {});
-  freqs.set_data(allocator::malloc(freqs.nbytes()));
-
-  std::vector<char> src_bytes;
-  if (!readback_array_bytes(input_eval, s, src_bytes)) {
-    return false;
+  freqs = input;
+  if (freqs.offset() != 0 || !freqs.flags().row_contiguous) {
+    freqs = contiguous_copy_gpu(freqs, s);
   }
-  auto* dst_buffer = static_cast<vulkan::VulkanBuffer*>(freqs.buffer().ptr());
-  if (dst_buffer == nullptr || dst_buffer->buffer == VK_NULL_HANDLE) {
-    return false;
-  }
-  vulkan::enqueue_owned_staging_upload(
-      s, src_bytes.data(), freqs.nbytes(), dst_buffer->buffer, freqs.offset());
-  return true;
+  return freqs.offset() == 0 && freqs.flags().row_contiguous;
 }
 
 vulkan::RopePushConstants make_rope_push_constants(
@@ -208,7 +115,9 @@ vulkan::RopePushConstants make_rope_push_constants(
     float base,
     float scale,
     bool forward,
-    bool has_freqs) {
+    bool has_freqs,
+    uint32_t position_stride,
+    bool positions_are_offsets) {
   vulkan::RopePushConstants pc{};
   const uint32_t batch = checked_u32_size(in.shape(0), "rope batch");
   const uint32_t steps = checked_u32_size(in.shape(1), "rope steps");
@@ -233,6 +142,8 @@ vulkan::RopePushConstants make_rope_push_constants(
   pc.is_imrope = 0;
   pc.is_back = forward ? 0u : 1u;
   pc.set_rows_stride = 0;
+  pc.position_stride = position_stride;
+  pc.positions_are_offsets = positions_are_offsets ? 1u : 0u;
 
   pc.ne00 = checked_u32_size(in.shape(3), "rope ne00");
   pc.ne01 = checked_u32_size(in.shape(2), "rope ne01");
@@ -260,26 +171,13 @@ bool try_eval_rope_vulkan(
   }
 
   array x = inputs[0];
-  if (x.status() == array::Status::unscheduled) {
-    return false;
-  }
-  x.wait();
-
-  if (x.size() != 0) {
-    array x_private(x.shape(), x.dtype(), nullptr, {});
-    x_private.set_data(allocator::malloc(x_private.nbytes()));
-    copy_gpu(x, x_private, CopyType::General, s);
-    x = x_private;
+  if (x.offset() != 0 || !x.flags().row_contiguous) {
+    x = contiguous_copy_gpu(x, s);
   }
 
   const auto shader_name = rope_shader_name(x.dtype(), traditional);
   if (shader_name.empty() || x.dtype() != out.dtype() || dims <= 0 ||
       (dims % 2) != 0 || dims > x.shape(-1) || x.offset() != 0) {
-    return false;
-  }
-
-  array offset = inputs[1];
-  if (offset.dtype() != int32 || offset.ndim() > 1) {
     return false;
   }
 
@@ -293,14 +191,15 @@ bool try_eval_rope_vulkan(
   const uint32_t batch = checked_u32_size(x_norm.shape(0), "rope batch");
   const uint32_t steps = checked_u32_size(x_norm.shape(2), "rope steps");
 
-  array positions = offset;
-  if (!make_rope_positions(offset, batch, steps, positions, s)) {
+  array offsets = inputs[1];
+  uint32_t position_stride = 0;
+  if (!prepare_rope_offsets(offsets, batch, offsets, position_stride, s)) {
     return false;
   }
 
-  array freqs = positions;
+  array freqs = offsets;
   const bool has_freqs = inputs.size() == 3;
-  if (has_freqs && !stage_rope_freqs(inputs[2], dims, freqs, s)) {
+  if (has_freqs && !prepare_rope_freqs(inputs[2], dims, freqs, s)) {
     return false;
   }
 
@@ -318,7 +217,15 @@ bool try_eval_rope_vulkan(
     return false;
   }
   auto pc = make_rope_push_constants(
-      x_kernel, out_kernel, dims, base, scale, forward, has_freqs);
+      x_kernel,
+      out_kernel,
+      dims,
+      base,
+      scale,
+      forward,
+      has_freqs,
+      position_stride,
+      true);
   const std::array<uint32_t, 3> grid = {
       std::min(pc.nrows, 32768u),
       std::max(1u, (pc.ne00 + 511u) / 512u),
@@ -328,10 +235,10 @@ bool try_eval_rope_vulkan(
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_rope_op(
         x_kernel,
-        positions,
+        offsets,
         freqs,
         out_kernel,
-        positions,
+        offsets,
         shader_name,
         command_buffer,
         s,

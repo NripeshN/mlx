@@ -13,7 +13,7 @@ This document tracks the work needed to move MLX Vulkan from a submit-on-hazard 
 
 - [x] Step 1 - Write down the execution plan and use it as the source of truth for progress.
 - [x] Step 2 - Add Vulkan submission/hazard accounting so prefill and decode can report barriers vs submits.
-- [ ] Step 3 - Rework Vulkan RoPE so it does not read back offsets/frequencies to the host or force stream synchronization in the hot path.
+- [x] Step 3 - Rework Vulkan RoPE so it does not read back offsets/frequencies to the host or force stream synchronization in the hot path.
 - [ ] Step 4 - Remove explicit stream synchronization from the Vulkan flash-attention path and keep the follow-on work on the GPU timeline.
 - [ ] Step 5 - Add a barrier-first hazard mode in `mlx/backend/vulkan/device.cpp`, keeping submit-on-hazard as a fallback escape hatch.
 - [ ] Step 6 - Add explicit scratch-lane tracking for the highest-pressure temporary buffers used by matmul and attention paths.
@@ -30,3 +30,4 @@ This document tracks the work needed to move MLX Vulkan from a submit-on-hazard 
 - The reference control-plane design is `tmp_/ggml-vulkan.cpp`, especially its graph batching, barrier-based synchronization, and scratch-buffer reuse flags.
 - The immediate target is correctness-preserving latency reduction, not a literal port of ggml's graph engine.
 - The profiler now captures backend stderr in-process, attributes sync-trace activity to prefill/decode, and reports submit reasons plus hazard counts without requiring shell-side grepping.
+- RoPE now feeds offsets and optional frequency buffers directly to the Vulkan shader path, removing the prior host readback + staging round-trip from inference.

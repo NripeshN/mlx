@@ -35,7 +35,18 @@ void rope_yarn(const float theta_extrap, const uint i0, out float cos_theta, out
 }
 
 uint rope_pos_coord(const uint i2, const uint i3, rope_params p) {
-    return i2 + p.ne02 * i3;
+    if (p.positions_are_offsets != 0) {
+        return p.position_stride == 0 ? 0 : i3 * p.position_stride;
+    }
+    return i2 + p.position_stride * i3;
+}
+
+int rope_position(const uint i2, const uint i3, rope_params p) {
+    int pos = rope_data_pos[rope_pos_coord(i2, i3, p)];
+    if (p.positions_are_offsets != 0) {
+        pos += int(i2);
+    }
+    return pos;
 }
 
 void rope_norm(const uint i0, const uint i1, const uint i2, const uint i3, rope_params p) {
@@ -60,7 +71,7 @@ void rope_norm(const uint i0, const uint i1, const uint i2, const uint i3, rope_
         return;
     }
 
-    const float theta_base = rope_data_pos[rope_pos_coord(i2, i3, p)] * pow(p.theta_scale, i0/2.0f);
+    const float theta_base = rope_position(i2, i3, p) * pow(p.theta_scale, i0/2.0f);
 
     const float freq_factor = p.has_ff != 0 ? rope_data_ff[i0/2] : 1.0f;
 
@@ -96,7 +107,7 @@ void rope_neox(const uint i0, const uint i1, const uint i2, const uint i3, rope_
         return;
     }
 
-    const float theta_base = rope_data_pos[rope_pos_coord(i2, i3, p)] * pow(p.theta_scale, i0/2.0f);
+    const float theta_base = rope_position(i2, i3, p) * pow(p.theta_scale, i0/2.0f);
 
     const float freq_factor = p.has_ff != 0 ? rope_data_ff[i0/2] : 1.0f;
 

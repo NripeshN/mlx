@@ -350,6 +350,8 @@ struct RopePushConstants {
   uint32_t is_imrope;
   uint32_t is_back;
   uint32_t set_rows_stride;
+  uint32_t position_stride;
+  uint32_t positions_are_offsets;
   uint32_t ne00;
   uint32_t ne01;
   uint32_t ne02;
