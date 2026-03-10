@@ -64,16 +64,28 @@ if(Vulkan_FOUND)
     list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
   endif()
 
+  # Find shaderc for shader generation (required)
+  include(FindShaderc REQUIRED)
+  message(STATUS "shaderc found for shader generation: ${SHADERC_LIBRARY}")
+
   # Build shader generator tool
   set(SHADER_GEN_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kernels/vulkan-shaders-gen.cpp")
-  set(SHADER_GEN_BIN "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders-gen")
 
-  add_custom_command(
-    OUTPUT ${SHADER_GEN_BIN}
-    COMMAND ${CMAKE_CXX_COMPILER} -std=c++17 -O2 ${VULKAN_SHADER_GEN_CMAKE_ARGS} -o ${SHADER_GEN_BIN} ${SHADER_GEN_SRC} -lpthread
-    DEPENDS ${SHADER_GEN_SRC}
-    COMMENT "Building Vulkan shader generator"
+  add_executable(vulkan-shaders-gen ${SHADER_GEN_SRC})
+  set_target_properties(vulkan-shaders-gen PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
   )
+  target_link_libraries(vulkan-shaders-gen PRIVATE 
+    Shaderc::shaderc_combined
+    glslang
+    glslang-SPIRV
+    SPIRV-Tools-opt
+    SPIRV-Tools
+  )
+  target_compile_features(vulkan-shaders-gen PRIVATE cxx_std_17)
+  if(VULKAN_SHADER_GEN_CMAKE_ARGS)
+    target_compile_definitions(vulkan-shaders-gen PRIVATE ${VULKAN_SHADER_GEN_CMAKE_ARGS})
+  endif()
   
   # Get all shader files
   file(
@@ -92,13 +104,12 @@ if(Vulkan_FOUND)
     add_custom_command(
       OUTPUT ${shader_cpp}
       COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUTPUT_DIR}
-      COMMAND ${SHADER_GEN_BIN}
-        --glslc ${Vulkan_GLSLC_EXECUTABLE}
+      COMMAND vulkan-shaders-gen
         --source ${shader_file}
         --output-dir ${SHADER_OUTPUT_DIR}
         --target-hpp ${SHADER_HEADER}
         --target-cpp ${shader_cpp}
-      DEPENDS ${shader_file} ${SHADER_GEN_BIN}
+      DEPENDS ${shader_file} vulkan-shaders-gen
       COMMENT "Generating shader variants for ${shader_name}"
     )
     
@@ -108,10 +119,10 @@ if(Vulkan_FOUND)
   # Generate main header - must happen after all shader variants are compiled
   add_custom_command(
     OUTPUT ${SHADER_HEADER}
-    COMMAND ${SHADER_GEN_BIN}
+    COMMAND vulkan-shaders-gen
       --output-dir ${SHADER_OUTPUT_DIR}
       --target-hpp ${SHADER_HEADER}
-    DEPENDS ${SHADER_GEN_BIN} ${SHADER_CPP_FILES}
+    DEPENDS vulkan-shaders-gen ${SHADER_CPP_FILES}
     COMMENT "Generating Vulkan shaders header"
   )
   

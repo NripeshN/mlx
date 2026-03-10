@@ -20,13 +20,14 @@
 #include <thread>
 #include <vector>
 
+#include <shaderc/shaderc.hpp>
+
 #ifdef _WIN32
 #define NOMINMAX
 #include <direct.h> // For _mkdir on Windows
 #include <windows.h>
 #else
 #include <fcntl.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -36,7 +37,6 @@ std::mutex lock;
 std::vector<std::pair<std::string, std::string>> shader_fnames;
 std::locale c_locale("C");
 
-std::string GLSLC = "glslc";
 std::string input_filepath = "";
 std::string output_dir = "/tmp";
 std::string target_hpp = "";
@@ -56,125 +56,6 @@ enum MatMulIdType {
 };
 
 namespace {
-
-void execute_command(
-    std::vector<std::string>& command,
-    std::string& stdout_str,
-    std::string& stderr_str) {
-#ifdef _WIN32
-  HANDLE stdout_read, stdout_write;
-  HANDLE stderr_read, stderr_write;
-  SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
-
-  if (!CreatePipe(&stdout_read, &stdout_write, &sa, 0) ||
-      !SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0)) {
-    throw std::runtime_error("Failed to create stdout pipe");
-  }
-
-  if (!CreatePipe(&stderr_read, &stderr_write, &sa, 0) ||
-      !SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0)) {
-    throw std::runtime_error("Failed to create stderr pipe");
-  }
-
-  PROCESS_INFORMATION pi;
-  STARTUPINFOA si = {};
-  si.cb = sizeof(STARTUPINFOA);
-  si.dwFlags = STARTF_USESTDHANDLES;
-  si.hStdOutput = stdout_write;
-  si.hStdError = stderr_write;
-
-  std::string cmd;
-  for (const auto& part : command) {
-    cmd += part + " ";
-  }
-
-  if (!CreateProcessA(
-          NULL, cmd.data(), NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
-    throw std::runtime_error("Failed to create process");
-  }
-
-  CloseHandle(stdout_write);
-  CloseHandle(stderr_write);
-
-  std::array<char, 128> buffer;
-  DWORD bytes_read;
-
-  while (ReadFile(
-             stdout_read,
-             buffer.data(),
-             (DWORD)buffer.size(),
-             &bytes_read,
-             NULL) &&
-         bytes_read > 0) {
-    stdout_str.append(buffer.data(), bytes_read);
-  }
-
-  while (ReadFile(
-             stderr_read,
-             buffer.data(),
-             (DWORD)buffer.size(),
-             &bytes_read,
-             NULL) &&
-         bytes_read > 0) {
-    stderr_str.append(buffer.data(), bytes_read);
-  }
-
-  CloseHandle(stdout_read);
-  CloseHandle(stderr_read);
-  WaitForSingleObject(pi.hProcess, INFINITE);
-  CloseHandle(pi.hProcess);
-  CloseHandle(pi.hThread);
-#else
-  int stdout_pipe[2];
-  int stderr_pipe[2];
-
-  if (pipe(stdout_pipe) != 0 || pipe(stderr_pipe) != 0) {
-    throw std::runtime_error("Failed to create pipes");
-  }
-
-  pid_t pid = fork();
-  if (pid < 0) {
-    throw std::runtime_error("Failed to fork process");
-  }
-
-  std::vector<char*> argv;
-  for (std::string& part : command) {
-    argv.push_back(part.data());
-  }
-  argv.push_back(nullptr);
-
-  if (pid == 0) {
-    close(stdout_pipe[0]);
-    close(stderr_pipe[0]);
-    dup2(stdout_pipe[1], STDOUT_FILENO);
-    dup2(stderr_pipe[1], STDERR_FILENO);
-    close(stdout_pipe[1]);
-    close(stderr_pipe[1]);
-    execvp(argv[0], argv.data());
-    _exit(EXIT_FAILURE);
-  } else {
-    close(stdout_pipe[1]);
-    close(stderr_pipe[1]);
-
-    std::array<char, 128> buffer;
-    ssize_t bytes_read;
-
-    while ((bytes_read = read(stdout_pipe[0], buffer.data(), buffer.size())) >
-           0) {
-      stdout_str.append(buffer.data(), bytes_read);
-    }
-
-    while ((bytes_read = read(stderr_pipe[0], buffer.data(), buffer.size())) >
-           0) {
-      stderr_str.append(buffer.data(), bytes_read);
-    }
-
-    close(stdout_pipe[0]);
-    close(stderr_pipe[0]);
-    waitpid(pid, nullptr, 0);
-  }
-#endif
-}
 
 bool directory_exists(const std::string& path) {
   struct stat info;
@@ -277,6 +158,17 @@ std::string read_binary_file(
   return data;
 }
 
+std::string read_text_file(const std::string& path) {
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    std::cerr << "Error opening file: " << path << "\n";
+    return {};
+  }
+  std::stringstream buffer;
+  buffer << file.rdbuf();
+  return buffer.str();
+}
+
 void write_binary_file(const std::string& path, const std::string& content) {
   FILE* f = fopen(path.c_str(), "wb");
   if (!f) {
@@ -323,14 +215,70 @@ using compile_count_guard =
 
 compile_count_guard acquire_compile_slot() {
   // wait until fewer than N compiles are in progress.
-  // 16 is an arbitrary limit, the goal is to avoid "failed to create pipe"
-  // errors.
+  // 16 is an arbitrary limit, the goal is to avoid resource exhaustion
   uint32_t N = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
   std::unique_lock<std::mutex> guard(compile_count_mutex);
   compile_count_cond.wait(guard, [N] { return compile_count < N; });
   compile_count++;
   return compile_count_guard(&compile_count, &decrement_compile_count);
 }
+
+// Global shaderc compiler instance (thread-safe)
+shaderc::Compiler g_compiler;
+
+// File system includer for shaderc
+class FileIncluder : public shaderc::CompileOptions::IncluderInterface {
+ public:
+  explicit FileIncluder(const std::string& base_path) : base_path_(base_path) {}
+
+  shaderc_include_result* GetInclude(
+      const char* requested_source,
+      shaderc_include_type type,
+      const char* requesting_source,
+      size_t include_depth) override {
+    std::string full_path = base_path_ + "/" + requested_source;
+    std::string content = read_text_file(full_path);
+
+    if (content.empty()) {
+      std::string error_msg = "Could not open include file: " + full_path;
+      char* error_storage = new char[error_msg.size() + 1];
+      std::memcpy(error_storage, error_msg.c_str(), error_msg.size() + 1);
+
+      auto* result = new shaderc_include_result;
+      result->source_name = "";
+      result->source_name_length = 0;
+      result->content = error_storage;
+      result->content_length = error_msg.size();
+      result->user_data = error_storage;
+      return result;
+    }
+
+    char* content_storage = new char[content.size() + 1];
+    std::memcpy(content_storage, content.c_str(), content.size() + 1);
+
+    char* name_storage = new char[full_path.size() + 1];
+    std::memcpy(name_storage, full_path.c_str(), full_path.size() + 1);
+
+    auto* result = new shaderc_include_result;
+    result->source_name = name_storage;
+    result->source_name_length = full_path.size();
+    result->content = content_storage;
+    result->content_length = content.size();
+    result->user_data = content_storage;
+    return result;
+  }
+
+  void ReleaseInclude(shaderc_include_result* data) override {
+    if (data->user_data) {
+      delete[] static_cast<char*>(data->user_data);
+    }
+    delete[] data->source_name;
+    delete data;
+  }
+
+ private:
+  std::string base_path_;
+};
 
 void string_to_spv_func(
     std::string name,
@@ -340,93 +288,83 @@ void string_to_spv_func(
     bool coopmat,
     bool dep_file,
     compile_count_guard slot) {
-  std::string target_env = (name.find("_cm2") != std::string::npos)
-      ? "--target-env=vulkan1.3"
-      : "--target-env=vulkan1.2";
+  // Determine target environment based on shader name
+  shaderc_target_env target_env = shaderc_target_env_vulkan;
+  uint32_t env_version = (name.find("_cm2") != std::string::npos)
+      ? shaderc_env_version_vulkan_1_3
+      : shaderc_env_version_vulkan_1_2;
 
-#ifdef _WIN32
-  std::vector<std::string> cmd = {
-      GLSLC,
-      "-fshader-stage=compute",
-      target_env,
-      "\"" + in_path + "\"",
-      "-o",
-      "\"" + out_path + "\""};
-#else
-  std::vector<std::string> cmd = {
-      GLSLC, "-fshader-stage=compute", target_env, in_path, "-o", out_path};
-#endif
+  // Read the source file
+  std::string source = read_text_file(in_path);
+  if (source.empty()) {
+    std::cerr << "Error: Could not read shader source: " << in_path
+              << std::endl;
+    return;
+  }
 
-  // disable spirv-opt for coopmat shaders for
-  // https://github.com/ggml-org/llama.cpp/issues/10734 disable spirv-opt for
-  // bf16 shaders for https://github.com/ggml-org/llama.cpp/issues/15344 disable
-  // spirv-opt for rope shaders for
-  // https://github.com/ggml-org/llama.cpp/issues/16860
+  // Set up compile options
+  shaderc::CompileOptions options;
+  options.SetTargetEnvironment(target_env, env_version);
+  options.SetSourceLanguage(shaderc_source_language_glsl);
+  options.SetForcedVersionProfile(460, shaderc_profile_core);
+  options.SetGenerateDebugInfo();
+
+  // Set up file includer for #include directives
+  size_t last_slash = in_path.find_last_of("/\\");
+  if (last_slash != std::string::npos) {
+    std::string include_dir = in_path.substr(0, last_slash);
+    options.SetIncluder(std::make_unique<FileIncluder>(include_dir));
+  }
+
+  // Add preprocessor defines
+  for (const auto& define : defines) {
+    options.AddMacroDefinition(define.first, define.second);
+  }
+
+  // Optimization: disable for coopmat, bf16, and rope shaders (matching glslc
+  // behavior)
   if (!coopmat && name.find("bf16") == std::string::npos &&
       name.find("rope") == std::string::npos) {
-    cmd.push_back("-O");
+    options.SetOptimizationLevel(shaderc_optimization_level_performance);
+  } else {
+    options.SetOptimizationLevel(shaderc_optimization_level_zero);
   }
 
+  // Compile the shader
+  shaderc::SpvCompilationResult result = g_compiler.CompileGlslToSpv(
+      source.c_str(),
+      source.size(),
+      shaderc_compute_shader,
+      in_path.c_str(),
+      name.c_str(),
+      options);
+
+  // Check for compilation errors
+  if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
+    std::cerr << "cannot compile " << name << "\n";
+    std::cerr << "Error: " << result.GetErrorMessage() << std::endl;
+    return;
+  }
+
+  // Get the SPIR-V binary
+  std::vector<uint32_t> spv_binary(result.cbegin(), result.cend());
+
+  // Write the SPIR-V binary to file
+  std::string spv_data(
+      reinterpret_cast<const char*>(spv_binary.data()),
+      spv_binary.size() * sizeof(uint32_t));
+  write_binary_file(out_path, spv_data);
+
+  // Handle dependency file generation
   if (dep_file) {
-    cmd.push_back("-MD");
-    cmd.push_back("-MF");
-#ifdef _WIN32
-    cmd.push_back("\"" + target_cpp + ".d\"");
-#else
-    cmd.push_back(target_cpp + ".d");
-#endif
+    // Create a simple dependency file
+    // The dep file format is: target: dependencies
+    std::string dep_content = target_cpp + ": " + in_path + "\n";
+    write_binary_file(target_cpp + ".d", dep_content);
   }
 
-#ifdef GGML_VULKAN_SHADER_DEBUG_INFO
-  cmd.push_back("-g");
-#endif
-
-  for (const auto& define : defines) {
-    cmd.push_back("-D" + define.first + "=" + define.second);
-  }
-
-  std::string command;
-  for (const auto& part : cmd) {
-    command += part + " ";
-  }
-
-  std::string stdout_str, stderr_str;
-  try {
-    // std::cout << "Executing command: ";
-    // for (const auto& part : cmd) {
-    //     std::cout << part << " ";
-    // }
-    // std::cout << std::endl;
-
-    execute_command(cmd, stdout_str, stderr_str);
-    if (!stderr_str.empty()) {
-      std::cerr << "cannot compile " << name << "\n\n";
-      for (const auto& part : cmd) {
-        std::cerr << part << " ";
-      }
-      std::cerr << "\n\n" << stderr_str << std::endl;
-      return;
-    }
-
-    if (dep_file) {
-      // replace .spv output path with the embed .cpp path which is used as
-      // output in CMakeLists.txt
-      std::string dep = read_binary_file(target_cpp + ".d", true);
-      if (!dep.empty()) {
-        size_t pos = dep.find(out_path);
-        if (pos != std::string::npos) {
-          dep.replace(pos, out_path.length(), target_cpp);
-        }
-        write_binary_file(target_cpp + ".d", dep);
-      }
-    }
-
-    std::lock_guard<std::mutex> guard(lock);
-    shader_fnames.push_back(std::make_pair(name, out_path));
-  } catch (const std::exception& e) {
-    std::cerr << "Error executing command for " << name << ": " << e.what()
-              << std::endl;
-  }
+  std::lock_guard<std::mutex> guard(lock);
+  shader_fnames.push_back(std::make_pair(name, out_path));
 }
 
 std::map<std::string, std::string> merge_maps(
@@ -473,7 +411,6 @@ void string_to_spv(
   // Don't write the same dep file from multiple processes
   generate_dep_file = false;
 }
-
 void matmul_shaders(
     bool fp16,
     MatMulIdType matmul_id_type,
@@ -2649,9 +2586,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (args.find("--glslc") != args.end()) {
-    GLSLC = args["--glslc"]; // Path to glslc
-  }
+  // Note: --glslc argument is no longer needed as we use shaderc library
   if (args.find("--source") != args.end()) {
     input_filepath = args["--source"]; // The shader source file to compile
   }
