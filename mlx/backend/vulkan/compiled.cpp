@@ -2,7 +2,10 @@
 
 #include <fmt/format.h>
 #include <shaderc/shaderc.hpp>
+#include <algorithm>
+#include <cmath>
 #include <sstream>
+#include <unordered_set>
 
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/common/utils.h"
@@ -46,7 +49,7 @@ std::string dtype_to_glsl_storage(Dtype d) {
     case uint8:
       return "uint8_t";
     case bool_:
-      return "bool";
+      return "uint8_t";
     default:
       throw std::runtime_error(
           fmt::format(
@@ -74,19 +77,52 @@ bool has_dtype(const std::vector<array>& arrays, Dtype dtype) {
   return false;
 }
 
+bool has_any_dtype(
+    const std::vector<array>& arrays,
+    std::initializer_list<Dtype> dtypes) {
+  for (const auto& x : arrays) {
+    for (auto dtype : dtypes) {
+      if (x.dtype() == dtype) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+std::string glsl_float_constant(float v) {
+  if (std::isnan(v)) {
+    return "uintBitsToFloat(0x7fc00000u)";
+  }
+  if (std::isinf(v)) {
+    return v > 0 ? "uintBitsToFloat(0x7f800000u)"
+                 : "uintBitsToFloat(0xff800000u)";
+  }
+  return fmt::format("{:.9g}", v);
+}
+
 std::string glsl_constant(const array& x) {
   switch (x.dtype()) {
+    case bool_:
+      return x.item<bool>() ? "true" : "false";
+    case float32:
+      return fmt::format("float({})", glsl_float_constant(x.item<float>()));
     case complex64: {
       auto v = x.item<complex64_t>();
-      return fmt::format("vec2({:.9g}, {:.9g})", v.real(), v.imag());
+      return fmt::format(
+          "vec2({}, {})",
+          glsl_float_constant(v.real()),
+          glsl_float_constant(v.imag()));
     }
     case bfloat16: {
       auto v = x.item<bfloat16_t>();
-      return fmt::format("float({:.9g})", static_cast<float>(v));
+      return fmt::format(
+          "float({})", glsl_float_constant(static_cast<float>(v)));
     }
     case float16: {
       auto v = x.item<float16_t>();
-      return fmt::format("float16_t({:.9g})", static_cast<float>(v));
+      return fmt::format(
+          "float16_t({})", glsl_float_constant(static_cast<float>(v)));
     }
     default: {
       std::ostringstream ss;
@@ -97,6 +133,12 @@ std::string glsl_constant(const array& x) {
 }
 
 std::string glsl_cast_expr(Dtype dst, Dtype src, const std::string& expr) {
+  if (dst == bool_ && src != bool_) {
+    return fmt::format("bool({})", expr);
+  }
+  if (dst != bool_ && src == bool_) {
+    return fmt::format("{}(({}) ? 1 : 0)", dtype_to_glsl_compute(dst), expr);
+  }
   if (dst == complex64 && src != complex64) {
     return fmt::format("vec2({}, 0.0)", expr);
   }
@@ -106,14 +148,35 @@ std::string glsl_cast_expr(Dtype dst, Dtype src, const std::string& expr) {
   return fmt::format("{}({})", dtype_to_glsl_compute(dst), expr);
 }
 
-std::string emit_glsl_preamble(bool uses_bfloat16, bool uses_complex64) {
+bool supports_primitive_name(const std::string& prim_name) {
+  static const std::unordered_set<std::string> supported = {
+      "Abs",     "Add",     "AsType",   "Broadcast", "Ceil",  "Conjugate",
+      "Cos",     "Divide",  "Exp",      "Floor",     "Imag",  "Log",
+      "Maximum", "Minimum", "Multiply", "Real",      "Round", "Sigmoid",
+      "Sin",     "Sqrt",    "Subtract", "Tan"};
+  return supported.contains(prim_name);
+}
+
+std::string emit_glsl_preamble(
+    bool uses_bfloat16,
+    bool uses_complex64,
+    bool uses_float16_types,
+    bool uses_int16_types,
+    bool uses_int8_types) {
   std::ostringstream os;
   os << "#version 450\n";
   os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
   os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
-  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
-  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n";
-  os << "#extension GL_EXT_shader_16bit_storage : require\n";
+  if (uses_float16_types) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n";
+  }
+  if (uses_float16_types || uses_int16_types || uses_bfloat16) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
+    os << "#extension GL_EXT_shader_16bit_storage : require\n";
+  }
+  if (uses_int8_types) {
+    os << "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n";
+  }
   os << "\n";
 
   if (uses_bfloat16) {
@@ -268,9 +331,22 @@ inline void build_glsl_kernel(
       has_dtype(outputs, bfloat16) || has_dtype(tape, bfloat16);
   bool uses_complex64 = has_dtype(inputs, complex64) ||
       has_dtype(outputs, complex64) || has_dtype(tape, complex64);
+  bool uses_float16_types = has_dtype(inputs, float16) ||
+      has_dtype(outputs, float16) || has_dtype(tape, float16);
+  bool uses_int16_types = has_any_dtype(inputs, {int16, uint16}) ||
+      has_any_dtype(outputs, {int16, uint16}) ||
+      has_any_dtype(tape, {int16, uint16});
+  bool uses_int8_types = has_any_dtype(inputs, {int8, uint8, bool_}) ||
+      has_any_dtype(outputs, {int8, uint8, bool_}) ||
+      has_any_dtype(tape, {int8, uint8, bool_});
 
   // GLSL header
-  os = emit_glsl_preamble(uses_bfloat16, uses_complex64);
+  os = emit_glsl_preamble(
+      uses_bfloat16,
+      uses_complex64,
+      uses_float16_types,
+      uses_int16_types,
+      uses_int8_types);
 
   // Determine max work per thread based on output dtype size
   int max_itemsize = 1;
@@ -291,21 +367,12 @@ inline void build_glsl_kernel(
     const auto& x = inputs[i];
     const auto& xname = get_var_name(x);
 
-    if (is_scalar(x)) {
-      os += fmt::format(
-          "layout(binding = {}) readonly buffer Buf{} {{ {} {}; }};\n",
-          binding++,
-          i,
-          dtype_to_glsl_storage(x.dtype()),
-          xname);
-    } else {
-      os += fmt::format(
-          "layout(binding = {}) readonly buffer Buf{} {{ {} {}[]; }};\n",
-          binding++,
-          i,
-          dtype_to_glsl_storage(x.dtype()),
-          xname);
-    }
+    os += fmt::format(
+        "layout(binding = {}) readonly buffer Buf{} {{ {} {}[]; }};\n",
+        binding++,
+        i,
+        dtype_to_glsl_storage(x.dtype()),
+        xname);
     input_bindings.push_back({static_cast<int>(i), xname});
   }
 
@@ -379,7 +446,10 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
     if (is_constant(i)) {
       continue;
     } else if (is_scalar(x)) {
-      if (x.dtype() == bfloat16) {
+      if (x.dtype() == bool_) {
+        os += fmt::format(
+            "    {} t_{} = ({}[0] != uint8_t(0));\n", type_str, xname, xname);
+      } else if (x.dtype() == bfloat16) {
         os += fmt::format(
             "    {} t_{} = bf16_to_fp32(uint({}[0]));\n",
             type_str,
@@ -389,7 +459,10 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
         os += fmt::format("    {} t_{} = {}[0];\n", type_str, xname, xname);
       }
     } else if (contiguous) {
-      if (x.dtype() == bfloat16) {
+      if (x.dtype() == bool_) {
+        os += fmt::format(
+            "    {} t_{} = ({}[idx] != uint8_t(0));\n", type_str, xname, xname);
+      } else if (x.dtype() == bfloat16) {
         os += fmt::format(
             "    {} t_{} = bf16_to_fp32(uint({}[idx]));\n",
             type_str,
@@ -413,7 +486,14 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
           xname,
           binding_idx * ndim,
           ndim);
-      if (x.dtype() == bfloat16) {
+      if (x.dtype() == bool_) {
+        os += fmt::format(
+            "    {} t_{} = ({}[loc_{}] != uint8_t(0));\n",
+            type_str,
+            xname,
+            xname,
+            xname);
+      } else if (x.dtype() == bfloat16) {
         os += fmt::format(
             "    {} t_{} = bf16_to_fp32(uint({}[loc_{}]));\n",
             type_str,
@@ -459,6 +539,13 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
           glsl_cast_expr(
               x.dtype(), x.inputs()[0].dtype(), get_input_expr(x.inputs()[0])));
     } else {
+      if (!supports_primitive_name(prim_name)) {
+        throw std::runtime_error(
+            fmt::format(
+                "Unsupported primitive '{}' in Vulkan compiled kernel",
+                prim_name));
+      }
+
       // Get operator or function name
       std::string op = get_glsl_operator(prim_name);
 
@@ -562,7 +649,10 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
     const auto& xname = get_var_name(x);
 
     if (contiguous) {
-      if (x.dtype() == bfloat16) {
+      if (x.dtype() == bool_) {
+        os +=
+            fmt::format("    {}[idx] = uint8_t(t_{} ? 1 : 0);\n", xname, xname);
+      } else if (x.dtype() == bfloat16) {
         os += fmt::format(
             "    {}[idx] = uint16_t(fp32_to_bf16(t_{}));\n", xname, xname);
       } else {
@@ -572,7 +662,13 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
       // For strided outputs, compute output location
       os += fmt::format(
           "    uint out_loc_{} = elem_to_loc(idx, 0, {});\n", xname, ndim);
-      if (x.dtype() == bfloat16) {
+      if (x.dtype() == bool_) {
+        os += fmt::format(
+            "    {}[out_loc_{}] = uint8_t(t_{} ? 1 : 0);\n",
+            xname,
+            xname,
+            xname);
+      } else if (x.dtype() == bfloat16) {
         os += fmt::format(
             "    {}[out_loc_{}] = uint16_t(fp32_to_bf16(t_{}));\n",
             xname,
@@ -672,6 +768,48 @@ void Compiled::eval_gpu(
   // Collapse contiguous dims to route to a faster kernel if possible
   auto [contiguous, shape, strides] =
       compiled_collapse_contiguous_dims(inputs, outputs[0], is_constant_);
+
+  const auto requires_cpu_fallback = [&]() {
+    if (!contiguous) {
+      return true;
+    }
+
+    auto has_nonzero_offset = [](const std::vector<array>& arrays) {
+      return std::any_of(arrays.begin(), arrays.end(), [](const array& x) {
+        return x.offset() != 0;
+      });
+    };
+
+    if (has_nonzero_offset(inputs) || has_nonzero_offset(outputs) ||
+        has_nonzero_offset(tape_)) {
+      return true;
+    }
+
+    auto has_bool_dtype = [](const std::vector<array>& arrays) {
+      return std::any_of(arrays.begin(), arrays.end(), [](const array& x) {
+        return x.dtype() == bool_;
+      });
+    };
+
+    if (has_bool_dtype(inputs_) || has_bool_dtype(outputs_) ||
+        has_bool_dtype(tape_)) {
+      return true;
+    }
+
+    return std::any_of(tape_.begin(), tape_.end(), [](const array& x) {
+      return !is_static_cast(x.primitive()) &&
+          !supports_primitive_name(x.primitive().name());
+    });
+  }();
+
+  if (requires_cpu_fallback) {
+    ::mlx::core::gpu::synchronize(s);
+    auto cpu_stream = default_stream(Device::cpu);
+    Compiled cpu_compiled(cpu_stream, inputs_, outputs_, tape_, constant_ids_);
+    cpu_compiled.eval_cpu(inputs, outputs);
+    synchronize(cpu_stream);
+    return;
+  }
 
   // Use large index if needed
   bool large = compiled_use_large_index(inputs, outputs, contiguous);

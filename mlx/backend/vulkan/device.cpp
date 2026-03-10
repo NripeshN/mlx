@@ -289,12 +289,11 @@ array make_scratch_view(const array& owner, Shape shape, Dtype dtype) {
   auto strides = make_contiguous_strides(shape);
   auto [data_size, row_contiguous, col_contiguous] =
       check_contiguity(shape, strides);
-  scratch.set_data(
-      owner.buffer(),
-      data_size,
+  scratch.copy_shared_buffer(
+      owner,
       std::move(strides),
       {true, row_contiguous, col_contiguous},
-      [](allocator::Buffer) {});
+      data_size);
   scratch.set_status(array::Status::available);
   return scratch;
 }

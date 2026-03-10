@@ -166,13 +166,45 @@ void VulkanContext::init() {
     queue_create_info.queueCount = 1;
     queue_create_info.pQueuePriorities = &queue_priority;
 
-    VkPhysicalDeviceFeatures device_features{};
+    VkPhysicalDeviceFeatures2 supported_features{};
+    supported_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    VkPhysicalDeviceVulkan11Features supported_vulkan11_features{};
+    supported_vulkan11_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    VkPhysicalDeviceShaderFloat16Int8Features supported_shader_float16_int8{};
+    supported_shader_float16_int8.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+    supported_features.pNext = &supported_vulkan11_features;
+    supported_vulkan11_features.pNext = &supported_shader_float16_int8;
+    vkGetPhysicalDeviceFeatures2(physical_device, &supported_features);
+
+    VkPhysicalDeviceFeatures2 enabled_features{};
+    enabled_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    VkPhysicalDeviceVulkan11Features enabled_vulkan11_features{};
+    enabled_vulkan11_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    VkPhysicalDeviceShaderFloat16Int8Features enabled_shader_float16_int8{};
+    enabled_shader_float16_int8.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+    enabled_features.pNext = &enabled_vulkan11_features;
+    enabled_vulkan11_features.pNext = &enabled_shader_float16_int8;
+
+    if (supported_vulkan11_features.storageBuffer16BitAccess) {
+      enabled_vulkan11_features.storageBuffer16BitAccess = VK_TRUE;
+    }
+    if (supported_features.features.shaderInt16) {
+      enabled_features.features.shaderInt16 = VK_TRUE;
+    }
+    if (supported_shader_float16_int8.shaderFloat16) {
+      enabled_shader_float16_int8.shaderFloat16 = VK_TRUE;
+    }
 
     VkDeviceCreateInfo device_create_info{};
     device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    device_create_info.pNext = &enabled_features;
     device_create_info.pQueueCreateInfos = &queue_create_info;
     device_create_info.queueCreateInfoCount = 1;
-    device_create_info.pEnabledFeatures = &device_features;
+    device_create_info.pEnabledFeatures = nullptr;
 
     throw_if_vk_error(
         vkCreateDevice(physical_device, &device_create_info, nullptr, &device),
