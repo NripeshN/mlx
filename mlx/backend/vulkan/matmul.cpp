@@ -153,7 +153,10 @@ std::vector<std::string> mul_mm_shader_candidates(Dtype dtype) {
       break;
     case float32:
       base = "matmul_f32_f32";
-      break;
+      return {
+          base + "_fp32",
+          base,
+      };
     default:
       return {};
   }
