@@ -19,13 +19,16 @@ namespace mlx::core {
 
 namespace {
 
-// Convert MLX dtype to GLSL type string
-std::string dtype_to_glsl(Dtype d) {
+std::string dtype_to_glsl_storage(Dtype d) {
   switch (d) {
     case float32:
       return "float";
     case float16:
       return "float16_t";
+    case bfloat16:
+      return "uint16_t";
+    case complex64:
+      return "vec2";
     case int32:
       return "int";
     case uint32:
@@ -49,6 +52,136 @@ std::string dtype_to_glsl(Dtype d) {
           fmt::format(
               "Unsupported dtype for Vulkan compiled: {}", dtype_to_string(d)));
   }
+}
+
+std::string dtype_to_glsl_compute(Dtype d) {
+  switch (d) {
+    case bfloat16:
+      return "float";
+    case complex64:
+      return "vec2";
+    default:
+      return dtype_to_glsl_storage(d);
+  }
+}
+
+bool has_dtype(const std::vector<array>& arrays, Dtype dtype) {
+  for (const auto& x : arrays) {
+    if (x.dtype() == dtype) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string glsl_constant(const array& x) {
+  switch (x.dtype()) {
+    case complex64: {
+      auto v = x.item<complex64_t>();
+      return fmt::format("vec2({:.9g}, {:.9g})", v.real(), v.imag());
+    }
+    case bfloat16: {
+      auto v = x.item<bfloat16_t>();
+      return fmt::format("float({:.9g})", static_cast<float>(v));
+    }
+    case float16: {
+      auto v = x.item<float16_t>();
+      return fmt::format("float16_t({:.9g})", static_cast<float>(v));
+    }
+    default: {
+      std::ostringstream ss;
+      print_constant(ss, x);
+      return fmt::format("{}({})", dtype_to_glsl_compute(x.dtype()), ss.str());
+    }
+  }
+}
+
+std::string glsl_cast_expr(Dtype dst, Dtype src, const std::string& expr) {
+  if (dst == complex64 && src != complex64) {
+    return fmt::format("vec2({}, 0.0)", expr);
+  }
+  if (dst != complex64 && src == complex64) {
+    return fmt::format("{}(({}).x)", dtype_to_glsl_compute(dst), expr);
+  }
+  return fmt::format("{}({})", dtype_to_glsl_compute(dst), expr);
+}
+
+std::string emit_glsl_preamble(bool uses_bfloat16, bool uses_complex64) {
+  std::ostringstream os;
+  os << "#version 450\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n";
+  os << "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n";
+  os << "#extension GL_EXT_shader_16bit_storage : require\n";
+  os << "\n";
+
+  if (uses_bfloat16) {
+    os << R"(
+uint fp32_to_bf16(float f) {
+  uint u = floatBitsToUint(f);
+  u = (u + (0x7fffu + ((u >> 16) & 1u))) >> 16;
+  return u;
+}
+
+float bf16_to_fp32(uint u) {
+  return uintBitsToFloat(u << 16);
+}
+
+)";
+  }
+
+  if (uses_complex64) {
+    os << R"(
+vec2 complex_mul(vec2 a, vec2 b) {
+  return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+vec2 complex_div(vec2 a, vec2 b) {
+  float denom = dot(b, b);
+  return vec2(
+      (a.x * b.x + a.y * b.y) / denom,
+      (a.y * b.x - a.x * b.y) / denom);
+}
+
+vec2 complex_exp(vec2 z) {
+  float e = exp(z.x);
+  return vec2(e * cos(z.y), e * sin(z.y));
+}
+
+vec2 complex_log(vec2 z) {
+  return vec2(log(length(z)), atan(z.y, z.x));
+}
+
+vec2 complex_sin(vec2 z) {
+  return vec2(sin(z.x) * cosh(z.y), cos(z.x) * sinh(z.y));
+}
+
+vec2 complex_cos(vec2 z) {
+  return vec2(cos(z.x) * cosh(z.y), -sin(z.x) * sinh(z.y));
+}
+
+vec2 complex_tan(vec2 z) {
+  return complex_div(complex_sin(z), complex_cos(z));
+}
+
+vec2 complex_sigmoid(vec2 z) {
+  return complex_div(vec2(1.0, 0.0), vec2(1.0, 0.0) + complex_exp(-z));
+}
+
+float complex_abs(vec2 z) {
+  return length(z);
+}
+
+vec2 complex_conjugate(vec2 z) {
+  return vec2(z.x, -z.y);
+}
+
+)";
+  }
+
+  os << "layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
+  return os.str();
 }
 
 // Map primitive names to GLSL operators/functions
@@ -131,11 +264,13 @@ inline void build_glsl_kernel(
     get_var_name(x);
   }
 
+  bool uses_bfloat16 = has_dtype(inputs, bfloat16) ||
+      has_dtype(outputs, bfloat16) || has_dtype(tape, bfloat16);
+  bool uses_complex64 = has_dtype(inputs, complex64) ||
+      has_dtype(outputs, complex64) || has_dtype(tape, complex64);
+
   // GLSL header
-  os = "#version 450\n";
-  os += "#extension GL_EXT_shader_16bit_storage : require\n";
-  os +=
-      "\nlayout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;\n\n";
+  os = emit_glsl_preamble(uses_bfloat16, uses_complex64);
 
   // Determine max work per thread based on output dtype size
   int max_itemsize = 1;
@@ -161,14 +296,14 @@ inline void build_glsl_kernel(
           "layout(binding = {}) readonly buffer Buf{} {{ {} {}; }};\n",
           binding++,
           i,
-          dtype_to_glsl(x.dtype()),
+          dtype_to_glsl_storage(x.dtype()),
           xname);
     } else {
       os += fmt::format(
           "layout(binding = {}) readonly buffer Buf{} {{ {} {}[]; }};\n",
           binding++,
           i,
-          dtype_to_glsl(x.dtype()),
+          dtype_to_glsl_storage(x.dtype()),
           xname);
     }
     input_bindings.push_back({static_cast<int>(i), xname});
@@ -191,7 +326,7 @@ inline void build_glsl_kernel(
         "layout(binding = {}) buffer OutBuf{} {{ {} {}[]; }};\n",
         binding++,
         i,
-        dtype_to_glsl(x.dtype()),
+        dtype_to_glsl_storage(x.dtype()),
         xname);
   }
 
@@ -236,25 +371,33 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
   }
 
   // Declare and load inputs into temps
-  std::vector<std::string> loaded_inputs(inputs.size());
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& x = inputs[i];
     const auto& xname = get_var_name(x);
-    std::string type_str = dtype_to_glsl(x.dtype());
+    std::string type_str = dtype_to_glsl_compute(x.dtype());
 
     if (is_constant(i)) {
-      // Constants are inlined directly
-      std::ostringstream ss;
-      print_constant(ss, x);
-      loaded_inputs[i] = fmt::format("{}({})", type_str, ss.str());
+      continue;
     } else if (is_scalar(x)) {
-      // Scalars read from buffer[0]
-      os += fmt::format("    {} t_{} = {}[0];\n", type_str, xname, xname);
-      loaded_inputs[i] = fmt::format("t_{}", xname);
+      if (x.dtype() == bfloat16) {
+        os += fmt::format(
+            "    {} t_{} = bf16_to_fp32(uint({}[0]));\n",
+            type_str,
+            xname,
+            xname);
+      } else {
+        os += fmt::format("    {} t_{} = {}[0];\n", type_str, xname, xname);
+      }
     } else if (contiguous) {
-      // Contiguous: direct indexing
-      os += fmt::format("    {} t_{} = {}[idx];\n", type_str, xname, xname);
-      loaded_inputs[i] = fmt::format("t_{}", xname);
+      if (x.dtype() == bfloat16) {
+        os += fmt::format(
+            "    {} t_{} = bf16_to_fp32(uint({}[idx]));\n",
+            type_str,
+            xname,
+            xname);
+      } else {
+        os += fmt::format("    {} t_{} = {}[idx];\n", type_str, xname, xname);
+      }
     } else {
       // Strided: compute location from strides
       // Find the binding index for this input
@@ -270,9 +413,17 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
           xname,
           binding_idx * ndim,
           ndim);
-      os += fmt::format(
-          "    {} t_{} = {}[loc_{}];\n", type_str, xname, xname, xname);
-      loaded_inputs[i] = fmt::format("t_{}", xname);
+      if (x.dtype() == bfloat16) {
+        os += fmt::format(
+            "    {} t_{} = bf16_to_fp32(uint({}[loc_{}]));\n",
+            type_str,
+            xname,
+            xname,
+            xname);
+      } else {
+        os += fmt::format(
+            "    {} t_{} = {}[loc_{}];\n", type_str, xname, xname, xname);
+      }
     }
   }
 
@@ -285,10 +436,7 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
   // Helper to get GLSL expression for an input to a tape operation
   auto get_input_expr = [&](const array& x) -> std::string {
     if (is_constant_array(x)) {
-      // Inline constant
-      std::ostringstream ss;
-      print_constant(ss, x);
-      return fmt::format("{}({})", dtype_to_glsl(x.dtype()), ss.str());
+      return glsl_constant(x);
     } else {
       // Use temp variable
       return fmt::format("t_{}", get_var_name(x));
@@ -298,7 +446,7 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
   // Replay tape operations
   for (const auto& x : tape) {
     const auto& xname = get_var_name(x);
-    std::string type_str = dtype_to_glsl(x.dtype());
+    std::string type_str = dtype_to_glsl_compute(x.dtype());
     const auto& prim = x.primitive();
     std::string prim_name = prim.name();
 
@@ -306,7 +454,10 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
 
     if (is_static_cast(prim)) {
       // Handle Broadcast/AsType as static casts
-      os += fmt::format("{}({});\n", type_str, get_input_expr(x.inputs()[0]));
+      os += fmt::format(
+          "{};\n",
+          glsl_cast_expr(
+              x.dtype(), x.inputs()[0].dtype(), get_input_expr(x.inputs()[0])));
     } else {
       // Get operator or function name
       std::string op = get_glsl_operator(prim_name);
@@ -317,12 +468,26 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
            op == "!=" || op == ">" || op == "<" || op == ">=" || op == "<=" ||
            op == "&&" || op == "||" || op == "&" || op == "|" || op == "^");
 
+      bool is_complex = x.dtype() == complex64;
+
       if (is_binary_op && x.inputs().size() == 2) {
-        os += fmt::format(
-            "({} {} {});\n",
-            get_input_expr(x.inputs()[0]),
-            op,
-            get_input_expr(x.inputs()[1]));
+        if (is_complex && op == "*") {
+          os += fmt::format(
+              "complex_mul({}, {});\n",
+              get_input_expr(x.inputs()[0]),
+              get_input_expr(x.inputs()[1]));
+        } else if (is_complex && op == "/") {
+          os += fmt::format(
+              "complex_div({}, {});\n",
+              get_input_expr(x.inputs()[0]),
+              get_input_expr(x.inputs()[1]));
+        } else {
+          os += fmt::format(
+              "({} {} {});\n",
+              get_input_expr(x.inputs()[0]),
+              op,
+              get_input_expr(x.inputs()[1]));
+        }
       } else if (op == "max" || op == "min") {
         // Built-in GLSL functions
         os += fmt::format(
@@ -333,13 +498,60 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
       } else {
         // Generic function call - use the mapped name (e.g., "exp" instead of
         // "Exp")
-        os += fmt::format("{}(", op);
-        for (size_t i = 0; i < x.inputs().size(); ++i) {
-          if (i > 0)
-            os += ", ";
-          os += get_input_expr(x.inputs()[i]);
+        std::string fn = op;
+        if (prim_name == "Real" && !x.inputs().empty() &&
+            x.inputs()[0].dtype() == complex64) {
+          os += fmt::format("({}).x;\n", get_input_expr(x.inputs()[0]));
+        } else if (
+            prim_name == "Imag" && !x.inputs().empty() &&
+            x.inputs()[0].dtype() == complex64) {
+          os += fmt::format("({}).y;\n", get_input_expr(x.inputs()[0]));
+        } else if (x.dtype() == complex64) {
+          if (op == "exp") {
+            fn = "complex_exp";
+          } else if (op == "log") {
+            fn = "complex_log";
+          } else if (op == "sin") {
+            fn = "complex_sin";
+          } else if (op == "cos") {
+            fn = "complex_cos";
+          } else if (op == "tan") {
+            fn = "complex_tan";
+          } else if (op == "sigmoid") {
+            fn = "complex_sigmoid";
+          } else if (op == "abs") {
+            fn = "complex_abs";
+          } else if (prim_name == "Conjugate") {
+            fn = "complex_conjugate";
+          }
+        } else if (
+            prim_name == "Abs" && !x.inputs().empty() &&
+            x.inputs()[0].dtype() == complex64) {
+          fn = "complex_abs";
+        } else if (
+            prim_name == "Conjugate" && !x.inputs().empty() &&
+            x.inputs()[0].dtype() == complex64) {
+          fn = "complex_conjugate";
+        } else if (op == "sigmoid") {
+          fn = "(1.0 / (1.0 + exp(-";
         }
-        os += ");\n";
+
+        if ((prim_name == "Real" || prim_name == "Imag") &&
+            !x.inputs().empty() && x.inputs()[0].dtype() == complex64) {
+          // Already emitted.
+        } else if (op == "sigmoid" && x.dtype() != complex64) {
+          os += fn;
+          os += get_input_expr(x.inputs()[0]);
+          os += ")));\n";
+        } else {
+          os += fmt::format("{}(", fn);
+          for (size_t i = 0; i < x.inputs().size(); ++i) {
+            if (i > 0)
+              os += ", ";
+            os += get_input_expr(x.inputs()[i]);
+          }
+          os += ");\n";
+        }
       }
     }
   }
@@ -350,12 +562,25 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
     const auto& xname = get_var_name(x);
 
     if (contiguous) {
-      os += fmt::format("    {}[idx] = t_{};\n", xname, xname);
+      if (x.dtype() == bfloat16) {
+        os += fmt::format(
+            "    {}[idx] = uint16_t(fp32_to_bf16(t_{}));\n", xname, xname);
+      } else {
+        os += fmt::format("    {}[idx] = t_{};\n", xname, xname);
+      }
     } else {
       // For strided outputs, compute output location
       os += fmt::format(
           "    uint out_loc_{} = elem_to_loc(idx, 0, {});\n", xname, ndim);
-      os += fmt::format("    {}[out_loc_{}] = t_{};\n", xname, xname, xname);
+      if (x.dtype() == bfloat16) {
+        os += fmt::format(
+            "    {}[out_loc_{}] = uint16_t(fp32_to_bf16(t_{}));\n",
+            xname,
+            xname,
+            xname);
+      } else {
+        os += fmt::format("    {}[out_loc_{}] = t_{};\n", xname, xname, xname);
+      }
     }
   }
 
@@ -409,17 +634,17 @@ void Compiled::eval_gpu(
   vulkan::ScopedSyncLabel sync_label("compiled_eval_gpu");
   auto& s = stream();
 
-  // Check for unsupported dtypes (bfloat16 requires special handling)
+  // Check for unsupported dtypes.
   bool has_unsupported_dtype = false;
   for (const auto& x : inputs_) {
-    if (x.dtype() == bfloat16 || x.dtype() == complex64) {
+    if (x.dtype() == float64) {
       has_unsupported_dtype = true;
       break;
     }
   }
   if (!has_unsupported_dtype) {
     for (const auto& x : outputs_) {
-      if (x.dtype() == bfloat16 || x.dtype() == complex64) {
+      if (x.dtype() == float64) {
         has_unsupported_dtype = true;
         break;
       }

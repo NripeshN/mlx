@@ -229,23 +229,30 @@ void copy_gpu_inplace(
 
   const bool staging_scalar_fill = ctype == CopyType::Scalar &&
       !dynamic_i_offset && !dynamic_o_offset && i_offset == 0 &&
-      o_offset == 0 && out.flags().contiguous &&
-      out.data_size() == out.size() &&
-      !vulkan::VulkanContext::get().is_unified_memory();
+      o_offset == 0 && full_tensor_copy &&
+      (out.flags().contiguous || out.flags().row_contiguous ||
+       out.flags().col_contiguous);
 
   if (staging_scalar_fill) {
-    std::vector<char> host_fill(out.nbytes());
     const char* scalar_ptr = static_cast<const char*>(in.data<void>());
     const size_t scalar_size = size_of(in.dtype());
-    for (size_t offset = 0; offset < host_fill.size(); offset += scalar_size) {
-      std::memcpy(host_fill.data() + offset, scalar_ptr, scalar_size);
-    }
-
     auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
-    vulkan::enqueue_owned_staging_upload(
-        s, host_fill.data(), host_fill.size(), out_buf->buffer, out.offset());
-    vulkan::retain_array_for_stream(s, in);
-    vulkan::retain_array_for_stream(s, out);
+    if (vulkan::VulkanContext::get().is_unified_memory()) {
+      char* dst = static_cast<char*>(out_buf->mapped_ptr) + out.offset();
+      for (size_t offset = 0; offset < out.nbytes(); offset += scalar_size) {
+        std::memcpy(dst + offset, scalar_ptr, scalar_size);
+      }
+    } else {
+      std::vector<char> host_fill(out.nbytes());
+      for (size_t offset = 0; offset < host_fill.size();
+           offset += scalar_size) {
+        std::memcpy(host_fill.data() + offset, scalar_ptr, scalar_size);
+      }
+      vulkan::enqueue_owned_staging_upload(
+          s, host_fill.data(), host_fill.size(), out_buf->buffer, out.offset());
+      vulkan::retain_array_for_stream(s, in);
+      vulkan::retain_array_for_stream(s, out);
+    }
     return;
   }
 
