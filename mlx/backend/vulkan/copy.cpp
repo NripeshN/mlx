@@ -65,7 +65,9 @@ std::string seq_to_string(const Seq& seq) {
 }
 
 bool is_supported_copy_layout(const mlx::core::array& arr) {
-  if (arr.ndim() > 4 || arr.size() > std::numeric_limits<uint32_t>::max()) {
+  // For contiguous arrays, we can handle any number of dimensions
+  // by treating them as 1D
+  if (arr.size() > std::numeric_limits<uint32_t>::max()) {
     return false;
   }
   if (arr.offset() < 0 || arr.offset() > 0xFFFF) {
@@ -110,8 +112,10 @@ std::string get_copy_shader_name(
     }
   }
 
+  // Only use contig_cpy shaders when both arrays have the same size
+  // (for simple contiguous copies, not for scatter/concatenate operations)
   if (in.offset() == 0 && out.offset() == 0 && in.flags().row_contiguous &&
-      out.flags().row_contiguous) {
+      out.flags().row_contiguous && in.size() == out.size()) {
     if (in.dtype() == mlx::core::float32 &&
         out.dtype() == mlx::core::bfloat16) {
       return "contig_cpy_f32_bf16";
@@ -223,10 +227,13 @@ void copy_gpu_inplace(
   const bool shader_copy_type =
       ctype == CopyType::General || ctype == CopyType::GeneralGeneral;
 
+  // Allow shader copy for both full tensor copies and strided copies
+  // as long as total element count matches and layouts are supported
+  const bool same_element_count = in.size() == out.size();
   const bool shader_copy = shader_copy_type && !dynamic_i_offset &&
-      !dynamic_o_offset && i_offset == 0 && o_offset == 0 && full_tensor_copy &&
-      is_supported_copy_layout(in) && is_supported_copy_layout(out) &&
-      !shader_name.empty();
+      !dynamic_o_offset && i_offset == 0 && o_offset == 0 &&
+      same_element_count && is_supported_copy_layout(in) &&
+      is_supported_copy_layout(out) && !shader_name.empty();
 
   const bool staging_scalar_fill = ctype == CopyType::Scalar &&
       !dynamic_i_offset && !dynamic_o_offset && i_offset == 0 &&
@@ -257,7 +264,13 @@ void copy_gpu_inplace(
     return;
   }
 
-  if (!raw_buffer_copy && !shader_copy) {
+  // For GeneralGeneral copies with mismatched sizes (slice updates),
+  // we need special handling
+  const bool is_slice_copy = shader_copy_type && !dynamic_i_offset &&
+      !dynamic_o_offset && !shader_name.empty() && in.size() != out.size() &&
+      i_offset == 0;
+
+  if (!raw_buffer_copy && !shader_copy && !is_slice_copy) {
     throw std::runtime_error(
         "Copy operation failed on Vulkan (unsupported dtype or layout).");
   }
@@ -284,7 +297,7 @@ void copy_gpu_inplace(
     vulkan::retain_array_for_stream(s, in);
     vulkan::retain_array_for_stream(s, out);
 
-  } else if (shader_copy) {
+  } else if (shader_copy || is_slice_copy) {
     if (trace_copy_dispatch_enabled() &&
         (shader_name == "cpy_bf16_f32" || shader_name == "cpy_bf16_bf16")) {
       std::cerr << "[vulkan-copy] shader=" << shader_name
@@ -298,7 +311,54 @@ void copy_gpu_inplace(
                 << " out_strides=" << seq_to_string(out.strides()) << "\n";
     }
     try {
-      vulkan::dispatch_unary_op(in, out, shader_name, cmd_buffer, s);
+      // For >4D arrays, we need to use a different approach since the shader
+      // only supports up to 4D. For contiguous arrays, use raw buffer copy.
+      // For non-contiguous >4D arrays, throw an error.
+      if (in.ndim() > 4 || out.ndim() > 4) {
+        if (in.flags().contiguous && out.flags().contiguous &&
+            in.size() == out.size() && !is_slice_copy) {
+          // Use raw buffer copy for contiguous >4D arrays
+          VkBufferCopy copy_region{};
+          copy_region.srcOffset =
+              static_cast<VkDeviceSize>(in.offset() * size_of(in.dtype()));
+          copy_region.dstOffset =
+              static_cast<VkDeviceSize>(out.offset() * size_of(out.dtype()));
+          copy_region.size = static_cast<VkDeviceSize>(in.nbytes());
+
+          auto* in_buf = static_cast<vulkan::VulkanBuffer*>(
+              const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
+          auto* out_buf =
+              static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
+          vkCmdCopyBuffer(
+              cmd_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
+
+          vulkan::retain_array_for_stream(s, in);
+          vulkan::retain_array_for_stream(s, out);
+          vulkan::end_command_recording(s.index);
+          return;
+        } else {
+          throw std::runtime_error(
+              "Copy operation failed on Vulkan: >4D non-contiguous arrays not supported");
+        }
+      }
+
+      if (is_slice_copy) {
+        // For slice copies, use a custom dispatch that handles mismatched sizes
+        // Create temporary arrays with proper shapes for the copy
+        array in_view(in.shape(), in.dtype(), nullptr, {});
+        in_view.copy_shared_buffer(
+            in, in.strides(), in.flags(), in.size(), in.offset());
+
+        // Create output view with the slice shape and strides
+        array out_view(in.shape(), out.dtype(), nullptr, {});
+        out_view.copy_shared_buffer(
+            out, o_strides, out.flags(), in.size(), o_offset);
+
+        vulkan::dispatch_unary_op(
+            in_view, out_view, shader_name, cmd_buffer, s);
+      } else {
+        vulkan::dispatch_unary_op(in, out, shader_name, cmd_buffer, s);
+      }
     } catch (const std::runtime_error& e) {
       vulkan::end_command_recording(s.index);
       throw std::runtime_error(

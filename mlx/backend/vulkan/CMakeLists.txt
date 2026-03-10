@@ -140,6 +140,7 @@ if(Vulkan_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/reduce.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/softmax.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/gather.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scatter.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/scan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/arange.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/rope.cpp
