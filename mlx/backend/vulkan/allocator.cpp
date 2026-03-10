@@ -3,18 +3,33 @@
 #include "mlx/backend/vulkan/allocator.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
 
 #include "mlx/backend/gpu/device_info.h"
+#include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/memory.h"
 
 namespace mlx::core {
 
 namespace allocator {
+
+namespace {
+
+bool trace_cpu_access_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_VULKAN_TRACE_CPU_ACCESS");
+    return env != nullptr && std::string(env) != "0";
+  }();
+  return enabled;
+}
+
+} // namespace
 
 Allocator& allocator() {
   return vulkan::allocator();
@@ -24,7 +39,15 @@ void* Buffer::raw_ptr() {
   if (!ptr_) {
     return nullptr;
   }
-  return static_cast<vulkan::VulkanBuffer*>(ptr_)->mapped_ptr;
+  auto* buf = static_cast<vulkan::VulkanBuffer*>(ptr_);
+  if (trace_cpu_access_enabled()) {
+    std::cerr << "[vulkan-cpu-access] raw_ptr buffer=" << buf->buffer
+              << " mapped=" << buf->mapped_ptr << " size=" << buf->size
+              << " alloc=" << buf->allocation_size << " flags=0x" << std::hex
+              << buf->memory_flags << std::dec << "\n";
+  }
+  vulkan::synchronize_all();
+  return buf->mapped_ptr;
 }
 
 } // namespace allocator
