@@ -454,33 +454,16 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     log_matmul_path(inputs, "mul_mm");
     return;
   }
-  log_matmul_path(inputs, "cpu_fallback");
-  vulkan::ScopedSyncLabel sync_label("matmul_cpu_fallback");
-  ::mlx::core::gpu::synchronize(stream());
-  auto cpu_stream = default_stream(Device::cpu);
-  Matmul cpu_matmul(cpu_stream);
-  cpu_matmul.eval_cpu(inputs, out);
-  synchronize(cpu_stream);
+  throw std::runtime_error(
+      "Matmul operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  auto [alpha, beta] = state();
-  vulkan::ScopedSyncLabel sync_label("addmm_cpu_fallback");
-  ::mlx::core::gpu::synchronize(stream());
-  auto cpu_stream = default_stream(Device::cpu);
-  AddMM cpu_addmm(cpu_stream, alpha, beta);
-  cpu_addmm.eval_cpu(inputs, out);
-  synchronize(cpu_stream);
+  throw std::runtime_error("[AddMM::eval_gpu] Not implemented.");
 }
 
 void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  auto block_size = state();
-  vulkan::ScopedSyncLabel sync_label("block_masked_mm_cpu_fallback");
-  ::mlx::core::gpu::synchronize(stream());
-  auto cpu_stream = default_stream(Device::cpu);
-  BlockMaskedMM cpu_block_masked_mm(cpu_stream, block_size);
-  cpu_block_masked_mm.eval_cpu(inputs, out);
-  synchronize(cpu_stream);
+  throw std::runtime_error("[BlockMaskedMM::eval_gpu] Not implemented.");
 }
 
 } // namespace mlx::core

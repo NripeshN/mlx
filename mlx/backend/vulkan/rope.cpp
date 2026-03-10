@@ -277,22 +277,7 @@ void RoPE::eval_gpu(
         "[vulkan::RoPE::eval_gpu] Expected exactly one output.");
   }
 
-  if (!forward_) {
-    vulkan::ScopedSyncLabel sync_label("rope_vjp_cpu_fallback");
-    ::mlx::core::gpu::synchronize(stream());
-    auto fallback_outputs = fallback_(inputs);
-    if (fallback_outputs.size() != outputs.size()) {
-      throw std::runtime_error(
-          "[vulkan::RoPE::eval_gpu] Fallback output count mismatch.");
-    }
-    eval(fallback_outputs);
-    for (int i = 0; i < outputs.size(); ++i) {
-      outputs[i].copy_shared_buffer(fallback_outputs[i]);
-    }
-    return;
-  }
-
-  if (try_eval_rope_vulkan(
+  if (!try_eval_rope_vulkan(
           inputs,
           outputs[0],
           dims_,
@@ -301,19 +286,7 @@ void RoPE::eval_gpu(
           scale_,
           forward_,
           stream())) {
-    return;
-  }
-
-  vulkan::ScopedSyncLabel sync_label("rope_cpu_fallback");
-  ::mlx::core::gpu::synchronize(stream());
-  auto fallback_outputs = fallback_(inputs);
-  if (fallback_outputs.size() != outputs.size()) {
-    throw std::runtime_error(
-        "[vulkan::RoPE::eval_gpu] Fallback output count mismatch.");
-  }
-  eval(fallback_outputs);
-  for (int i = 0; i < outputs.size(); ++i) {
-    outputs[i].copy_shared_buffer(fallback_outputs[i]);
+    throw std::runtime_error("RoPE failed on Vulkan.");
   }
 }
 

@@ -47,10 +47,10 @@ bool try_eval_arange_vulkan(
 
 void Arange::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [start, stop, step] = state();
-  if (try_eval_arange_vulkan(inputs, out, stream(), start, step)) {
-    return;
+  if (!try_eval_arange_vulkan(inputs, out, stream(), start, step)) {
+    throw std::runtime_error(
+        "Arange operation failed on Vulkan (unsupported dtype or layout).");
   }
-  eval_cpu_fallback_on_stream<Arange>(inputs, out, stream(), start, stop, step);
 }
 
 } // namespace mlx::core

@@ -109,12 +109,11 @@ bool try_eval_scan_cumsum_vulkan(
 
 void Scan::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [reduce_type, axis, reverse, inclusive] = state();
-  if (try_eval_scan_cumsum_vulkan(
+  if (!try_eval_scan_cumsum_vulkan(
           inputs, out, reduce_type, axis, reverse, inclusive, stream())) {
-    return;
+    throw std::runtime_error(
+        "Scan operation failed on Vulkan (unsupported dtype or layout).");
   }
-  eval_cpu_fallback_on_stream<Scan>(
-      inputs, out, stream(), reduce_type, axis, reverse, inclusive);
 }
 
 } // namespace mlx::core

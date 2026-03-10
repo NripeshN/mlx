@@ -216,20 +216,19 @@ bool try_eval_arg_reduce_vulkan(
 
 void ArgReduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [reduce_type, axis] = state();
-  if (try_eval_arg_reduce_vulkan(inputs, out, reduce_type, axis, stream())) {
-    return;
+  if (!try_eval_arg_reduce_vulkan(inputs, out, reduce_type, axis, stream())) {
+    throw std::runtime_error(
+        "ArgReduce operation failed on Vulkan (unsupported dtype or layout).");
   }
-  eval_cpu_fallback_on_stream<ArgReduce>(
-      inputs, out, stream(), reduce_type, axis);
 }
 
 void Reduce::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [reduce_type, axes] = state();
-  if (try_eval_reduce_sum_rows_vulkan(
+  if (!try_eval_reduce_sum_rows_vulkan(
           inputs, out, reduce_type, axes, stream())) {
-    return;
+    throw std::runtime_error(
+        "Reduce operation failed on Vulkan (unsupported dtype or layout).");
   }
-  eval_cpu_fallback_on_stream<Reduce>(inputs, out, stream(), reduce_type, axes);
 }
 
 } // namespace mlx::core

@@ -35,6 +35,17 @@ namespace mlx::core {
     throw std::runtime_error(#func " has no Vulkan implementation.");  \
   }
 
+#define NO_GPU_MULTI_STATE(func)                                       \
+  void func::eval_gpu(                                                 \
+      const std::vector<array>& inputs, std::vector<array>& outputs) { \
+    throw std::runtime_error(#func " has no Vulkan implementation.");  \
+  }
+
+#define NO_GPU_STATE(func)                                            \
+  void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
+    throw std::runtime_error(#func " has no Vulkan implementation."); \
+  }
+
 #define NO_GPU_USE_FALLBACK(func)                             \
   bool func::use_fallback(Stream s) {                         \
     trace_use_fallback(#func, s, "no Vulkan implementation"); \
@@ -62,14 +73,9 @@ CPU_FALLBACK_STATE(Equal)
 // - fast.cpp: LayerNorm, RMSNorm, Quantize, ConvertFP8, CustomKernel, SDPA
 // - random.cpp: RandomBits
 
-// Load primitive implementation for Vulkan.
+// Load primitive - throw NYI like Metal backend
 void Load::eval_gpu(const std::vector<array>& inputs, array& out) {
-  vulkan::ScopedSyncLabel sync_label("load_cpu_fallback");
-  ::mlx::core::gpu::synchronize(stream());
-  auto cpu_stream = default_stream(Device::cpu);
-  Load cpu_load(cpu_stream, reader_, offset_, swap_endianness_);
-  cpu_load.eval_cpu(inputs, out);
-  synchronize(cpu_stream);
+  throw std::runtime_error("[Load::eval_gpu] Not implemented.");
 }
 
 // CPU fallbacks for primitives not implemented on Vulkan
@@ -103,11 +109,18 @@ CPU_FALLBACK(LogicalNot)
 CPU_FALLBACK(LogicalAnd)
 CPU_FALLBACK(LogicalOr)
 CPU_FALLBACK(LogAddExp)
-CPU_FALLBACK_MULTI(LUF)
+// Linear algebra operations - throw NYI like Metal backend
+NO_GPU_MULTI(LUF)
+NO_GPU_MULTI(QRF)
+NO_GPU_STATE(Inverse)
+NO_GPU_STATE(Cholesky)
+NO_GPU_MULTI_STATE(Eigh)
+NO_GPU_MULTI_STATE(Eig)
+NO_GPU_MULTI_STATE(SVD)
+
 CPU_FALLBACK(NotEqual)
 CPU_FALLBACK_STATE(Partition)
 CPU_FALLBACK(Power)
-CPU_FALLBACK_MULTI(QRF)
 CPU_FALLBACK_STATE(QuantizedMatmul)
 CPU_FALLBACK_STATE(QQMatmul)
 CPU_FALLBACK(Real)
@@ -115,11 +128,6 @@ CPU_FALLBACK(Sign)
 CPU_FALLBACK(Sinh)
 CPU_FALLBACK_STATE(Sort)
 CPU_FALLBACK(Tan)
-CPU_FALLBACK_STATE(Inverse)
-CPU_FALLBACK_STATE(Cholesky)
-CPU_FALLBACK_MULTI_STATE(Eigh)
-CPU_FALLBACK_MULTI_STATE(Eig)
-CPU_FALLBACK_MULTI_STATE(SVD)
 CPU_FALLBACK(MaskedScatter)
 CPU_FALLBACK_STATE(Scatter)
 CPU_FALLBACK_STATE(ScatterAxis)

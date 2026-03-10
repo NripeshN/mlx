@@ -20,9 +20,8 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   // For now, support only uint32 keys/output on Vulkan.
   if (keys.dtype() != uint32 || out.dtype() != uint32) {
-    eval_cpu_fallback_on_stream<RandomBits>(
-        inputs, out, stream(), state().first, state().second);
-    return;
+    throw std::runtime_error(
+        "RandomBits failed on Vulkan (only uint32 keys/output supported).");
   }
 
   // Shader expects packed key layout.
@@ -64,13 +63,8 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
 
     vulkan::end_command_recording(stream().index);
   } catch (const std::runtime_error& e) {
-    if (trace_fallback_enabled()) {
-      std::ostringstream oss;
-      oss << "random_bits_dispatch_failed reason=" << e.what();
-      trace_fallback(oss.str());
-    }
-    eval_cpu_fallback_on_stream<RandomBits>(
-        inputs, out, stream(), state().first, state().second);
+    throw std::runtime_error(
+        std::string("RandomBits failed on Vulkan: ") + e.what());
   }
 }
 

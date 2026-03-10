@@ -140,15 +140,16 @@ bool try_eval_binary_op_vulkan(
 }
 
 template <typename Primitive>
-void eval_binary_vulkan_or_cpu(
+void eval_binary_vulkan(
     const std::vector<array>& inputs,
     array& out,
     const char* op_name,
     Stream s) {
-  if (try_eval_binary_op_vulkan<Primitive>(inputs, out, op_name, s)) {
-    return;
+  if (!try_eval_binary_op_vulkan<Primitive>(inputs, out, op_name, s)) {
+    throw std::runtime_error(
+        std::string("Binary operation ") + op_name +
+        " failed on Vulkan (unsupported dtype or layout).");
   }
-  eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
 }
 
 bool try_eval_greater_equal_vulkan(
@@ -238,7 +239,7 @@ bool try_eval_greater_equal_vulkan(
 
 #define VULKAN_BINARY_GPU(func, op_name)                              \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
-    eval_binary_vulkan_or_cpu<func>(inputs, out, op_name, stream());  \
+    eval_binary_vulkan<func>(inputs, out, op_name, stream());         \
   }
 
 VULKAN_BINARY_GPU(Add, "add")
@@ -249,10 +250,10 @@ VULKAN_BINARY_GPU(Subtract, "sub")
 VULKAN_BINARY_GPU(Multiply, "mul")
 
 void GreaterEqual::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (try_eval_greater_equal_vulkan(inputs, out, stream())) {
-    return;
+  if (!try_eval_greater_equal_vulkan(inputs, out, stream())) {
+    throw std::runtime_error(
+        "GreaterEqual operation failed on Vulkan (unsupported dtype or layout).");
   }
-  eval_cpu_fallback_on_stream<GreaterEqual>(inputs, out, stream());
 }
 
 } // namespace mlx::core

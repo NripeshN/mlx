@@ -77,21 +77,20 @@ bool try_eval_unary_op_vulkan(
   }
 }
 
-template <typename Primitive, typename... FallbackArgs>
-void eval_unary_vulkan_or_cpu(
+template <typename Primitive>
+void eval_unary_vulkan(
     const std::vector<array>& inputs,
     array& out,
     const std::string& shader_name,
     Stream s,
     float param1 = 0.0f,
-    float param2 = 0.0f,
-    FallbackArgs&&... fallback_args) {
-  if (try_eval_unary_op_vulkan<Primitive>(
+    float param2 = 0.0f) {
+  if (!try_eval_unary_op_vulkan<Primitive>(
           inputs, out, shader_name, s, param1, param2)) {
-    return;
+    throw std::runtime_error(
+        std::string("Unary operation ") + shader_name +
+        " failed on Vulkan (unsupported dtype or layout).");
   }
-  eval_cpu_fallback_on_stream<Primitive>(
-      inputs, out, s, std::forward<FallbackArgs>(fallback_args)...);
 }
 
 template <typename Primitive>
@@ -177,7 +176,7 @@ bool try_eval_generic_unary_op_vulkan(
 }
 
 template <typename Primitive>
-void eval_generic_unary_vulkan_or_cpu(
+void eval_generic_unary_vulkan(
     const std::vector<array>& inputs,
     array& out,
     const std::string& shader_name,
@@ -186,15 +185,16 @@ void eval_generic_unary_vulkan_or_cpu(
     float param2 = 0.0f,
     float param3 = 0.0f,
     float param4 = 0.0f) {
-  if (try_eval_generic_unary_op_vulkan<Primitive>(
+  if (!try_eval_generic_unary_op_vulkan<Primitive>(
           inputs, out, shader_name, s, param1, param2, param3, param4)) {
-    return;
+    throw std::runtime_error(
+        std::string("Unary operation ") + shader_name +
+        " failed on Vulkan (unsupported dtype or layout).");
   }
-  eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
 }
 
 template <typename Primitive>
-void eval_generic_unary_suffix_vulkan_or_cpu(
+void eval_generic_unary_suffix_vulkan(
     const std::vector<array>& inputs,
     array& out,
     std::string_view op_name,
@@ -210,24 +210,25 @@ void eval_generic_unary_suffix_vulkan_or_cpu(
       if (f16_with_rte && out.dtype() == float16) {
         shader_name += "_rte";
       }
-      eval_generic_unary_vulkan_or_cpu<Primitive>(inputs, out, shader_name, s);
+      eval_generic_unary_vulkan<Primitive>(inputs, out, shader_name, s);
       return;
     }
   }
-  eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
+  throw std::runtime_error(
+      std::string("Unary operation ") + std::string(op_name) +
+      " failed on Vulkan (unsupported dtype or layout).");
 }
 
 } // namespace
 
-#define VULKAN_GENERIC_UNARY_GPU(func, op_name)                       \
-  void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
-    eval_generic_unary_suffix_vulkan_or_cpu<func>(                    \
-        inputs, out, op_name, stream());                              \
+#define VULKAN_GENERIC_UNARY_GPU(func, op_name)                             \
+  void func::eval_gpu(const std::vector<array>& inputs, array& out) {       \
+    eval_generic_unary_suffix_vulkan<func>(inputs, out, op_name, stream()); \
   }
 
 #define VULKAN_GENERIC_UNARY_RTE_GPU(func, op_name)                   \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
-    eval_generic_unary_suffix_vulkan_or_cpu<func>(                    \
+    eval_generic_unary_suffix_vulkan<func>(                           \
         inputs, out, op_name, stream(), true);                        \
   }
 
@@ -249,7 +250,8 @@ void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
   }
-  eval_cpu_fallback_on_stream<Cos>(inputs, out, stream());
+  throw std::runtime_error(
+      "Cos operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void Erf::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -259,7 +261,8 @@ void Erf::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
   }
-  eval_cpu_fallback_on_stream<Erf>(inputs, out, stream());
+  throw std::runtime_error(
+      "Erf operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void ErfInv::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -269,7 +272,8 @@ void ErfInv::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
   }
-  eval_cpu_fallback_on_stream<ErfInv>(inputs, out, stream());
+  throw std::runtime_error(
+      "ErfInv operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -285,7 +289,8 @@ void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
       }
     }
   }
-  eval_cpu_fallback_on_stream<Log>(inputs, out, stream(), state());
+  throw std::runtime_error(
+      "Log operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -295,33 +300,30 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
   }
-  eval_cpu_fallback_on_stream<Sin>(inputs, out, stream());
+  throw std::runtime_error(
+      "Sin operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void Square::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
       out.dtype() == float32) {
-    eval_unary_vulkan_or_cpu<Square>(inputs, out, "sqr_f32", stream());
+    eval_unary_vulkan<Square>(inputs, out, "sqr_f32", stream());
     return;
   }
-  eval_cpu_fallback_on_stream<Square>(inputs, out, stream());
+  throw std::runtime_error(
+      "Square operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void Sqrt::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 &&
       (inputs[0].dtype() == float32 || inputs[0].dtype() == bfloat16) &&
       out.dtype() == inputs[0].dtype()) {
-    eval_unary_vulkan_or_cpu<Sqrt>(
-        inputs,
-        out,
-        state() ? "rsqrt_f32" : "sqrt_f32",
-        stream(),
-        0.0f,
-        0.0f,
-        state());
+    eval_unary_vulkan<Sqrt>(
+        inputs, out, state() ? "rsqrt_f32" : "sqrt_f32", stream(), 0.0f, 0.0f);
     return;
   }
-  eval_cpu_fallback_on_stream<Sqrt>(inputs, out, stream(), state());
+  throw std::runtime_error(
+      "Sqrt operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 } // namespace mlx::core

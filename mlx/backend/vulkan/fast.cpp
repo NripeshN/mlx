@@ -840,17 +840,6 @@ void ScaledDotProductAttention::eval_gpu(
         "ScaledDotProductAttention expects at least 3 inputs and 1 output.");
   }
 
-  auto fallback_outputs = [&]() {
-    auto outs = eval_fallback_outputs(fallback_, inputs);
-    if (outs.size() != outputs.size()) {
-      throw std::runtime_error(
-          "ScaledDotProductAttention fallback output count mismatch.");
-    }
-    for (size_t i = 0; i < outs.size(); ++i) {
-      copy_gpu(outs[i], outputs[i], CopyType::General, stream());
-    }
-  };
-
   const array& q_in = inputs[0];
   const array& k_in = inputs[1];
   const array& v_in = inputs[2];
@@ -869,71 +858,67 @@ void ScaledDotProductAttention::eval_gpu(
           has_sinks_,
           stream(),
           &reason)) {
-    fallback_outputs();
+    throw std::runtime_error(
+        std::string("ScaledDotProductAttention not supported on Vulkan: ") +
+        reason);
+  }
+
+  auto s = stream();
+
+  if (try_eval_flash_attention_vulkan(
+          inputs, outputs[0], scale_, do_causal_, s)) {
     return;
   }
 
-  try {
-    auto s = stream();
+  array q = multiply(array(scale_, q_in.dtype()), q_in, s);
+  array k = k_in;
+  array v = v_in;
 
-    if (try_eval_flash_attention_vulkan(
-            inputs, outputs[0], scale_, do_causal_, s)) {
-      return;
+  const int n_q_heads = q.shape(1);
+  const int n_kv_heads = k.shape(1);
+  const int n_repeats = n_q_heads / n_kv_heads;
+
+  if (n_repeats > 1) {
+    q = unflatten(q, 1, {n_kv_heads, n_repeats}, s);
+    k = expand_dims(k, 2, s);
+    v = expand_dims(v, 2, s);
+  }
+
+  auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
+  if (do_causal_) {
+    if (scores.dtype() != float32) {
+      scores = astype(scores, float32, s);
     }
+    const int n_past = k_in.shape(2) - q_in.shape(2);
+    scores = apply_diag_mask_inf_vulkan(scores, n_past, s);
+  }
 
-    array q = multiply(array(scale_, q_in.dtype()), q_in, s);
-    array k = k_in;
-    array v = v_in;
+  const Shape scores_shape = scores.shape();
+  const bool collapsed_scores = scores.ndim() > 4;
+  if (collapsed_scores) {
+    scores = flatten(scores, 0, scores.ndim() - 3, s);
+  }
+  scores = softmax(scores, std::vector<int>{-1}, true, s);
+  if (collapsed_scores) {
+    scores = unflatten(
+        scores, 0, Shape(scores_shape.begin(), scores_shape.end() - 2), s);
+  }
 
-    const int n_q_heads = q.shape(1);
-    const int n_kv_heads = k.shape(1);
-    const int n_repeats = n_q_heads / n_kv_heads;
+  array v_work = v;
+  if (v_work.dtype() != scores.dtype()) {
+    v_work = astype(v_work, scores.dtype(), s);
+  }
 
-    if (n_repeats > 1) {
-      q = unflatten(q, 1, {n_kv_heads, n_repeats}, s);
-      k = expand_dims(k, 2, s);
-      v = expand_dims(v, 2, s);
-    }
+  auto result = matmul(scores, v_work, s);
+  if (result.dtype() != outputs[0].dtype()) {
+    result = astype(result, outputs[0].dtype(), s);
+  }
 
-    auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
-    if (do_causal_) {
-      if (scores.dtype() != float32) {
-        scores = astype(scores, float32, s);
-      }
-      const int n_past = k_in.shape(2) - q_in.shape(2);
-      scores = apply_diag_mask_inf_vulkan(scores, n_past, s);
-    }
+  copy_gpu(result, outputs[0], CopyType::General, s);
 
-    const Shape scores_shape = scores.shape();
-    const bool collapsed_scores = scores.ndim() > 4;
-    if (collapsed_scores) {
-      scores = flatten(scores, 0, scores.ndim() - 3, s);
-    }
-    scores = softmax(scores, std::vector<int>{-1}, true, s);
-    if (collapsed_scores) {
-      scores = unflatten(
-          scores, 0, Shape(scores_shape.begin(), scores_shape.end() - 2), s);
-    }
-
-    array v_work = v;
-    if (v_work.dtype() != scores.dtype()) {
-      v_work = astype(v_work, scores.dtype(), s);
-    }
-
-    auto out = matmul(scores, v_work, s);
-    if (n_repeats > 1) {
-      out = flatten(out, 1, 2, s);
-    }
-
-    eval(out);
-    copy_gpu(out, outputs[0], CopyType::General, s);
-  } catch (const std::runtime_error& e) {
-    if (trace_fallback_enabled()) {
-      std::ostringstream oss;
-      oss << "sdpa_vulkan_eval_failed reason=" << e.what();
-      trace_fallback(oss.str());
-    }
-    fallback_outputs();
+  if (output_logsumexp_) {
+    throw std::runtime_error(
+        "ScaledDotProductAttention with logsumexp output is not supported on Vulkan.");
   }
 }
 
@@ -971,69 +956,27 @@ void RMSNorm::eval_gpu(
   if (outputs.size() != 1) {
     throw std::runtime_error("RMSNorm expects a single output.");
   }
-  auto fallback_outputs = [&]() {
-    vulkan::ScopedSyncLabel sync_label("rms_norm_cpu_fallback");
-    ::mlx::core::gpu::synchronize(stream());
-    auto outs = fallback_(inputs);
-    if (outs.size() != outputs.size()) {
-      throw std::runtime_error("RMSNorm fallback output count mismatch.");
-    }
-    eval(outs);
-    for (size_t i = 0; i < outs.size(); ++i) {
-      outputs[i].copy_shared_buffer(outs[i]);
-    }
-  };
-  if (inputs.size() == 2 && inputs[0].dtype() == float32 &&
-      inputs[1].dtype() == float32 && outputs[0].dtype() == float32) {
-    fallback_outputs();
-    return;
+  if (!try_eval_rms_norm_vulkan(inputs, outputs[0], eps_, stream())) {
+    throw std::runtime_error("RMSNorm failed on Vulkan.");
   }
-  if (try_eval_rms_norm_vulkan(inputs, outputs[0], eps_, stream())) {
-    return;
-  }
-  fallback_outputs();
 }
 
 void RMSNormVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  vulkan::ScopedSyncLabel sync_label("rms_norm_vjp_cpu_fallback");
-  ::mlx::core::gpu::synchronize(stream());
-  auto fallback_outputs = fallback_(inputs);
-  if (fallback_outputs.size() != outputs.size()) {
-    throw std::runtime_error("RMSNormVJP fallback output count mismatch.");
-  }
-  eval(fallback_outputs);
-  for (size_t i = 0; i < fallback_outputs.size(); ++i) {
-    outputs[i].copy_shared_buffer(fallback_outputs[i]);
-  }
+  throw std::runtime_error("[RMSNormVJP::eval_gpu] Not implemented.");
 }
 
 void ConvertFP8::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  vulkan::ScopedSyncLabel sync_label("convert_fp8_cpu_fallback");
-  ::mlx::core::gpu::synchronize(stream());
-  auto cpu_stream = default_stream(Device::cpu);
-  fast::ConvertFP8 cpu_convert(cpu_stream, state());
-  cpu_convert.eval_cpu(inputs, outputs);
-  synchronize(cpu_stream);
+  throw std::runtime_error("[ConvertFP8::eval_gpu] Not implemented.");
 }
 
 void Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  vulkan::ScopedSyncLabel sync_label("quantize_cpu_fallback");
-  ::mlx::core::gpu::synchronize(stream());
-  auto fallback_outputs = fallback_(inputs);
-  if (fallback_outputs.size() != outputs.size()) {
-    throw std::runtime_error(
-        "[vulkan::Quantize::eval_gpu] Fallback output count mismatch.");
-  }
-  eval(fallback_outputs);
-  for (int i = 0; i < outputs.size(); ++i) {
-    outputs[i].copy_shared_buffer(fallback_outputs[i]);
-  }
+  throw std::runtime_error("[Quantize::eval_gpu] Not implemented.");
 }
 
 void CustomKernel::eval_gpu(

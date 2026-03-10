@@ -748,13 +748,8 @@ void Compiled::eval_gpu(
   }
 
   if (has_unsupported_dtype) {
-    // Fall back to CPU for unsupported dtypes
-    ::mlx::core::gpu::synchronize(s);
-    auto cpu_stream = default_stream(Device::cpu);
-    Compiled cpu_compiled(cpu_stream, inputs_, outputs_, tape_, constant_ids_);
-    cpu_compiled.eval_cpu(inputs, outputs);
-    synchronize(cpu_stream);
-    return;
+    throw std::runtime_error(
+        "Compiled kernel failed on Vulkan (unsupported dtype).");
   }
 
   // Determine work per thread based on output dtype size
@@ -803,12 +798,8 @@ void Compiled::eval_gpu(
   }();
 
   if (requires_cpu_fallback) {
-    ::mlx::core::gpu::synchronize(s);
-    auto cpu_stream = default_stream(Device::cpu);
-    Compiled cpu_compiled(cpu_stream, inputs_, outputs_, tape_, constant_ids_);
-    cpu_compiled.eval_cpu(inputs, outputs);
-    synchronize(cpu_stream);
-    return;
+    throw std::runtime_error(
+        "Compiled kernel failed on Vulkan (complex tape operations or unsupported layout).");
   }
 
   // Use large index if needed

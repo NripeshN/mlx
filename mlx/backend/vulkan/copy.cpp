@@ -258,30 +258,8 @@ void copy_gpu_inplace(
   }
 
   if (!raw_buffer_copy && !shader_copy) {
-    std::ostringstream sync_reason;
-    sync_reason << "copy_cpu_fallback:" << copy_type_name(ctype) << ":"
-                << copy_dtype_suffix(in.dtype()) << "->"
-                << copy_dtype_suffix(out.dtype())
-                << ":full=" << (full_tensor_copy ? 1 : 0)
-                << ":src_rc=" << (in.flags().row_contiguous ? 1 : 0)
-                << ":dst_rc=" << (out.flags().row_contiguous ? 1 : 0);
-    vulkan::ScopedSyncLabel sync_label(sync_reason.str());
-    gpu::synchronize(s);
-    auto cpu_stream = default_stream(Device::cpu);
-    copy_cpu_inplace(
-        in,
-        out,
-        data_shape,
-        i_strides,
-        o_strides,
-        i_offset,
-        o_offset,
-        ctype,
-        cpu_stream,
-        dynamic_i_offset,
-        dynamic_o_offset);
-    synchronize(cpu_stream);
-    return;
+    throw std::runtime_error(
+        "Copy operation failed on Vulkan (unsupported dtype or layout).");
   }
 
   VkCommandBuffer cmd_buffer = vulkan::begin_command_recording(s.index);
@@ -321,29 +299,10 @@ void copy_gpu_inplace(
     }
     try {
       vulkan::dispatch_unary_op(in, out, shader_name, cmd_buffer, s);
-    } catch (const std::runtime_error&) {
+    } catch (const std::runtime_error& e) {
       vulkan::end_command_recording(s.index);
-      std::ostringstream sync_reason;
-      sync_reason << "copy_dispatch_cpu_fallback:" << copy_type_name(ctype)
-                  << ":" << copy_dtype_suffix(in.dtype()) << "->"
-                  << copy_dtype_suffix(out.dtype());
-      vulkan::ScopedSyncLabel sync_label(sync_reason.str());
-      gpu::synchronize(s);
-      auto cpu_stream = default_stream(Device::cpu);
-      copy_cpu_inplace(
-          in,
-          out,
-          data_shape,
-          i_strides,
-          o_strides,
-          i_offset,
-          o_offset,
-          ctype,
-          cpu_stream,
-          dynamic_i_offset,
-          dynamic_o_offset);
-      synchronize(cpu_stream);
-      return;
+      throw std::runtime_error(
+          std::string("Copy operation failed on Vulkan: ") + e.what());
     }
   } else {
     throw std::runtime_error("Unsupported Vulkan copy type.");

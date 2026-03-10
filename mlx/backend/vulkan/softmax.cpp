@@ -166,17 +166,17 @@ bool try_eval_logsumexp_vulkan(
 } // namespace
 
 void Softmax::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (try_eval_softmax_vulkan(inputs, out, state(), stream())) {
-    return;
+  if (!try_eval_softmax_vulkan(inputs, out, state(), stream())) {
+    throw std::runtime_error(
+        "Softmax operation failed on Vulkan (unsupported dtype or layout).");
   }
-  eval_cpu_fallback_on_stream<Softmax>(inputs, out, stream(), state());
 }
 
 void LogSumExp::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (try_eval_logsumexp_vulkan(inputs, out, stream())) {
-    return;
+  if (!try_eval_logsumexp_vulkan(inputs, out, stream())) {
+    throw std::runtime_error(
+        "LogSumExp operation failed on Vulkan (unsupported dtype or layout).");
   }
-  eval_cpu_fallback_on_stream<LogSumExp>(inputs, out, stream());
 }
 
 } // namespace mlx::core

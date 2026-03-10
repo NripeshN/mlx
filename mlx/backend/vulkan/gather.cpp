@@ -250,17 +250,17 @@ bool try_eval_gather_axis_vulkan(
 
 void Gather::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto [axes, slice_sizes] = state();
-  if (try_eval_gather_vulkan(inputs, out, axes, slice_sizes, stream())) {
-    return;
+  if (!try_eval_gather_vulkan(inputs, out, axes, slice_sizes, stream())) {
+    throw std::runtime_error(
+        "Gather operation failed on Vulkan (unsupported dtype or layout).");
   }
-  eval_cpu_fallback_on_stream<Gather>(inputs, out, stream(), axes, slice_sizes);
 }
 
 void GatherAxis::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (try_eval_gather_axis_vulkan(inputs, out, state(), stream())) {
-    return;
+  if (!try_eval_gather_axis_vulkan(inputs, out, state(), stream())) {
+    throw std::runtime_error(
+        "GatherAxis operation failed on Vulkan (unsupported dtype or layout).");
   }
-  eval_cpu_fallback_on_stream<GatherAxis>(inputs, out, stream(), state());
 }
 
 } // namespace mlx::core
