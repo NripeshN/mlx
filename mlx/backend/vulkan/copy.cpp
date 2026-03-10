@@ -249,7 +249,16 @@ void copy_gpu_inplace(
     return;
   }
 
-  if (!raw_buffer_copy && !shader_copy) {
+  // For non-contiguous copies with large offsets, stage through contiguous
+  // buffer instead of falling back to CPU. This avoids expensive GPU->CPU->GPU
+  // syncs.
+  const bool large_offset = in.offset() > 0xFFFF || out.offset() > 0xFFFF;
+  const bool can_stage_through_contiguous = !raw_buffer_copy && !shader_copy &&
+      !dynamic_i_offset && !dynamic_o_offset && i_offset == 0 &&
+      o_offset == 0 && large_offset && full_tensor_copy &&
+      !shader_name.empty() && ctype != CopyType::Scalar;
+
+  if (!raw_buffer_copy && !shader_copy && !can_stage_through_contiguous) {
     std::ostringstream sync_reason;
     sync_reason << "copy_cpu_fallback:" << copy_type_name(ctype) << ":"
                 << copy_dtype_suffix(in.dtype()) << "->"
@@ -273,6 +282,35 @@ void copy_gpu_inplace(
         dynamic_i_offset,
         dynamic_o_offset);
     synchronize(cpu_stream);
+    return;
+  }
+
+  // Handle large offsets by staging through contiguous buffer
+  if (can_stage_through_contiguous) {
+    // Make input contiguous first (uses Vector copy path which handles large
+    // offsets)
+    array in_contig = contiguous_copy_gpu(in, s);
+
+    // Now do shader copy from contiguous input to output
+    // Both should have offset 0 now, so shader_copy conditions are satisfied
+    VkCommandBuffer cmd_buffer = vulkan::begin_command_recording(s.index);
+    try {
+      vulkan::dispatch_unary_op(in_contig, out, shader_name, cmd_buffer, s);
+      vulkan::end_command_recording(s.index);
+    } catch (const std::runtime_error&) {
+      vulkan::end_command_recording(s.index);
+      // Fall back to CPU if shader dispatch fails
+      std::ostringstream sync_reason;
+      sync_reason << "copy_staged_dispatch_cpu_fallback:"
+                  << copy_type_name(ctype) << ":"
+                  << copy_dtype_suffix(in.dtype()) << "->"
+                  << copy_dtype_suffix(out.dtype());
+      vulkan::ScopedSyncLabel sync_label(sync_reason.str());
+      gpu::synchronize(s);
+      auto cpu_stream = default_stream(Device::cpu);
+      copy_gpu_inplace(in, out, ctype, cpu_stream);
+      synchronize(cpu_stream);
+    }
     return;
   }
 

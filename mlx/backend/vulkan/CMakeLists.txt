@@ -152,11 +152,19 @@ if(Vulkan_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/copy.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/matmul.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp
     ${SHADER_CPP_FILES}
   )
   
   target_include_directories(mlx PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-  target_link_libraries(mlx PRIVATE Vulkan::Vulkan)
+  target_link_libraries(mlx PRIVATE 
+    Vulkan::Vulkan
+    Shaderc::shaderc_combined
+    glslang
+    glslang-SPIRV
+    SPIRV-Tools-opt
+    SPIRV-Tools
+  )
   add_dependencies(mlx vulkan_shaders_target)
   
   # Set definitions based on extension support

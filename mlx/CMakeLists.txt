@@ -102,6 +102,7 @@ endif()
 
 if(MLX_BUILD_VULKAN)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backend/vulkan)
+  target_compile_definitions(mlx PRIVATE MLX_BUILD_VULKAN)
 else()
   target_sources(mlx
                  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/backend/vulkan/no_vulkan.cpp)
