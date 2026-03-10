@@ -9,6 +9,21 @@ namespace mlx::core {
 
 namespace {
 
+bool is_vulkan_compare_dtype(Dtype dtype) {
+  switch (dtype) {
+    case float16:
+    case float32:
+    case bfloat16:
+    case int32:
+    case int64:
+    case uint32:
+    case uint64:
+      return true;
+    default:
+      return false;
+  }
+}
+
 template <typename Primitive>
 constexpr vulkan::BinaryDispatchVariant binary_dispatch_variant() {
   if constexpr (std::is_same_v<Primitive, Add>) {
@@ -146,7 +161,12 @@ bool try_eval_greater_equal_vulkan(
 
   array a = inputs[0];
   array b = inputs[1];
-  if (!is_vulkan_float_dtype(a.dtype()) || !is_vulkan_float_dtype(b.dtype())) {
+  if (!is_vulkan_compare_dtype(a.dtype()) ||
+      !is_vulkan_compare_dtype(b.dtype())) {
+    return false;
+  }
+  if (a.dtype() != b.dtype() &&
+      !(is_vulkan_float_dtype(a.dtype()) && is_vulkan_float_dtype(b.dtype()))) {
     return false;
   }
   if (a.shape() != out.shape() || b.shape() != out.shape()) {

@@ -144,7 +144,8 @@ std::string get_copy_shader_name(
       (in.dtype() == mlx::core::float32 &&
        out.dtype() == mlx::core::bfloat16) ||
       (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::int32) ||
-      (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::float32);
+      (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::float32) ||
+      (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int32);
 
   if (!supported_pair) {
     return {};
@@ -208,6 +209,45 @@ void copy_gpu_inplace(
     std::optional<array> dynamic_o_offset) {
   if (out.size() == 0) {
     return;
+  }
+
+  if ((ctype == CopyType::General || ctype == CopyType::GeneralGeneral) &&
+      data_shape.size() > 4) {
+    auto [collapsed_shape, collapsed_strides] = collapse_contiguous_dims(
+        data_shape, std::vector{i_strides, o_strides}, INT32_MAX);
+    if (collapsed_shape.size() < data_shape.size()) {
+      auto make_view =
+          [&](const array& base, const Shape& shape, const Strides& strides) {
+            array view(shape, base.dtype(), nullptr, {});
+            auto [data_size, row_contiguous, col_contiguous] =
+                check_contiguity(shape, strides);
+            view.copy_shared_buffer(
+                base,
+                strides,
+                {data_size == static_cast<size_t>(base.data_size()),
+                 row_contiguous,
+                 col_contiguous},
+                data_size,
+                base.offset());
+            return view;
+          };
+
+      auto in_view = make_view(in, collapsed_shape, collapsed_strides[0]);
+      auto out_view = make_view(out, collapsed_shape, collapsed_strides[1]);
+      copy_gpu_inplace(
+          in_view,
+          out_view,
+          collapsed_shape,
+          collapsed_strides[0],
+          collapsed_strides[1],
+          i_offset,
+          o_offset,
+          ctype,
+          s,
+          dynamic_i_offset,
+          dynamic_o_offset);
+      return;
+    }
   }
 
   const bool same_dtype = in.dtype() == out.dtype();

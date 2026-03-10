@@ -1427,6 +1427,10 @@ void process_shaders() {
       "contig_copy.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "int"}});
   string_to_spv(
+      "contig_cpy_i32_i32",
+      "contig_copy.comp",
+      {{"A_TYPE", "int"}, {"D_TYPE", "int"}});
+  string_to_spv(
       "contig_cpy_i32_f32",
       "contig_copy.comp",
       {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
@@ -1463,6 +1467,8 @@ void process_shaders() {
        {"DATA_D_BF16", "1"}});
   string_to_spv(
       "cpy_f32_i32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "int"}});
+  string_to_spv(
+      "cpy_i32_i32", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "int"}});
   string_to_spv(
       "cpy_i32_f32", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
 
@@ -1610,6 +1616,32 @@ void process_shaders() {
              {"RTE16", "0"},
              {"ADD_RMS", "0"}});
       }
+    }
+
+    for (const auto& t :
+         {std::string("int"),
+          std::string("int64_t"),
+          std::string("uint"),
+          std::string("uint64_t")}) {
+      std::string suffix;
+      if (t == "int") {
+        suffix = "i32";
+      } else if (t == "int64_t") {
+        suffix = "i64";
+      } else if (t == "uint") {
+        suffix = "u32";
+      } else {
+        suffix = "u64";
+      }
+      string_to_spv(
+          (op + "_" + suffix + "_" + suffix + "_u8").c_str(),
+          op + ".comp",
+          {{"A_TYPE", t},
+           {"B_TYPE", t},
+           {"D_TYPE", "uint8_t"},
+           {"FLOAT_TYPE", t},
+           {"RTE16", "0"},
+           {"ADD_RMS", "0"}});
     }
   }
 
