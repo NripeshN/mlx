@@ -271,9 +271,6 @@ bool try_eval_mul_mm_vulkan(
       !is_supported_matmul_dtype(out.dtype())) {
     return false;
   }
-  if (a.dtype() == float32 || b.dtype() == float32 || out.dtype() == float32) {
-    return false;
-  }
 
   if (a.ndim() != b.ndim() || a.ndim() != out.ndim()) {
     return false;
@@ -340,6 +337,10 @@ bool try_eval_mul_mm_vulkan(
     return false;
   }
   const uint32_t num_batches = static_cast<uint32_t>(num_batches_u64);
+
+  if (num_batches > 1) {
+    ::mlx::core::gpu::synchronize(s);
+  }
 
   vulkan::MatmulPushConstants push_constants{};
   push_constants.M = m;

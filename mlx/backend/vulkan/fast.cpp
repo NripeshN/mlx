@@ -916,9 +916,6 @@ void ScaledDotProductAttention::eval_gpu(
     if (n_repeats > 1) {
       out = flatten(out, 1, 2, s);
     }
-    if (out.dtype() != outputs[0].dtype()) {
-      out = astype(out, outputs[0].dtype(), s);
-    }
 
     eval(out);
     copy_gpu(out, outputs[0], CopyType::General, s);
