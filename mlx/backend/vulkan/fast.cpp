@@ -788,6 +788,7 @@ bool ScaledDotProductAttention::use_fallback(
     bool do_causal,
     bool is_training,
     bool output_logsumexp,
+    bool has_sinks,
     Stream s) {
   std::string reason;
   const bool supported = sdpa_vulkan_supported(
@@ -799,7 +800,7 @@ bool ScaledDotProductAttention::use_fallback(
       do_causal,
       is_training,
       output_logsumexp,
-      false,
+      has_sinks,
       s,
       &reason);
   if (!supported && trace_fallback_enabled()) {
@@ -834,30 +835,37 @@ bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {
 void ScaledDotProductAttention::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  if (inputs.size() != 3 || outputs.size() != 1) {
+  if (inputs.size() < 3 || outputs.empty()) {
     throw std::runtime_error(
-        "ScaledDotProductAttention expects 3 inputs and 1 output.");
+        "ScaledDotProductAttention expects at least 3 inputs and 1 output.");
   }
 
   auto fallback_outputs = [&]() {
     auto outs = eval_fallback_outputs(fallback_, inputs);
-    copy_gpu(outs[0], outputs[0], CopyType::General, stream());
+    if (outs.size() != outputs.size()) {
+      throw std::runtime_error(
+          "ScaledDotProductAttention fallback output count mismatch.");
+    }
+    for (size_t i = 0; i < outs.size(); ++i) {
+      copy_gpu(outs[i], outputs[i], CopyType::General, stream());
+    }
   };
 
   const array& q_in = inputs[0];
   const array& k_in = inputs[1];
   const array& v_in = inputs[2];
+  const bool has_arr_mask = inputs.size() > static_cast<size_t>(3 + has_sinks_);
 
   std::string reason;
   if (!sdpa_vulkan_supported(
           q_in,
           k_in,
           v_in,
+          has_arr_mask || do_causal_,
+          has_arr_mask,
           do_causal_,
           false,
-          do_causal_,
-          false,
-          false,
+          output_logsumexp_,
           has_sinks_,
           stream(),
           &reason)) {

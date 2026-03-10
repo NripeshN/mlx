@@ -817,6 +817,7 @@ array scaled_dot_product_attention(
           do_causal,
           is_training,
           output_logsumexp,
+          has_sinks,
           stream)) {
     if (has_bool_mask && !ScaledDotProductAttention::supports_bool_mask()) {
       // Convert bool mask to additive mask.

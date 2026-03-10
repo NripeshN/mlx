@@ -144,17 +144,6 @@ Buffer VulkanAllocator::malloc(size_t size) {
           << ") exceeded.";
       throw std::runtime_error(msg.str());
     }
-
-    const bool exceeds_limit = active_memory_ > block_limit_ ||
-        allocation_size > (block_limit_ - active_memory_);
-    if (exceeds_limit) {
-      vkDestroyBuffer(device, vk_buffer, nullptr);
-      std::ostringstream msg;
-      msg << "[vulkan::malloc] Memory limit (" << block_limit_
-          << " bytes) exceeded while allocating " << size << " bytes ("
-          << allocation_size << " bytes with alignment).";
-      throw std::runtime_error(msg.str());
-    }
   }
 
   std::vector<VkMemoryPropertyFlags> preferred_memory_types;
