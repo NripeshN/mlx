@@ -211,11 +211,13 @@ void copy_gpu_inplace(
     return;
   }
 
-  if ((ctype == CopyType::General || ctype == CopyType::GeneralGeneral) &&
+  if (false &&
+      (ctype == CopyType::General || ctype == CopyType::GeneralGeneral) &&
       data_shape.size() > 4) {
     auto [collapsed_shape, collapsed_strides] = collapse_contiguous_dims(
         data_shape, std::vector{i_strides, o_strides}, INT32_MAX);
-    if (collapsed_shape.size() < data_shape.size()) {
+    if (collapsed_shape.size() < data_shape.size() &&
+        collapsed_shape.size() <= 4) {
       auto make_view =
           [&](const array& base, const Shape& shape, const Strides& strides) {
             array view(shape, base.dtype(), nullptr, {});
@@ -296,14 +298,7 @@ void copy_gpu_inplace(
     return;
   }
 
-  // For non-contiguous copies with large offsets, stage through contiguous
-  // buffer instead of falling back to CPU. This avoids expensive GPU->CPU->GPU
-  // syncs.
-  const bool large_offset = in.offset() > 0xFFFF || out.offset() > 0xFFFF;
-  const bool can_stage_through_contiguous = !raw_buffer_copy && !shader_copy &&
-      !dynamic_i_offset && !dynamic_o_offset && i_offset == 0 &&
-      o_offset == 0 && large_offset && full_tensor_copy &&
-      !shader_name.empty() && ctype != CopyType::Scalar;
+  const bool can_stage_through_contiguous = false;
 
   if (!raw_buffer_copy && !shader_copy && !can_stage_through_contiguous) {
     std::ostringstream sync_reason;

@@ -775,6 +775,7 @@ void Compiled::eval_gpu(
 
   // Get command buffer
   auto cmd_buffer = vulkan::begin_command_recording(s.index);
+  const uint64_t descriptor_epoch = vulkan::descriptor_epoch_for_stream(s);
 
   // Allocate descriptor set
   auto descriptor_set =
@@ -787,6 +788,7 @@ void Compiled::eval_gpu(
 
   // Helper to add buffer info
   auto add_buffer = [&](const array& arr) {
+    vulkan::retain_array_for_stream(s, arr);
     auto* vulkan_buffer = static_cast<const vulkan::VulkanBuffer*>(
         static_cast<const void*>(arr.buffer().ptr()));
     if (!vulkan_buffer || vulkan_buffer->buffer == VK_NULL_HANDLE) {
@@ -915,7 +917,7 @@ void Compiled::eval_gpu(
   vkCmdDispatch(cmd_buffer, workgroups, 1, 1);
 
   // Defer descriptor set cleanup
-  manager.defer_descriptor_set_free(s.index, descriptor_set);
+  manager.defer_descriptor_set_free(s.index, descriptor_epoch, descriptor_set);
 }
 
 } // namespace mlx::core
