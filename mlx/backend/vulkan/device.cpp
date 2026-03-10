@@ -356,6 +356,9 @@ class VulkanDevice {
       }
       trace_sync(oss.str());
     }
+    if (!stream->in_flight_submissions.empty()) {
+      retire_submissions(stream, true);
+    }
     if (stream->recording) {
       auto label = current_sync_label();
       submit_commands(
@@ -1165,6 +1168,9 @@ class VulkanDevice {
         }
         if (result != VK_TIMEOUT && result != VK_NOT_READY) {
           break;
+        }
+        if (retry >= 3) {
+          vkQueueWaitIdle(queue);
         }
         const auto backoff_ms = std::min(8, 1 << std::min(retry, 3));
         std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
