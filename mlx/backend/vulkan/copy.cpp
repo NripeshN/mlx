@@ -211,47 +211,6 @@ void copy_gpu_inplace(
     return;
   }
 
-  if (false &&
-      (ctype == CopyType::General || ctype == CopyType::GeneralGeneral) &&
-      data_shape.size() > 4) {
-    auto [collapsed_shape, collapsed_strides] = collapse_contiguous_dims(
-        data_shape, std::vector{i_strides, o_strides}, INT32_MAX);
-    if (collapsed_shape.size() < data_shape.size() &&
-        collapsed_shape.size() <= 4) {
-      auto make_view =
-          [&](const array& base, const Shape& shape, const Strides& strides) {
-            array view(shape, base.dtype(), nullptr, {});
-            auto [data_size, row_contiguous, col_contiguous] =
-                check_contiguity(shape, strides);
-            view.copy_shared_buffer(
-                base,
-                strides,
-                {data_size == static_cast<size_t>(base.data_size()),
-                 row_contiguous,
-                 col_contiguous},
-                data_size,
-                base.offset());
-            return view;
-          };
-
-      auto in_view = make_view(in, collapsed_shape, collapsed_strides[0]);
-      auto out_view = make_view(out, collapsed_shape, collapsed_strides[1]);
-      copy_gpu_inplace(
-          in_view,
-          out_view,
-          collapsed_shape,
-          collapsed_strides[0],
-          collapsed_strides[1],
-          i_offset,
-          o_offset,
-          ctype,
-          s,
-          dynamic_i_offset,
-          dynamic_o_offset);
-      return;
-    }
-  }
-
   const bool same_dtype = in.dtype() == out.dtype();
   const bool raw_buffer_copy = same_dtype && ctype == CopyType::Vector;
 
@@ -298,9 +257,7 @@ void copy_gpu_inplace(
     return;
   }
 
-  const bool can_stage_through_contiguous = false;
-
-  if (!raw_buffer_copy && !shader_copy && !can_stage_through_contiguous) {
+  if (!raw_buffer_copy && !shader_copy) {
     std::ostringstream sync_reason;
     sync_reason << "copy_cpu_fallback:" << copy_type_name(ctype) << ":"
                 << copy_dtype_suffix(in.dtype()) << "->"
@@ -324,35 +281,6 @@ void copy_gpu_inplace(
         dynamic_i_offset,
         dynamic_o_offset);
     synchronize(cpu_stream);
-    return;
-  }
-
-  // Handle large offsets by staging through contiguous buffer
-  if (can_stage_through_contiguous) {
-    // Make input contiguous first (uses Vector copy path which handles large
-    // offsets)
-    array in_contig = contiguous_copy_gpu(in, s);
-
-    // Now do shader copy from contiguous input to output
-    // Both should have offset 0 now, so shader_copy conditions are satisfied
-    VkCommandBuffer cmd_buffer = vulkan::begin_command_recording(s.index);
-    try {
-      vulkan::dispatch_unary_op(in_contig, out, shader_name, cmd_buffer, s);
-      vulkan::end_command_recording(s.index);
-    } catch (const std::runtime_error&) {
-      vulkan::end_command_recording(s.index);
-      // Fall back to CPU if shader dispatch fails
-      std::ostringstream sync_reason;
-      sync_reason << "copy_staged_dispatch_cpu_fallback:"
-                  << copy_type_name(ctype) << ":"
-                  << copy_dtype_suffix(in.dtype()) << "->"
-                  << copy_dtype_suffix(out.dtype());
-      vulkan::ScopedSyncLabel sync_label(sync_reason.str());
-      gpu::synchronize(s);
-      auto cpu_stream = default_stream(Device::cpu);
-      copy_gpu_inplace(in, out, ctype, cpu_stream);
-      synchronize(cpu_stream);
-    }
     return;
   }
 
