@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+#include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 
 #include <algorithm>
@@ -135,6 +136,84 @@ void eval_binary_vulkan_or_cpu(
   eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
 }
 
+bool try_eval_greater_equal_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
+  if (inputs.size() != 2 || out.dtype() != bool_) {
+    return false;
+  }
+
+  array a = inputs[0];
+  array b = inputs[1];
+  if (!is_vulkan_float_dtype(a.dtype()) || !is_vulkan_float_dtype(b.dtype())) {
+    return false;
+  }
+  if (a.shape() != out.shape() || b.shape() != out.shape()) {
+    return false;
+  }
+
+  const bool use_f32_staging_io =
+      a.dtype() == bfloat16 || b.dtype() == bfloat16;
+  if (use_f32_staging_io) {
+    array a_f32(a.shape(), float32, nullptr, {});
+    array b_f32(b.shape(), float32, nullptr, {});
+    copy_gpu(a, a_f32, CopyType::General, s);
+    copy_gpu(b, b_f32, CopyType::General, s);
+    a = a_f32;
+    b = b_f32;
+  }
+
+  if (!is_supported_elementwise_layout(a)) {
+    a = contiguous_copy_gpu(a, s);
+  }
+  if (!is_supported_elementwise_layout(b)) {
+    b = contiguous_copy_gpu(b, s);
+  }
+
+  auto suffix_a = dtype_suffix(a.dtype());
+  auto suffix_b = dtype_suffix(b.dtype());
+  if (suffix_a.empty() || suffix_b.empty()) {
+    return false;
+  }
+
+  array out_u8(out.shape(), uint8, nullptr, {});
+  auto bopt = get_binary_op_type(a, b);
+  set_binary_op_output_data(a, b, out_u8, bopt, [&](size_t n) {
+    return vulkan::allocator().malloc(n);
+  });
+  if (!is_supported_elementwise_layout(out_u8)) {
+    return false;
+  }
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_binary_op(
+        a,
+        b,
+        out_u8,
+        std::string("greater_equal_") + suffix_a + "_" + suffix_b + "_u8",
+        command_buffer,
+        s,
+        vulkan::BinaryDispatchVariant::Standard);
+    vulkan::end_command_recording(s.index);
+    out.copy_shared_buffer(
+        out_u8,
+        out_u8.strides(),
+        out_u8.flags(),
+        out_u8.data_size(),
+        out_u8.offset());
+    return true;
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "binary_dispatch_failed op=greater_equal reason=" << e.what();
+      trace_fallback(oss.str());
+    }
+    return false;
+  }
+}
+
 } // namespace
 
 #define VULKAN_BINARY_GPU(func, op_name)                              \
@@ -148,5 +227,12 @@ VULKAN_BINARY_GPU(Maximum, "maximum")
 VULKAN_BINARY_GPU(Divide, "div")
 VULKAN_BINARY_GPU(Subtract, "sub")
 VULKAN_BINARY_GPU(Multiply, "mul")
+
+void GreaterEqual::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (try_eval_greater_equal_vulkan(inputs, out, stream())) {
+    return;
+  }
+  eval_cpu_fallback_on_stream<GreaterEqual>(inputs, out, stream());
+}
 
 } // namespace mlx::core

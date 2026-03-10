@@ -1595,6 +1595,24 @@ void process_shaders() {
     }
   }
 
+  for (std::string op : {"greater_equal"}) {
+    for (auto src0_f16 : {false, true}) {
+      for (auto src1_f16 : {false, true}) {
+        auto name = op + std::string(src0_f16 ? "_f16" : "_f32") +
+            std::string(src1_f16 ? "_f16" : "_f32") + "_u8";
+        string_to_spv(
+            name.c_str(),
+            op + ".comp",
+            {{"A_TYPE", get_type_str(src0_f16)},
+             {"B_TYPE", get_type_str(src1_f16)},
+             {"D_TYPE", "uint8_t"},
+             {"FLOAT_TYPE", "float"},
+             {"RTE16", "0"},
+             {"ADD_RMS", "0"}});
+      }
+    }
+  }
+
   string_to_spv(
       "sub_f32",
       "sub.comp",
