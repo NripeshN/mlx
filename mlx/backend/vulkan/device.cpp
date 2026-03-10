@@ -53,10 +53,10 @@ uint32_t max_deferred_ops() {
         const int parsed = std::stoi(env);
         return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
       } catch (...) {
-        return 8u;
+        return 4u;
       }
     }
-    return 8u;
+    return 4u;
   }();
   return value;
 }
@@ -1138,7 +1138,7 @@ class VulkanDevice {
     }
     trace_sync("submit reset_fence success");
 
-    constexpr int kSubmitRetryCount = 8;
+    constexpr int kSubmitRetryCount = 32;
     {
       std::lock_guard<std::mutex> queue_lock(queue_mutex_);
       for (int retry = 0; retry < kSubmitRetryCount; ++retry) {
@@ -1166,7 +1166,8 @@ class VulkanDevice {
         if (result != VK_TIMEOUT && result != VK_NOT_READY) {
           break;
         }
-        std::this_thread::yield();
+        const auto backoff_ms = std::min(8, 1 << std::min(retry, 3));
+        std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
       }
     }
     if (result != VK_SUCCESS) {
