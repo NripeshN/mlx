@@ -971,17 +971,42 @@ void RMSNorm::eval_gpu(
   if (outputs.size() != 1) {
     throw std::runtime_error("RMSNorm expects a single output.");
   }
+  auto fallback_outputs = [&]() {
+    vulkan::ScopedSyncLabel sync_label("rms_norm_cpu_fallback");
+    ::mlx::core::gpu::synchronize(stream());
+    auto outs = fallback_(inputs);
+    if (outs.size() != outputs.size()) {
+      throw std::runtime_error("RMSNorm fallback output count mismatch.");
+    }
+    eval(outs);
+    for (size_t i = 0; i < outs.size(); ++i) {
+      outputs[i].copy_shared_buffer(outs[i]);
+    }
+  };
+  if (inputs.size() == 2 && inputs[0].dtype() == float32 &&
+      inputs[1].dtype() == float32 && outputs[0].dtype() == float32) {
+    fallback_outputs();
+    return;
+  }
   if (try_eval_rms_norm_vulkan(inputs, outputs[0], eps_, stream())) {
     return;
   }
-  eval_cpu_fallback_multi_on_stream<RMSNorm>(
-      inputs, outputs, stream(), fallback_, eps_);
+  fallback_outputs();
 }
 
 void RMSNormVJP::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  throw std::runtime_error("RMSNormVJP has no Vulkan implementation.");
+  vulkan::ScopedSyncLabel sync_label("rms_norm_vjp_cpu_fallback");
+  ::mlx::core::gpu::synchronize(stream());
+  auto fallback_outputs = fallback_(inputs);
+  if (fallback_outputs.size() != outputs.size()) {
+    throw std::runtime_error("RMSNormVJP fallback output count mismatch.");
+  }
+  eval(fallback_outputs);
+  for (size_t i = 0; i < fallback_outputs.size(); ++i) {
+    outputs[i].copy_shared_buffer(fallback_outputs[i]);
+  }
 }
 
 void ConvertFP8::eval_gpu(

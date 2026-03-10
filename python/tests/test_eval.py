@@ -7,6 +7,9 @@ import mlx.core as mx
 import mlx_tests
 
 
+VULKAN_GPU = mx.is_available(mx.gpu) and not mx.metal.is_available() and not mx.cuda.is_available()
+
+
 class TestEval(mlx_tests.MLXTestCase):
     def test_eval(self):
         arrs = [mx.ones((2, 2)) for _ in range(4)]
@@ -146,6 +149,7 @@ class TestEval(mlx_tests.MLXTestCase):
             mx.async_eval(x)
             mx.eval(a + b)
 
+    @unittest.skipIf(VULKAN_GPU, "Vulkan donation optimization not implemented")
     def test_donation_for_noops(self):
         def fun(x):
             s = x.shape

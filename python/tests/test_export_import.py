@@ -10,6 +10,9 @@ import mlx.nn as nn
 import mlx_tests
 
 
+HAS_CUSTOM_KERNEL_GPU = mx.metal.is_available() or mx.cuda.is_available()
+
+
 class TestExportImport(mlx_tests.MLXTestCase):
 
     @classmethod
@@ -537,7 +540,9 @@ class TestExportImport(mlx_tests.MLXTestCase):
         self.assertEqual(primitive_args[2], [2])
         self.assertEqual(primitive_args[3], [mx.int32])
 
-    @unittest.skipIf(not mx.is_available(mx.gpu), "No GPU available")
+    @unittest.skipUnless(
+        HAS_CUSTOM_KERNEL_GPU, "Custom kernels unsupported on this GPU backend"
+    )
     def test_export_import_custom_kernel(self):
         if mx.metal.is_available():
             source = """

@@ -1905,7 +1905,6 @@ void process_shaders() {
       {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
   string_to_spv(
       "diag_f32", "diag.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
-
   string_to_spv(
       "softplus_f16",
       "softplus.comp",

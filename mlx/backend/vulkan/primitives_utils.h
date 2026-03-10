@@ -27,6 +27,19 @@
 
 namespace mlx::core {
 
+inline std::vector<array> materialize_cpu_fallback_inputs(
+    const std::vector<array>& inputs) {
+  auto cpu_stream = default_stream(Device::cpu);
+  std::vector<array> cpu_inputs;
+  cpu_inputs.reserve(inputs.size());
+  for (const auto& in : inputs) {
+    cpu_inputs.push_back(astype(in, in.dtype(), cpu_stream));
+  }
+  eval(cpu_inputs);
+  synchronize(cpu_stream);
+  return cpu_inputs;
+}
+
 // Trace fallback utilities
 bool trace_fallback_enabled();
 void trace_fallback(const std::string& msg);
@@ -86,8 +99,9 @@ void eval_cpu_fallback(
     trace_fallback(oss.str());
   }
   auto cpu_stream = default_stream(Device::cpu);
+  auto cpu_inputs = materialize_cpu_fallback_inputs(inputs);
   Primitive cpu_primitive(cpu_stream, std::forward<Args>(args)...);
-  cpu_primitive.eval_cpu(inputs, out);
+  cpu_primitive.eval_cpu(cpu_inputs, out);
   synchronize(cpu_stream);
 }
 
@@ -115,8 +129,9 @@ void eval_cpu_fallback_multi(
     trace_fallback(oss.str());
   }
   auto cpu_stream = default_stream(Device::cpu);
+  auto cpu_inputs = materialize_cpu_fallback_inputs(inputs);
   Primitive cpu_primitive(cpu_stream, std::forward<Args>(args)...);
-  cpu_primitive.eval_cpu(inputs, outputs);
+  cpu_primitive.eval_cpu(cpu_inputs, outputs);
   synchronize(cpu_stream);
 }
 
