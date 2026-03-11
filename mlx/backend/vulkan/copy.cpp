@@ -262,12 +262,20 @@ std::string copy_dtype_suffix(Dtype dtype) {
       return "bf16";
     case mlx::core::bool_:
       return "bool";
+    case mlx::core::uint16:
+      return "u16";
     case mlx::core::uint8:
       return "u8";
+    case mlx::core::int8:
+      return "i8";
+    case mlx::core::int16:
+      return "i16";
     case mlx::core::int32:
       return "i32";
     case mlx::core::uint32:
       return "u32";
+    case mlx::core::uint64:
+      return "u64";
     case mlx::core::int64:
       return "i64";
     case mlx::core::complex64:
@@ -389,12 +397,23 @@ std::string get_copy_shader_name(
       (in.dtype() == mlx::core::float32 &&
        out.dtype() == mlx::core::bfloat16) ||
       (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::int32) ||
+      (in.dtype() == mlx::core::int8 && out.dtype() == mlx::core::int32) ||
+      (in.dtype() == mlx::core::int16 && out.dtype() == mlx::core::int32) ||
+      (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int8) ||
+      (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int16) ||
       (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::float32) ||
       (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int32) ||
+      (in.dtype() == mlx::core::int8 && out.dtype() == mlx::core::int8) ||
+      (in.dtype() == mlx::core::int16 && out.dtype() == mlx::core::int16) ||
+      (in.dtype() == mlx::core::uint16 && out.dtype() == mlx::core::uint16) ||
       (in.dtype() == mlx::core::uint8 && out.dtype() == mlx::core::uint8) ||
+      (in.dtype() == mlx::core::uint8 && out.dtype() == mlx::core::uint32) ||
+      (in.dtype() == mlx::core::uint16 && out.dtype() == mlx::core::uint32) ||
       (in.dtype() == mlx::core::bool_ && out.dtype() == mlx::core::bool_) ||
       (in.dtype() == mlx::core::int64 && out.dtype() == mlx::core::int64) ||
       (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::uint32) ||
+      (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::uint8) ||
+      (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::uint16) ||
       (in.dtype() == mlx::core::uint64 && out.dtype() == mlx::core::uint64) ||
       (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::float32) ||
       (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int64) ||

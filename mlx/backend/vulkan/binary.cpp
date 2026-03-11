@@ -11,8 +11,12 @@ namespace {
 
 bool is_vulkan_integer_dtype(Dtype dtype) {
   switch (dtype) {
+    case int8:
+    case int16:
     case int32:
     case int64:
+    case uint8:
+    case uint16:
     case uint32:
     case uint64:
       return true;
@@ -79,6 +83,10 @@ bool try_eval_binary_op_vulkan(
       is_vulkan_div_cast_dtype(b.dtype());
   const bool bool_add = std::is_same_v<Primitive, Add> && a.dtype() == bool_ &&
       b.dtype() == bool_ && out.dtype() == bool_;
+  const bool small_signed_integer_case = a.dtype() == b.dtype() &&
+      a.dtype() == out.dtype() && (a.dtype() == int8 || a.dtype() == int16);
+  const bool small_unsigned_integer_case = a.dtype() == b.dtype() &&
+      a.dtype() == out.dtype() && (a.dtype() == uint8 || a.dtype() == uint16);
   const bool float_case = is_vulkan_float_dtype(a.dtype()) &&
       is_vulkan_float_dtype(b.dtype()) && is_vulkan_float_dtype(out.dtype());
   const bool integer_case = a.dtype() == b.dtype() &&
@@ -104,6 +112,22 @@ bool try_eval_binary_op_vulkan(
     copy_gpu(b, b_f32, CopyType::General, s);
     a = a_f32;
     b = b_f32;
+  }
+
+  if (small_signed_integer_case) {
+    array a_i32(a.shape(), int32, nullptr, {});
+    array b_i32(b.shape(), int32, nullptr, {});
+    copy_gpu(a, a_i32, CopyType::General, s);
+    copy_gpu(b, b_i32, CopyType::General, s);
+    a = a_i32;
+    b = b_i32;
+  } else if (small_unsigned_integer_case) {
+    array a_u32(a.shape(), uint32, nullptr, {});
+    array b_u32(b.shape(), uint32, nullptr, {});
+    copy_gpu(a, a_u32, CopyType::General, s);
+    copy_gpu(b, b_u32, CopyType::General, s);
+    a = a_u32;
+    b = b_u32;
   }
 
   const bool low_precision_div = std::string_view(op_name) == "div" &&
@@ -132,12 +156,16 @@ bool try_eval_binary_op_vulkan(
     b = contiguous_copy_gpu(b, s);
   }
 
-  const bool staged_output =
-      use_f32_staging_io || !is_supported_elementwise_layout(out);
+  const bool staged_output = use_f32_staging_io || small_signed_integer_case ||
+      small_unsigned_integer_case || !is_supported_elementwise_layout(out);
   array out_work = staged_output
       ? array(
             out.shape(),
-            use_f32_staging_io ? float32 : out.dtype(),
+            use_f32_staging_io
+                ? float32
+                : (small_signed_integer_case
+                       ? int32
+                       : (small_unsigned_integer_case ? uint32 : out.dtype())),
             nullptr,
             {})
       : out;
@@ -150,7 +178,11 @@ bool try_eval_binary_op_vulkan(
   }
 
   auto bopt = get_binary_op_type(a, b);
-  set_binary_op_output_data(a, b, out_work, bopt);
+  if (small_signed_integer_case || small_unsigned_integer_case) {
+    out_work.set_data(allocator::malloc(out_work.nbytes()));
+  } else {
+    set_binary_op_output_data(a, b, out_work, bopt);
+  }
   if (!is_supported_elementwise_layout(out_work)) {
     return false;
   }

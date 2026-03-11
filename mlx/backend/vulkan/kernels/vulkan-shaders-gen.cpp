@@ -1559,17 +1559,51 @@ void process_shaders() {
   string_to_spv(
       "cpy_i32_i32", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "int"}});
   string_to_spv(
+      "cpy_i64_i64",
+      "copy.comp",
+      {{"A_TYPE", "int64_t"}, {"D_TYPE", "int64_t"}});
+  string_to_spv(
       "cpy_u32_u32", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
   string_to_spv(
+      "cpy_u64_u64",
+      "copy.comp",
+      {{"A_TYPE", "uint64_t"}, {"D_TYPE", "uint64_t"}});
+  string_to_spv(
       "cpy_i32_f32", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "cpy_i8_i32", "copy.comp", {{"A_TYPE", "int8_t"}, {"D_TYPE", "int"}});
+  string_to_spv(
+      "cpy_i16_i32", "copy.comp", {{"A_TYPE", "int16_t"}, {"D_TYPE", "int"}});
+  string_to_spv(
+      "cpy_i32_i8", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "int8_t"}});
+  string_to_spv(
+      "cpy_i32_i16", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "int16_t"}});
   string_to_spv(
       "cpy_bool_bool",
       "copy.comp",
       {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}});
   string_to_spv(
+      "cpy_i8_i8", "copy.comp", {{"A_TYPE", "int8_t"}, {"D_TYPE", "int8_t"}});
+  string_to_spv(
+      "cpy_i16_i16",
+      "copy.comp",
+      {{"A_TYPE", "int16_t"}, {"D_TYPE", "int16_t"}});
+  string_to_spv(
       "cpy_u8_u8", "copy.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}});
   string_to_spv(
+      "cpy_u16_u16",
+      "copy.comp",
+      {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
+  string_to_spv(
       "cpy_u32_f32", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "cpy_u8_u32", "copy.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint"}});
+  string_to_spv(
+      "cpy_u16_u32", "copy.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint"}});
+  string_to_spv(
+      "cpy_u32_u8", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint8_t"}});
+  string_to_spv(
+      "cpy_u32_u16", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint16_t"}});
   string_to_spv(
       "cpy_i32_i64", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "int64_t"}});
   string_to_spv(
