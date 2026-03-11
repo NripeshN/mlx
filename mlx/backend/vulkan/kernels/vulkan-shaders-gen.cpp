@@ -1702,7 +1702,7 @@ void process_shaders() {
     }
   }
 
-  for (std::string op : {"add", "sub", "mul", "minimum", "maximum"}) {
+  for (std::string op : {"add", "sub", "mul", "div", "minimum", "maximum"}) {
     for (const auto& t :
          {std::string("int"),
           std::string("int64_t"),

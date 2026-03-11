@@ -21,6 +21,22 @@ bool is_vulkan_integer_dtype(Dtype dtype) {
   }
 }
 
+bool is_vulkan_div_cast_dtype(Dtype dtype) {
+  switch (dtype) {
+    case bool_:
+    case int32:
+    case int64:
+    case uint32:
+    case uint64:
+    case float16:
+    case float32:
+    case bfloat16:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool is_vulkan_compare_dtype(Dtype dtype) {
   switch (dtype) {
     case float16:
@@ -58,13 +74,16 @@ bool try_eval_binary_op_vulkan(
   array a = inputs[0];
   array b = inputs[1];
   std::string shader_op_name = op_name;
+  const bool mixed_numeric_div = std::string_view(op_name) == "div" &&
+      out.dtype() == float32 && is_vulkan_div_cast_dtype(a.dtype()) &&
+      is_vulkan_div_cast_dtype(b.dtype());
   const bool bool_add = std::is_same_v<Primitive, Add> && a.dtype() == bool_ &&
       b.dtype() == bool_ && out.dtype() == bool_;
   const bool float_case = is_vulkan_float_dtype(a.dtype()) &&
       is_vulkan_float_dtype(b.dtype()) && is_vulkan_float_dtype(out.dtype());
   const bool integer_case = a.dtype() == b.dtype() &&
       a.dtype() == out.dtype() && is_vulkan_integer_dtype(a.dtype());
-  if (!float_case && !integer_case && !bool_add) {
+  if (!float_case && !integer_case && !bool_add && !mixed_numeric_div) {
     return false;
   }
 
@@ -76,6 +95,15 @@ bool try_eval_binary_op_vulkan(
     a = a_u32;
     b = b_u32;
     shader_op_name = "maximum";
+  }
+
+  if (mixed_numeric_div) {
+    array a_f32(a.shape(), float32, nullptr, {});
+    array b_f32(b.shape(), float32, nullptr, {});
+    copy_gpu(a, a_f32, CopyType::General, s);
+    copy_gpu(b, b_f32, CopyType::General, s);
+    a = a_f32;
+    b = b_f32;
   }
 
   const bool low_precision_div = std::string_view(op_name) == "div" &&
