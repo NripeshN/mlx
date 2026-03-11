@@ -171,6 +171,17 @@ bool is_row_contiguous_zero_offset(const array& arr) {
       arr.strides(-1) == 1;
 }
 
+void zero_initialize_output(array& out, Stream s) {
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.nbytes() == 0) {
+    return;
+  }
+  auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  vkCmdFillBuffer(command_buffer, out_buf->buffer, 0, out.nbytes(), 0);
+  vulkan::end_command_recording(s.index);
+}
+
 bool try_eval_matvec_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -191,6 +202,11 @@ bool try_eval_matvec_vulkan(
   if (vec.shape(0) != 1 || out.shape(0) != 1 ||
       vec.shape(1) != matrix_t.shape(0) || out.shape(1) != matrix_t.shape(1)) {
     return false;
+  }
+
+  if (vec.shape(1) == 0) {
+    zero_initialize_output(out, s);
+    return true;
   }
 
   if (!matrix_t.flags().col_contiguous || matrix_t.offset() != 0 ||
@@ -286,6 +302,11 @@ bool try_eval_mul_mm_vulkan(
 
   if (a.dtype() != b.dtype()) {
     return false;
+  }
+
+  if (a.shape(-1) == 0) {
+    zero_initialize_output(out, s);
+    return true;
   }
 
   // Keep BF16 inputs in BF16 and dispatch matmul_bf16* directly.
@@ -446,6 +467,10 @@ bool try_eval_mul_mm_vulkan(
 } // namespace
 
 void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (inputs.size() == 2 && (inputs[0].size() == 0 || inputs[1].size() == 0)) {
+    zero_initialize_output(out, stream());
+    return;
+  }
   if (matvec_enabled() && try_eval_matvec_vulkan(inputs, out, stream())) {
     log_matmul_path(inputs, "mul_mat_vec");
     return;
