@@ -144,9 +144,7 @@ void eval_binary_vulkan(
     const char* op_name,
     Stream s) {
   if (!try_eval_binary_op_vulkan<Primitive>(inputs, out, op_name, s)) {
-    throw std::runtime_error(
-        std::string("Binary operation ") + op_name +
-        " failed on Vulkan (unsupported dtype or layout).");
+    eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
   }
 }
 

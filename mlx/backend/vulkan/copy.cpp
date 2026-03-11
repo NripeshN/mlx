@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <string>
 
@@ -73,6 +74,182 @@ std::tuple<Shape, Strides, Strides> collapse_copy_dims(
       std::move(collapsed_shape),
       std::move(collapsed_strides[0]),
       std::move(collapsed_strides[1])};
+}
+
+template <typename SrcT, typename DstT>
+void host_cast_copy_vector(const void* src, void* dst, size_t size) {
+  auto* src_ptr = static_cast<const SrcT*>(src);
+  auto* dst_ptr = static_cast<DstT*>(dst);
+  for (size_t i = 0; i < size; ++i) {
+    dst_ptr[i] = static_cast<DstT>(src_ptr[i]);
+  }
+}
+
+template <typename SrcT>
+void host_cast_copy_dispatch_dst(
+    const void* src,
+    void* dst,
+    size_t size,
+    Dtype dst_dtype) {
+  switch (dst_dtype) {
+    case mlx::core::bool_:
+      host_cast_copy_vector<SrcT, bool>(src, dst, size);
+      return;
+    case mlx::core::uint8:
+      host_cast_copy_vector<SrcT, uint8_t>(src, dst, size);
+      return;
+    case mlx::core::uint16:
+      host_cast_copy_vector<SrcT, uint16_t>(src, dst, size);
+      return;
+    case mlx::core::uint32:
+      host_cast_copy_vector<SrcT, uint32_t>(src, dst, size);
+      return;
+    case mlx::core::uint64:
+      host_cast_copy_vector<SrcT, uint64_t>(src, dst, size);
+      return;
+    case mlx::core::int8:
+      host_cast_copy_vector<SrcT, int8_t>(src, dst, size);
+      return;
+    case mlx::core::int16:
+      host_cast_copy_vector<SrcT, int16_t>(src, dst, size);
+      return;
+    case mlx::core::int32:
+      host_cast_copy_vector<SrcT, int32_t>(src, dst, size);
+      return;
+    case mlx::core::int64:
+      host_cast_copy_vector<SrcT, int64_t>(src, dst, size);
+      return;
+    case mlx::core::float16:
+      host_cast_copy_vector<SrcT, mlx::core::float16_t>(src, dst, size);
+      return;
+    case mlx::core::float32:
+      host_cast_copy_vector<SrcT, float>(src, dst, size);
+      return;
+    case mlx::core::bfloat16:
+      host_cast_copy_vector<SrcT, mlx::core::bfloat16_t>(src, dst, size);
+      return;
+    case mlx::core::complex64:
+      host_cast_copy_vector<SrcT, mlx::core::complex64_t>(src, dst, size);
+      return;
+    case mlx::core::float64:
+      throw std::runtime_error("float64 is not supported on the GPU");
+  }
+}
+
+void host_cast_copy_dispatch_src(
+    const void* src,
+    Dtype src_dtype,
+    void* dst,
+    size_t size,
+    Dtype dst_dtype) {
+  switch (src_dtype) {
+    case mlx::core::bool_:
+      host_cast_copy_dispatch_dst<bool>(src, dst, size, dst_dtype);
+      return;
+    case mlx::core::uint8:
+      host_cast_copy_dispatch_dst<uint8_t>(src, dst, size, dst_dtype);
+      return;
+    case mlx::core::uint16:
+      host_cast_copy_dispatch_dst<uint16_t>(src, dst, size, dst_dtype);
+      return;
+    case mlx::core::uint32:
+      host_cast_copy_dispatch_dst<uint32_t>(src, dst, size, dst_dtype);
+      return;
+    case mlx::core::uint64:
+      host_cast_copy_dispatch_dst<uint64_t>(src, dst, size, dst_dtype);
+      return;
+    case mlx::core::int8:
+      host_cast_copy_dispatch_dst<int8_t>(src, dst, size, dst_dtype);
+      return;
+    case mlx::core::int16:
+      host_cast_copy_dispatch_dst<int16_t>(src, dst, size, dst_dtype);
+      return;
+    case mlx::core::int32:
+      host_cast_copy_dispatch_dst<int32_t>(src, dst, size, dst_dtype);
+      return;
+    case mlx::core::int64:
+      host_cast_copy_dispatch_dst<int64_t>(src, dst, size, dst_dtype);
+      return;
+    case mlx::core::float16:
+      host_cast_copy_dispatch_dst<mlx::core::float16_t>(
+          src, dst, size, dst_dtype);
+      return;
+    case mlx::core::float32:
+      host_cast_copy_dispatch_dst<float>(src, dst, size, dst_dtype);
+      return;
+    case mlx::core::bfloat16:
+      host_cast_copy_dispatch_dst<mlx::core::bfloat16_t>(
+          src, dst, size, dst_dtype);
+      return;
+    case mlx::core::complex64:
+      host_cast_copy_dispatch_dst<mlx::core::complex64_t>(
+          src, dst, size, dst_dtype);
+      return;
+    case mlx::core::float64:
+      throw std::runtime_error("float64 is not supported on the GPU");
+  }
+}
+
+bool try_host_vector_cast_copy(
+    const mlx::core::array& in,
+    mlx::core::array& out,
+    size_t size,
+    int64_t in_offset,
+    int64_t out_offset,
+    const mlx::core::Stream& s) {
+  auto* in_buf = static_cast<mlx::core::vulkan::VulkanBuffer*>(
+      const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
+  auto* out_buf =
+      static_cast<mlx::core::vulkan::VulkanBuffer*>(out.buffer().ptr());
+
+  auto convert_and_store = [&](const void* src_ptr) {
+    std::vector<char> host_out(size * size_of(out.dtype()));
+    host_cast_copy_dispatch_src(
+        src_ptr, in.dtype(), host_out.data(), size, out.dtype());
+
+    if (mlx::core::vulkan::VulkanContext::get().is_unified_memory() &&
+        out_buf->mapped_ptr != nullptr) {
+      auto* dst_ptr = static_cast<char*>(out_buf->mapped_ptr) +
+          out_offset * size_of(out.dtype());
+      std::memcpy(dst_ptr, host_out.data(), host_out.size());
+      return;
+    }
+
+    mlx::core::vulkan::enqueue_owned_staging_upload(
+        s,
+        host_out.data(),
+        host_out.size(),
+        out_buf->buffer,
+        out_offset * size_of(out.dtype()));
+    mlx::core::vulkan::retain_array_for_stream(s, in);
+    mlx::core::vulkan::retain_array_for_stream(s, out);
+  };
+
+  if (in_buf->mapped_ptr != nullptr) {
+    auto* src_ptr = static_cast<const char*>(in_buf->mapped_ptr) +
+        in_offset * size_of(in.dtype());
+    convert_and_store(src_ptr);
+    return true;
+  }
+
+  auto host_in =
+      std::make_shared<std::vector<char>>(size * size_of(in.dtype()));
+  auto readback_done = std::make_shared<bool>(false);
+  mlx::core::vulkan::enqueue_owned_staging_readback(
+      s,
+      in_buf->buffer,
+      in_offset * size_of(in.dtype()),
+      host_in->size(),
+      [host_in, readback_done](const void* ptr, size_t nbytes) {
+        std::memcpy(host_in->data(), ptr, nbytes);
+        *readback_done = true;
+      });
+  mlx::core::vulkan::synchronize_stream(s);
+  if (!*readback_done) {
+    throw std::runtime_error("Vulkan readback did not complete for cast copy.");
+  }
+  convert_and_store(host_in->data());
+  return true;
 }
 
 std::string copy_dtype_suffix(Dtype dtype) {
@@ -353,6 +530,23 @@ void copy_gpu_inplace(
       dispatch_shape.size() > 4 && in_view.flags().contiguous &&
       out_view.flags().contiguous && in_view.size() == out_view.size() &&
       !is_slice_copy;
+
+  const bool host_contiguous_copy = in_view.flags().row_contiguous &&
+      out_view.flags().row_contiguous && dispatch_elements == in_view.size() &&
+      dispatch_elements == out_view.size();
+
+  if (!raw_buffer_copy && !shader_copy && !is_slice_copy &&
+      !contiguous_large_rank_copy && host_contiguous_copy) {
+    if (try_host_vector_cast_copy(
+            in_view,
+            out_view,
+            dispatch_elements,
+            in_view.offset(),
+            out_view.offset(),
+            s)) {
+      return;
+    }
+  }
 
   if (!raw_buffer_copy && !shader_copy && !is_slice_copy &&
       !contiguous_large_rank_copy) {
