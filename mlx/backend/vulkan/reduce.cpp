@@ -19,19 +19,31 @@ bool try_eval_reduce_sum_rows_vulkan(
     Reduce::ReduceType reduce_type,
     const std::vector<int>& axes,
     Stream s) {
-  if (inputs.size() != 1 || reduce_type != Reduce::Sum || axes.empty()) {
+  if (inputs.size() != 1 || axes.empty()) {
     return false;
   }
 
   array in = inputs[0];
-  const bool f32_io = in.dtype() == float32 && out.dtype() == float32;
-  const bool f16_io = in.dtype() == float16 && out.dtype() == float16;
-  const bool bf16_io = in.dtype() == bfloat16 && out.dtype() == bfloat16;
-  if (!f32_io && !f16_io && !bf16_io) {
+  const bool sum_reduce = reduce_type == Reduce::Sum;
+  const bool logic_reduce =
+      reduce_type == Reduce::And || reduce_type == Reduce::Or;
+  if (!sum_reduce && !logic_reduce) {
     return false;
   }
 
-  const bool use_f32_staging_io = f16_io || bf16_io;
+  const bool f32_io = in.dtype() == float32 && out.dtype() == float32;
+  const bool f16_io = in.dtype() == float16 && out.dtype() == float16;
+  const bool bf16_io = in.dtype() == bfloat16 && out.dtype() == bfloat16;
+  const bool bool_io = in.dtype() == bool_ && out.dtype() == bool_;
+  if (sum_reduce && !f32_io && !f16_io && !bf16_io) {
+    return false;
+  }
+  if (logic_reduce && !bool_io) {
+    return false;
+  }
+
+  const bool use_f32_staging_io = sum_reduce && (f16_io || bf16_io);
+  const bool use_u8_staging_io = logic_reduce;
   if (use_f32_staging_io) {
     if (in.offset() > 0xFFFF && in.flags().row_contiguous) {
       in = stage_zero_offset_row_contiguous(in, s);
@@ -40,9 +52,17 @@ bool try_eval_reduce_sum_rows_vulkan(
     copy_gpu(in, in_f32, CopyType::General, s);
     in = in_f32;
   }
+  if (use_u8_staging_io) {
+    array in_u8(in.shape(), uint8, nullptr, {});
+    in_u8.copy_shared_buffer(
+        in, in.strides(), in.flags(), in.data_size(), in.offset());
+    in = in_u8;
+  }
 
-  array reduce_out_target =
-      use_f32_staging_io ? array(out.shape(), float32, nullptr, {}) : out;
+  array reduce_out_target = use_f32_staging_io
+      ? array(out.shape(), float32, nullptr, {})
+      : use_u8_staging_io ? array(out.shape(), uint8, nullptr, {})
+                          : out;
 
   if (in.ndim() == 0 || in.ndim() > 4 || reduce_out_target.ndim() > 4) {
     return false;
@@ -94,7 +114,14 @@ bool try_eval_reduce_sum_rows_vulkan(
       try {
         auto command_buffer = vulkan::begin_command_recording(s.index);
         vulkan::dispatch_sum_rows_op(
-            in_kernel, out_work, "sum_rows_f32", command_buffer, s, 1.0f);
+            in_kernel,
+            out_work,
+            sum_reduce
+                ? "sum_rows_f32"
+                : (reduce_type == Reduce::And ? "all_rows_u8" : "any_rows_u8"),
+            command_buffer,
+            s,
+            1.0f);
         vulkan::end_command_recording(s.index);
       } catch (const std::runtime_error&) {
         return false;
@@ -111,9 +138,27 @@ bool try_eval_reduce_sum_rows_vulkan(
 
   if (out_is_squeezed) {
     auto squeezed = reshape_in_eval(reduced, reduce_out_target.shape(), s);
-    copy_gpu(squeezed, reduce_out_target, CopyType::GeneralGeneral, s);
+    if (use_u8_staging_io) {
+      out.copy_shared_buffer(
+          squeezed,
+          squeezed.strides(),
+          squeezed.flags(),
+          squeezed.data_size(),
+          squeezed.offset());
+    } else {
+      copy_gpu(squeezed, reduce_out_target, CopyType::GeneralGeneral, s);
+    }
   } else {
-    copy_gpu(reduced, reduce_out_target, CopyType::GeneralGeneral, s);
+    if (use_u8_staging_io) {
+      out.copy_shared_buffer(
+          reduced,
+          reduced.strides(),
+          reduced.flags(),
+          reduced.data_size(),
+          reduced.offset());
+    } else {
+      copy_gpu(reduced, reduce_out_target, CopyType::GeneralGeneral, s);
+    }
   }
 
   if (use_f32_staging_io) {
@@ -128,7 +173,8 @@ bool try_eval_arg_reduce_vulkan(
     ArgReduce::ReduceType reduce_type,
     int axis,
     Stream s) {
-  if (inputs.size() != 1 || reduce_type != ArgReduce::ArgMax) {
+  if (inputs.size() != 1 ||
+      (reduce_type != ArgReduce::ArgMax && reduce_type != ArgReduce::ArgMin)) {
     return false;
   }
 
@@ -202,7 +248,11 @@ bool try_eval_arg_reduce_vulkan(
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_argmax_op(
-        in_kernel, out_work, "argmax_f32", command_buffer, s);
+        in_kernel,
+        out_work,
+        reduce_type == ArgReduce::ArgMin ? "argmin_f32" : "argmax_f32",
+        command_buffer,
+        s);
     vulkan::end_command_recording(s.index);
     if (staged_output) {
       copy_gpu(out_work, kernel_out, CopyType::GeneralGeneral, s);

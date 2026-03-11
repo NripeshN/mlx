@@ -260,6 +260,10 @@ std::string copy_dtype_suffix(Dtype dtype) {
       return "f32";
     case mlx::core::bfloat16:
       return "bf16";
+    case mlx::core::bool_:
+      return "bool";
+    case mlx::core::uint8:
+      return "u8";
     case mlx::core::int32:
       return "i32";
     case mlx::core::uint32:
@@ -387,6 +391,8 @@ std::string get_copy_shader_name(
       (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::int32) ||
       (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::float32) ||
       (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int32) ||
+      (in.dtype() == mlx::core::uint8 && out.dtype() == mlx::core::uint8) ||
+      (in.dtype() == mlx::core::bool_ && out.dtype() == mlx::core::bool_) ||
       (in.dtype() == mlx::core::int64 && out.dtype() == mlx::core::int64) ||
       (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::uint32) ||
       (in.dtype() == mlx::core::uint64 && out.dtype() == mlx::core::uint64) ||

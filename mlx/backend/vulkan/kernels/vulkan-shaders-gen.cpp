@@ -1563,6 +1563,12 @@ void process_shaders() {
   string_to_spv(
       "cpy_i32_f32", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
   string_to_spv(
+      "cpy_bool_bool",
+      "copy.comp",
+      {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}});
+  string_to_spv(
+      "cpy_u8_u8", "copy.comp", {{"A_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}});
+  string_to_spv(
       "cpy_u32_f32", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "float"}});
   string_to_spv(
       "cpy_i32_i64", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "int64_t"}});
@@ -2396,9 +2402,17 @@ void process_shaders() {
       "argmax.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "int"}}));
   string_to_spv(
+      "argmin_f32",
+      "argmax.comp",
+      merge_maps(
+          base_dict,
+          {{"A_TYPE", "float"}, {"D_TYPE", "int"}, {"ARGMIN", "1"}}));
+  string_to_spv(
       "sum_rows_f32",
       "sum_rows.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+  string_to_spv("any_rows_u8", "any_rows.comp", base_dict);
+  string_to_spv("all_rows_u8", "all_rows.comp", base_dict);
   string_to_spv(
       "count_equal_i32",
       "count_equal.comp",
