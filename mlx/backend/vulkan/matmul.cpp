@@ -6,6 +6,7 @@
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
+#include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/primitives.h"
 
@@ -459,11 +460,12 @@ void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  throw std::runtime_error("[AddMM::eval_gpu] Not implemented.");
+  eval_cpu_fallback_with_state_on_stream<AddMM>(inputs, out, stream(), state());
 }
 
 void BlockMaskedMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-  throw std::runtime_error("[BlockMaskedMM::eval_gpu] Not implemented.");
+  eval_cpu_fallback_with_state_on_stream<BlockMaskedMM>(
+      inputs, out, stream(), state());
 }
 
 } // namespace mlx::core

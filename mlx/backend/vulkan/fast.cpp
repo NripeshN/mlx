@@ -980,7 +980,7 @@ void ConvertFP8::eval_gpu(
 void Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  throw std::runtime_error("[Quantize::eval_gpu] Not implemented.");
+  throw std::runtime_error("Quantize has no Vulkan implementation.");
 }
 
 void CustomKernel::eval_gpu(

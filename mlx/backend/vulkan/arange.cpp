@@ -2,10 +2,50 @@
 
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/vulkan.h"
+
+#include <vector>
 
 namespace mlx::core {
 
 namespace {
+
+template <typename T>
+void fill_arange_like_cpu(array& out, Stream s, double start, double step) {
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return;
+  }
+
+  T value = static_cast<T>(start);
+  const T next = static_cast<T>(start + step);
+  const T step_size = next - value;
+
+  if (vulkan::VulkanContext::get().is_unified_memory()) {
+    auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
+    auto* dst = static_cast<T*>(out_buf->mapped_ptr);
+    for (size_t i = 0; i < out.size(); ++i) {
+      dst[i] = value;
+      value += step_size;
+    }
+    return;
+  }
+
+  std::vector<T> host_values(out.size());
+  for (size_t i = 0; i < out.size(); ++i) {
+    host_values[i] = value;
+    value += step_size;
+  }
+
+  auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
+  vulkan::enqueue_owned_staging_upload(
+      s,
+      host_values.data(),
+      host_values.size() * sizeof(T),
+      out_buf->buffer,
+      out.offset());
+  vulkan::retain_array_for_stream(s, out);
+}
 
 bool try_eval_arange_vulkan(
     const std::vector<array>& inputs,
@@ -17,24 +57,50 @@ bool try_eval_arange_vulkan(
     return false;
   }
 
-  const bool direct_output = out.dtype() == float32;
-  const bool low_precision_output =
-      out.dtype() == float16 || out.dtype() == bfloat16;
-  if (!direct_output && !low_precision_output) {
-    return false;
+  switch (out.dtype()) {
+    case bool_:
+      return false;
+    case uint8:
+      fill_arange_like_cpu<uint8_t>(out, s, start, step);
+      return true;
+    case uint16:
+      fill_arange_like_cpu<uint16_t>(out, s, start, step);
+      return true;
+    case uint32:
+      fill_arange_like_cpu<uint32_t>(out, s, start, step);
+      return true;
+    case uint64:
+      fill_arange_like_cpu<uint64_t>(out, s, start, step);
+      return true;
+    case int8:
+      fill_arange_like_cpu<int8_t>(out, s, start, step);
+      return true;
+    case int16:
+      fill_arange_like_cpu<int16_t>(out, s, start, step);
+      return true;
+    case int32:
+      fill_arange_like_cpu<int32_t>(out, s, start, step);
+      return true;
+    case int64:
+      fill_arange_like_cpu<int64_t>(out, s, start, step);
+      return true;
+    case float16:
+      fill_arange_like_cpu<float16_t>(out, s, start, step);
+      return true;
+    case float64:
+      fill_arange_like_cpu<double>(out, s, start, step);
+      return true;
+    case bfloat16:
+      fill_arange_like_cpu<bfloat16_t>(out, s, start, step);
+      return true;
+    case complex64:
+      fill_arange_like_cpu<complex64_t>(out, s, start, step);
+      return true;
+    case float32:
+      break;
   }
 
-  array* dispatch_out = &out;
-  std::optional<array> temp_out;
-  if (!direct_output) {
-    temp_out = array(out.shape(), float32, nullptr, {});
-    temp_out->set_data(allocator::malloc(temp_out->nbytes()));
-    dispatch_out = &(*temp_out);
-  }
-
-  if (direct_output) {
-    out.set_data(allocator::malloc(out.nbytes()));
-  }
+  out.set_data(allocator::malloc(out.nbytes()));
   if (out.size() == 0) {
     return true;
   }
@@ -42,17 +108,13 @@ bool try_eval_arange_vulkan(
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_arange_op(
-        *dispatch_out,
+        out,
         "arange_f32",
         command_buffer,
         s,
         static_cast<float>(start),
         static_cast<float>(step));
     vulkan::end_command_recording(s.index);
-
-    if (temp_out.has_value()) {
-      copy_gpu(*temp_out, out, CopyType::Vector, s);
-    }
 
     return true;
   } catch (const std::runtime_error& e) {

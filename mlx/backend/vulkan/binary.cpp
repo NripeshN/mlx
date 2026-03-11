@@ -50,8 +50,12 @@ bool try_eval_binary_op_vulkan(
     return false;
   }
 
-  const bool use_f32_staging_io =
-      a.dtype() == bfloat16 || b.dtype() == bfloat16 || out.dtype() == bfloat16;
+  const bool low_precision_div = std::string_view(op_name) == "div" &&
+      (a.dtype() == float16 || b.dtype() == float16 || out.dtype() == float16 ||
+       a.dtype() == bfloat16 || b.dtype() == bfloat16 ||
+       out.dtype() == bfloat16);
+  const bool use_f32_staging_io = low_precision_div || a.dtype() == bfloat16 ||
+      b.dtype() == bfloat16 || out.dtype() == bfloat16;
   if (use_f32_staging_io) {
     array a_f32(a.shape(), float32, nullptr, {});
     array b_f32(b.shape(), float32, nullptr, {});
@@ -59,12 +63,6 @@ bool try_eval_binary_op_vulkan(
     copy_gpu(b, b_f32, CopyType::General, s);
     a = a_f32;
     b = b_f32;
-  }
-
-  if (!use_f32_staging_io && std::string_view(op_name) == "div" &&
-      (a.dtype() == float16 || b.dtype() == float16 ||
-       out.dtype() == float16)) {
-    return false;
   }
 
   if (a.shape() != out.shape() || b.shape() != out.shape()) {
