@@ -42,6 +42,22 @@ bool trace_compiled_runtime_enabled() {
   return enabled;
 }
 
+uint32_t checked_elem_offset(const array& arr, const char* name) {
+  const int64_t item_size = static_cast<int64_t>(size_of(arr.dtype()));
+  const int64_t byte_offset = arr.offset();
+  if (item_size <= 0 || byte_offset < 0 || (byte_offset % item_size) != 0) {
+    throw std::runtime_error(
+        fmt::format("Invalid element offset for Vulkan compiled {}", name));
+  }
+  const uint64_t elem_offset = static_cast<uint64_t>(byte_offset / item_size);
+  if (elem_offset > std::numeric_limits<uint32_t>::max()) {
+    throw std::runtime_error(
+        fmt::format(
+            "Element offset out of range for Vulkan compiled {}", name));
+  }
+  return static_cast<uint32_t>(elem_offset);
+}
+
 std::string join_primitive_names(const std::vector<array>& arrays) {
   std::ostringstream os;
   bool first = true;
@@ -334,10 +350,16 @@ inline void build_glsl_kernel(
     int ndim,
     int work_per_thread,
     const Shape* strided_shape = nullptr,
-    const std::vector<Strides>* strided_strides = nullptr) {
+    const std::vector<Strides>* strided_strides = nullptr,
+    const std::vector<uint32_t>* input_offsets = nullptr,
+    const std::vector<uint32_t>* output_offsets = nullptr) {
   if (!contiguous && (strided_shape == nullptr || strided_strides == nullptr)) {
     throw std::runtime_error(
         "Missing runtime shape/strides for Vulkan compiled strided kernel");
+  }
+  if (input_offsets == nullptr || output_offsets == nullptr) {
+    throw std::runtime_error(
+        "Missing runtime offsets for Vulkan compiled kernel");
   }
 
   // Maps to store array identifiers - use simple valid GLSL names
@@ -456,34 +478,51 @@ layout(push_constant) uniform PushConstants {
     const auto& x = inputs[i];
     const auto& xname = get_var_name(x);
     std::string type_str = dtype_to_glsl_compute(x.dtype());
+    const uint32_t base_offset = (*input_offsets)[i];
 
     if (is_constant(i)) {
       continue;
     } else if (is_scalar(x)) {
       if (x.dtype() == bool_) {
         os += fmt::format(
-            "    {} t_{} = ({}[0] != uint8_t(0));\n", type_str, xname, xname);
-      } else if (x.dtype() == bfloat16) {
-        os += fmt::format(
-            "    {} t_{} = bf16_to_fp32(uint({}[0]));\n",
+            "    {} t_{} = ({}[{}] != uint8_t(0));\n",
             type_str,
             xname,
-            xname);
+            xname,
+            base_offset);
+      } else if (x.dtype() == bfloat16) {
+        os += fmt::format(
+            "    {} t_{} = bf16_to_fp32(uint({}[{}]));\n",
+            type_str,
+            xname,
+            xname,
+            base_offset);
       } else {
-        os += fmt::format("    {} t_{} = {}[0];\n", type_str, xname, xname);
+        os += fmt::format(
+            "    {} t_{} = {}[{}];\n", type_str, xname, xname, base_offset);
       }
     } else if (contiguous) {
       if (x.dtype() == bool_) {
         os += fmt::format(
-            "    {} t_{} = ({}[idx] != uint8_t(0));\n", type_str, xname, xname);
-      } else if (x.dtype() == bfloat16) {
-        os += fmt::format(
-            "    {} t_{} = bf16_to_fp32(uint({}[idx]));\n",
+            "    {} t_{} = ({}[idx + {}u] != uint8_t(0));\n",
             type_str,
             xname,
-            xname);
+            xname,
+            base_offset);
+      } else if (x.dtype() == bfloat16) {
+        os += fmt::format(
+            "    {} t_{} = bf16_to_fp32(uint({}[idx + {}u]));\n",
+            type_str,
+            xname,
+            xname,
+            base_offset);
       } else {
-        os += fmt::format("    {} t_{} = {}[idx];\n", type_str, xname, xname);
+        os += fmt::format(
+            "    {} t_{} = {}[idx + {}u];\n",
+            type_str,
+            xname,
+            xname,
+            base_offset);
       }
     } else {
       // Strided: compute location from strides
@@ -495,7 +534,7 @@ layout(push_constant) uniform PushConstants {
       }
       const auto& runtime_shape = *strided_shape;
       const auto& runtime_input_strides = (*strided_strides)[stride_idx];
-      os += fmt::format("    uint loc_{} = 0u;\n", xname);
+      os += fmt::format("    uint loc_{} = {}u;\n", xname, base_offset);
       os += fmt::format("    uint rem_{} = idx;\n", xname);
       for (int axis = ndim - 1; axis >= 0; --axis) {
         os += fmt::format(
@@ -681,26 +720,41 @@ layout(push_constant) uniform PushConstants {
   for (size_t i = 0; i < outputs.size(); ++i) {
     auto& x = outputs[i];
     const auto& xname = get_var_name(x);
+    const uint32_t base_offset = (*output_offsets)[i];
 
     if (contiguous) {
       if (x.dtype() == bool_) {
-        os +=
-            fmt::format("    {}[idx] = uint8_t(t_{} ? 1 : 0);\n", xname, xname);
+        os += fmt::format(
+            "    {}[idx + {}u] = uint8_t(t_{} ? 1 : 0);\n",
+            xname,
+            base_offset,
+            xname);
       } else if (x.dtype() == bfloat16) {
         os += fmt::format(
-            "    {}[idx] = uint16_t(fp32_to_bf16(t_{}));\n", xname, xname);
+            "    {}[idx + {}u] = uint16_t(fp32_to_bf16(t_{}));\n",
+            xname,
+            base_offset,
+            xname);
       } else {
-        os += fmt::format("    {}[idx] = t_{};\n", xname, xname);
+        os += fmt::format(
+            "    {}[idx + {}u] = t_{};\n", xname, base_offset, xname);
       }
     } else {
       if (x.dtype() == bool_) {
-        os +=
-            fmt::format("    {}[idx] = uint8_t(t_{} ? 1 : 0);\n", xname, xname);
+        os += fmt::format(
+            "    {}[idx + {}u] = uint8_t(t_{} ? 1 : 0);\n",
+            xname,
+            base_offset,
+            xname);
       } else if (x.dtype() == bfloat16) {
         os += fmt::format(
-            "    {}[idx] = uint16_t(fp32_to_bf16(t_{}));\n", xname, xname);
+            "    {}[idx + {}u] = uint16_t(fp32_to_bf16(t_{}));\n",
+            xname,
+            base_offset,
+            xname);
       } else {
-        os += fmt::format("    {}[idx] = t_{};\n", xname, xname);
+        os += fmt::format(
+            "    {}[idx + {}u] = t_{};\n", xname, base_offset, xname);
       }
     }
   }
@@ -789,20 +843,23 @@ void Compiled::eval_gpu(
   auto [contiguous, shape, strides] =
       compiled_collapse_contiguous_dims(inputs, outputs[0], is_constant_);
   auto dispatch_inputs = inputs;
+  std::vector<uint32_t> input_offsets(inputs.size(), 0u);
+  for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
+    input_offsets[i] = checked_elem_offset(dispatch_inputs[i], "input");
+  }
+  std::vector<uint32_t> output_offsets(outputs.size(), 0u);
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    output_offsets[i] = checked_elem_offset(outputs[i], "output");
+  }
 
   if (!contiguous) {
     work_per_thread = 1;
   }
 
   const auto requires_cpu_fallback = [&]() {
-    auto has_nonzero_offset = [](const std::vector<array>& arrays) {
-      return std::any_of(arrays.begin(), arrays.end(), [](const array& x) {
-        return x.offset() != 0;
-      });
-    };
-
-    if (has_nonzero_offset(dispatch_inputs) || has_nonzero_offset(outputs) ||
-        has_nonzero_offset(tape_)) {
+    if (std::any_of(tape_.begin(), tape_.end(), [](const array& x) {
+          return x.offset() != 0;
+        })) {
       return true;
     }
 
@@ -847,11 +904,31 @@ void Compiled::eval_gpu(
 
   // Use large index if needed
   bool large = compiled_use_large_index(dispatch_inputs, outputs, contiguous);
+  const bool has_nonzero_runtime_offset =
+      std::any_of(
+          input_offsets.begin(),
+          input_offsets.end(),
+          [](uint32_t x) { return x != 0; }) ||
+      std::any_of(output_offsets.begin(), output_offsets.end(), [](uint32_t x) {
+        return x != 0;
+      });
 
   // Build kernel name based on configuration
   std::string kernel_name = kernel_lib_;
   if (contiguous) {
     kernel_name += "_contiguous";
+    if (has_nonzero_runtime_offset) {
+      std::ostringstream layout_key;
+      for (size_t i = 0; i < input_offsets.size(); ++i) {
+        layout_key << "i" << i << "=" << input_offsets[i] << ",";
+      }
+      layout_key << "out=";
+      for (auto offset : output_offsets) {
+        layout_key << offset << ",";
+      }
+      kernel_name += fmt::format(
+          "_offsets_{}", std::hash<std::string>{}(layout_key.str()));
+    }
   } else {
     kernel_name += fmt::format("_strided_{}", shape.size());
     std::ostringstream layout_key;
@@ -860,19 +937,26 @@ void Compiled::eval_gpu(
       layout_key << dim << ",";
     }
     for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
-      if (is_constant_(i) || is_scalar(dispatch_inputs[i])) {
+      if (is_constant_(i)) {
         continue;
       }
-      int stride_idx = 1;
-      for (size_t j = 0; j < i; ++j) {
-        if (!is_constant_(j) && !is_scalar(dispatch_inputs[j])) {
-          stride_idx++;
+      if (!is_scalar(dispatch_inputs[i])) {
+        int stride_idx = 1;
+        for (size_t j = 0; j < i; ++j) {
+          if (!is_constant_(j) && !is_scalar(dispatch_inputs[j])) {
+            stride_idx++;
+          }
+        }
+        layout_key << "s" << i << "=";
+        for (auto stride : strides[stride_idx]) {
+          layout_key << stride << ",";
         }
       }
-      layout_key << "s" << i << "=";
-      for (auto stride : strides[stride_idx]) {
-        layout_key << stride << ",";
-      }
+      layout_key << "o" << i << "=" << input_offsets[i] << ",";
+    }
+    layout_key << "out=";
+    for (auto offset : output_offsets) {
+      layout_key << offset << ",";
     }
     kernel_name +=
         fmt::format("_layout_{}", std::hash<std::string>{}(layout_key.str()));
@@ -901,7 +985,9 @@ void Compiled::eval_gpu(
         static_cast<int>(shape.size()),
         work_per_thread,
         contiguous ? nullptr : &shape,
-        contiguous ? nullptr : &strides);
+        contiguous ? nullptr : &strides,
+        &input_offsets,
+        &output_offsets);
 
     if (trace_compiled_glsl_enabled()) {
       std::cerr << "=== Vulkan compiled GLSL: " << kernel_name << " ===\n"
@@ -1021,7 +1107,9 @@ void Compiled::eval_gpu(
               << " contiguous=" << contiguous << " shape=" << shape
               << " all_strides=" << all_strides
               << " out_data_size=" << outputs[0].data_size()
-              << " out_size=" << outputs[0].size() << "\n";
+              << " out_size=" << outputs[0].size()
+              << " input_offsets=" << input_offsets
+              << " output_offsets=" << output_offsets << "\n";
     for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
       if (dispatch_inputs[i].dtype() == float32 &&
           dispatch_inputs[i].size() > 0) {
