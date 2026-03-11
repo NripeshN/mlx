@@ -1,6 +1,10 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/vulkan.h"
+
+#include <cstring>
+#include <vector>
 
 namespace mlx::core {
 
@@ -79,6 +83,26 @@ bool try_eval_reduce_sum_rows_vulkan(
       has_squeezed_axes_shape(in, reduce_out_target, normalized_axes);
   if (!out_is_keepdims && !out_is_squeezed) {
     return false;
+  }
+
+  if (logic_reduce && in.size() == 0) {
+    out.set_data(allocator::malloc(out.nbytes()));
+    const uint8_t fill_value =
+        reduce_type == Reduce::And ? uint8_t(1) : uint8_t(0);
+    if (out.nbytes() == 0) {
+      return true;
+    }
+    auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
+    if (vulkan::VulkanContext::get().is_unified_memory() &&
+        out_buf->mapped_ptr != nullptr) {
+      std::memset(out_buf->mapped_ptr, fill_value, out.nbytes());
+      return true;
+    }
+    std::vector<uint8_t> host_values(out.size(), fill_value);
+    vulkan::enqueue_owned_staging_upload(
+        s, host_values.data(), host_values.size(), out_buf->buffer, 0);
+    vulkan::retain_array_for_stream(s, out);
+    return true;
   }
 
   array reduced = in;
