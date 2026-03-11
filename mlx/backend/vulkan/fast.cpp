@@ -909,6 +909,9 @@ void ScaledDotProductAttention::eval_gpu(
   }
 
   auto result = matmul(scores, v_work, s);
+  if (n_repeats > 1) {
+    result = flatten(result, 1, 2, s);
+  }
   if (result.dtype() != outputs[0].dtype()) {
     result = astype(result, outputs[0].dtype(), s);
   }
