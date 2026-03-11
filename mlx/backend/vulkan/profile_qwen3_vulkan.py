@@ -5,6 +5,8 @@ Uses MLX tracing/monkeypatching to show time per layer/op.
 
 Usage:
     python mlx/backend/vulkan/profile_qwen3_vulkan.py
+    python mlx/backend/vulkan/profile_qwen3_vulkan.py --model mlx-community/Qwen3.5-2B-bf16
+    python mlx/backend/vulkan/profile_qwen3_vulkan.py --help
 
 Environment variables:
     MLX_VULKAN_DEFERRED_SUBMISSION=1  # Enable deferred submission
@@ -15,22 +17,11 @@ import time
 import sys
 import os
 import re
+import argparse
 import threading
 from collections import defaultdict
 from contextlib import contextmanager
 from typing import Dict, List, Tuple, Any, Optional
-
-# Enable Vulkan fallback tracing by default for profiling
-os.environ.setdefault("MLX_VULKAN_TRACE_FALLBACKS", "1")
-
-import mlx.core as mx
-
-try:
-    from mlx_lm import load
-    from mlx_lm.models import cache as cache_utils
-except ImportError:
-    print("Error: mlx_lm not installed. Install with: pip install mlx-lm")
-    sys.exit(1)
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -49,6 +40,28 @@ def env_int(name: str, default: int) -> int:
     except ValueError:
         return default
 
+
+def should_enable_sync_trace_before_import(argv: List[str]) -> bool:
+    if "MLX_VULKAN_TRACE_SYNC" in os.environ:
+        return False
+    if "--no-capture-sync-trace" in argv:
+        return False
+    return env_flag("MLX_VULKAN_PROFILE_CAPTURE_SYNC_TRACE", True)
+
+
+# Enable Vulkan fallback tracing by default for profiling
+os.environ.setdefault("MLX_VULKAN_TRACE_FALLBACKS", "1")
+if should_enable_sync_trace_before_import(sys.argv[1:]):
+    os.environ["MLX_VULKAN_TRACE_SYNC"] = "1"
+
+import mlx.core as mx
+
+try:
+    from mlx_lm import load
+    from mlx_lm.models import cache as cache_utils
+except ImportError:
+    print("Error: mlx_lm not installed. Install with: pip install mlx-lm")
+    sys.exit(1)
 
 class FallbackAnalyzer:
     """Analyzes Vulkan fallback messages from stderr."""
@@ -741,16 +754,59 @@ def trace_model_inference(
 def main():
     """Main entry point."""
 
-    model_name = os.environ.get(
-        "MLX_VULKAN_PROFILE_MODEL", "mlx-community/qwen3-0.6b-bf16"
+    parser = argparse.ArgumentParser(
+        description="Profile Qwen3 model inference with Vulkan backend"
     )
-    prompt = os.environ.get(
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="mlx-community/qwen3-0.6b-bf16",
+        choices=[
+            "mlx-community/Qwen3.5-2B-bf16",
+            "mlx-community/qwen3-0.6b-bf16",
+        ],
+        help="Model to profile (default: mlx-community/qwen3-0.6b-bf16)",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Prompt for generation (default: from env or 'Explain machine learning in simple terms.')",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Max tokens to generate (default: 5)",
+    )
+    parser.add_argument(
+        "--sync-checkpoints",
+        action="store_true",
+        help="Synchronize after each checkpoint for accurate timing",
+    )
+    parser.add_argument(
+        "--no-capture-sync-trace",
+        action="store_true",
+        help="Disable Vulkan sync trace capture",
+    )
+    parser.add_argument(
+        "--echo-sync-trace",
+        action="store_true",
+        help="Echo sync trace output to stderr",
+    )
+    args = parser.parse_args()
+
+    model_name = os.environ.get("MLX_VULKAN_PROFILE_MODEL", args.model)
+    prompt = args.prompt or os.environ.get(
         "MLX_VULKAN_PROFILE_PROMPT", "Explain machine learning in simple terms."
     )
-    max_tokens = env_int("MLX_VULKAN_PROFILE_MAX_TOKENS", 5)
-    sync_checkpoints = env_flag("MLX_VULKAN_PROFILE_SYNC_CHECKPOINTS", False)
-    capture_sync_trace = env_flag("MLX_VULKAN_PROFILE_CAPTURE_SYNC_TRACE", True)
-    echo_sync_trace = env_flag("MLX_VULKAN_PROFILE_ECHO_SYNC_TRACE", False)
+    max_tokens = args.max_tokens if args.max_tokens is not None else env_int("MLX_VULKAN_PROFILE_MAX_TOKENS", 5)
+    sync_checkpoints = args.sync_checkpoints or env_flag("MLX_VULKAN_PROFILE_SYNC_CHECKPOINTS", False)
+    if args.no_capture_sync_trace:
+        capture_sync_trace = False
+    else:
+        capture_sync_trace = env_flag("MLX_VULKAN_PROFILE_CAPTURE_SYNC_TRACE", True)
+    echo_sync_trace = args.echo_sync_trace or env_flag("MLX_VULKAN_PROFILE_ECHO_SYNC_TRACE", False)
 
     if capture_sync_trace and "MLX_VULKAN_TRACE_SYNC" not in os.environ:
         os.environ["MLX_VULKAN_TRACE_SYNC"] = "1"
@@ -763,7 +819,7 @@ def main():
         sync_analyzer.consume_line(line)
 
     print("=" * 100)
-    print("QWEN3-0.6B-BF16 VULKAN PROFILER")
+    print(f"VULKAN PROFILER - {model_name}")
     print("=" * 100)
     print()
 

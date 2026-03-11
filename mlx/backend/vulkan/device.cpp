@@ -53,12 +53,25 @@ uint32_t max_deferred_ops() {
         const int parsed = std::stoi(env);
         return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
       } catch (...) {
-        return 4u;
+        return 16u;
       }
     }
-    return 4u;
+    return 16u;
   }();
   return value;
+}
+
+bool barrier_between_deferred_ops() {
+  static const bool enabled = []() {
+    if (const char* env =
+            std::getenv("MLX_VULKAN_BARRIER_BETWEEN_DEFERRED_OPS");
+        env != nullptr) {
+      return std::string(env) != "0";
+    }
+
+    return true;
+  }();
+  return enabled;
 }
 
 bool submit_on_hazard_boundary() {
@@ -68,9 +81,7 @@ bool submit_on_hazard_boundary() {
       return std::string(env) != "0";
     }
 
-    // Barrier-first by default. Keep submit-on-hazard available as an explicit
-    // escape hatch while we validate and tighten the Vulkan dependency model.
-    return false;
+    return true;
   }();
   return enabled;
 }
@@ -689,10 +700,10 @@ class VulkanDevice {
       return;
     }
 
-    // Keep a conservative memory dependency between deferred primitive
-    // dispatches in the same command buffer. Hazard tracking can still force
-    // stronger boundaries (submit) when requested.
-    insert_memory_barrier(stream->recording_resources->command_buffer);
+    if (barrier_between_deferred_ops()) {
+      trace_sync("barrier action=recording-tail reason=deferred-op-boundary");
+      insert_memory_barrier(stream->recording_resources->command_buffer);
+    }
   }
 
  private:

@@ -69,6 +69,17 @@ bool mul_mm_enabled() {
   return enabled;
 }
 
+bool mul_mm_batch_sync_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_VULKAN_MUL_MM_BATCH_SYNC");
+    if (env == nullptr) {
+      return false;
+    }
+    return std::string(env) != "0";
+  }();
+  return enabled;
+}
+
 void disable_mul_mm_runtime(const std::string& reason) {
   static auto& runtime_disabled = []() -> std::atomic<bool>& {
     static std::atomic<bool> disabled{false};
@@ -396,7 +407,7 @@ bool try_eval_mul_mm_vulkan(
   }
   const uint32_t num_batches = static_cast<uint32_t>(num_batches_u64);
 
-  if (num_batches > 1) {
+  if (num_batches > 1 && mul_mm_batch_sync_enabled()) {
     ::mlx::core::gpu::synchronize(s);
   }
 

@@ -889,13 +889,13 @@ void KernelManager::init_descriptor_pool() {
 
   VkDescriptorPoolSize poolSize{};
   poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  poolSize.descriptorCount = 1024; // Arbitrary initial size
+  poolSize.descriptorCount = 65536;
 
   VkDescriptorPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   poolInfo.poolSizeCount = 1;
   poolInfo.pPoolSizes = &poolSize;
-  poolInfo.maxSets = 512;
+  poolInfo.maxSets = 16384;
   poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
 
   if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptor_pool_) !=
@@ -908,6 +908,27 @@ void KernelManager::init_descriptor_pool() {
 
 VkDescriptorSet KernelManager::allocate_descriptor_set(
     VkDescriptorSetLayout layout) {
+  {
+    std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
+    auto reusable_it = reusable_descriptor_sets_.find(layout);
+    if (reusable_it != reusable_descriptor_sets_.end() &&
+        !reusable_it->second.empty()) {
+      VkDescriptorSet descriptor_set = reusable_it->second.back();
+      reusable_it->second.pop_back();
+      if (reusable_it->second.empty()) {
+        reusable_descriptor_sets_.erase(reusable_it);
+      }
+      if (trace_descriptor_epochs_enabled()) {
+        std::ostringstream oss;
+        oss << "reuse layout=0x" << std::hex
+            << reinterpret_cast<uintptr_t>(layout) << " set=0x"
+            << reinterpret_cast<uintptr_t>(descriptor_set) << std::dec;
+        trace_descriptor_epochs(oss.str());
+      }
+      return descriptor_set;
+    }
+  }
+
   if (!descriptor_pool_initialized_) {
     init_descriptor_pool();
   }
@@ -926,11 +947,28 @@ VkDescriptorSet KernelManager::allocate_descriptor_set(
     throw std::runtime_error("Failed to allocate descriptor set");
   }
 
+  {
+    std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
+    descriptor_set_layouts_[descriptor_set] = layout;
+  }
+
+  if (trace_descriptor_epochs_enabled()) {
+    std::ostringstream oss;
+    oss << "allocate layout=0x" << std::hex
+        << reinterpret_cast<uintptr_t>(layout) << " set=0x"
+        << reinterpret_cast<uintptr_t>(descriptor_set) << std::dec;
+    trace_descriptor_epochs(oss.str());
+  }
+
   return descriptor_set;
 }
 
 void KernelManager::free_descriptor_set(VkDescriptorSet set) {
   if (descriptor_pool_ != VK_NULL_HANDLE) {
+    {
+      std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
+      descriptor_set_layouts_.erase(set);
+    }
     VkDevice device = VulkanContext::get().device();
     vkFreeDescriptorSets(device, descriptor_pool_, 1, &set);
   }
@@ -949,8 +987,17 @@ void KernelManager::defer_descriptor_set_free(
   if (set == VK_NULL_HANDLE) {
     return;
   }
+  VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+  {
+    std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
+    auto it = descriptor_set_layouts_.find(set);
+    if (it != descriptor_set_layouts_.end()) {
+      layout = it->second;
+    }
+  }
   std::lock_guard<std::mutex> lock(deferred_descriptor_sets_mutex_);
-  deferred_descriptor_sets_[stream_index][submission_epoch].push_back(set);
+  deferred_descriptor_sets_[stream_index][submission_epoch].push_back(
+      DescriptorSetRecord{set, layout});
   if (trace_descriptor_epochs_enabled()) {
     std::ostringstream oss;
     oss << "enqueue stream=" << stream_index << " epoch=" << submission_epoch
@@ -967,7 +1014,7 @@ void KernelManager::reclaim_descriptor_sets(int stream_index) {
 void KernelManager::reclaim_descriptor_set_epoch(
     int stream_index,
     uint64_t submission_epoch) {
-  std::vector<VkDescriptorSet> sets;
+  std::vector<DescriptorSetRecord> sets;
   {
     std::lock_guard<std::mutex> lock(deferred_descriptor_sets_mutex_);
     auto it = deferred_descriptor_sets_.find(stream_index);
@@ -996,18 +1043,47 @@ void KernelManager::reclaim_descriptor_set_epoch(
     return;
   }
 
-  VkDevice device = VulkanContext::get().device();
-  vkFreeDescriptorSets(
-      device,
-      descriptor_pool_,
-      static_cast<uint32_t>(sets.size()),
-      sets.data());
+  size_t reusable_count = 0;
+  size_t freed_count = 0;
+  std::vector<VkDescriptorSet> freeable_sets;
+  {
+    std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
+    for (const auto& record : sets) {
+      if (record.set == VK_NULL_HANDLE) {
+        continue;
+      }
+      if (record.layout != VK_NULL_HANDLE) {
+        reusable_descriptor_sets_[record.layout].push_back(record.set);
+        ++reusable_count;
+      } else {
+        descriptor_set_layouts_.erase(record.set);
+        freeable_sets.push_back(record.set);
+        ++freed_count;
+      }
+    }
+  }
+  if (!freeable_sets.empty()) {
+    VkDevice device = VulkanContext::get().device();
+    vkFreeDescriptorSets(
+        device,
+        descriptor_pool_,
+        static_cast<uint32_t>(freeable_sets.size()),
+        freeable_sets.data());
+  }
+
+  if (trace_descriptor_epochs_enabled()) {
+    std::ostringstream oss;
+    oss << "reclaim_epoch stream=" << stream_index
+        << " epoch=" << submission_epoch << " reusable_sets=" << reusable_count
+        << " freed_sets=" << freed_count;
+    trace_descriptor_epochs(oss.str());
+  }
 }
 
 void KernelManager::reclaim_descriptor_sets(
     int stream_index,
     uint64_t completed_epoch) {
-  std::vector<VkDescriptorSet> sets;
+  std::vector<DescriptorSetRecord> sets;
   size_t remaining_epochs = 0;
   {
     std::lock_guard<std::mutex> lock(deferred_descriptor_sets_mutex_);
@@ -1041,18 +1117,39 @@ void KernelManager::reclaim_descriptor_sets(
     return;
   }
 
-  VkDevice device = VulkanContext::get().device();
-  vkFreeDescriptorSets(
-      device,
-      descriptor_pool_,
-      static_cast<uint32_t>(sets.size()),
-      sets.data());
+  size_t reusable_count = 0;
+  size_t freed_count = 0;
+  std::vector<VkDescriptorSet> freeable_sets;
+  {
+    std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
+    for (const auto& record : sets) {
+      if (record.set == VK_NULL_HANDLE) {
+        continue;
+      }
+      if (record.layout != VK_NULL_HANDLE) {
+        reusable_descriptor_sets_[record.layout].push_back(record.set);
+        ++reusable_count;
+      } else {
+        descriptor_set_layouts_.erase(record.set);
+        freeable_sets.push_back(record.set);
+        ++freed_count;
+      }
+    }
+  }
+  if (!freeable_sets.empty()) {
+    VkDevice device = VulkanContext::get().device();
+    vkFreeDescriptorSets(
+        device,
+        descriptor_pool_,
+        static_cast<uint32_t>(freeable_sets.size()),
+        freeable_sets.data());
+  }
 
   if (trace_descriptor_epochs_enabled()) {
     std::ostringstream oss;
     oss << "reclaim stream=" << stream_index
         << " completed_epoch=" << completed_epoch
-        << " freed_sets=" << sets.size()
+        << " reusable_sets=" << reusable_count << " freed_sets=" << freed_count
         << " remaining_epochs=" << remaining_epochs;
     trace_descriptor_epochs(oss.str());
   }
@@ -1064,13 +1161,23 @@ void KernelManager::reclaim_all_descriptor_sets() {
     std::lock_guard<std::mutex> lock(deferred_descriptor_sets_mutex_);
     for (auto& [_, epoch_map] : deferred_descriptor_sets_) {
       for (auto& [_, sets] : epoch_map) {
-        all_sets.insert(
-            all_sets.end(),
-            std::make_move_iterator(sets.begin()),
-            std::make_move_iterator(sets.end()));
+        for (auto& record : sets) {
+          if (record.set != VK_NULL_HANDLE) {
+            all_sets.push_back(record.set);
+          }
+        }
       }
     }
     deferred_descriptor_sets_.clear();
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
+    for (auto& [_, sets] : reusable_descriptor_sets_) {
+      all_sets.insert(all_sets.end(), sets.begin(), sets.end());
+    }
+    reusable_descriptor_sets_.clear();
+    descriptor_set_layouts_.clear();
   }
 
   if (all_sets.empty() || descriptor_pool_ == VK_NULL_HANDLE) {

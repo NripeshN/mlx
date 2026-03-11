@@ -15,6 +15,13 @@
 
 namespace mlx::core::vulkan {
 
+struct VulkanHandleHash {
+  template <typename T>
+  size_t operator()(T handle) const {
+    return std::hash<uintptr_t>{}(reinterpret_cast<uintptr_t>(handle));
+  }
+};
+
 // Shader SPIR-V data container
 struct ShaderModule {
   std::vector<uint32_t> spirv_code;
@@ -82,14 +89,27 @@ class KernelManager {
   std::unordered_map<std::string, std::unique_ptr<ShaderModule>> shaders_;
   std::unordered_map<std::string, std::unique_ptr<ComputePipeline>> pipelines_;
 
+  struct DescriptorSetRecord {
+    VkDescriptorSet set{VK_NULL_HANDLE};
+    VkDescriptorSetLayout layout{VK_NULL_HANDLE};
+  };
+
   // Descriptor pool for allocating descriptor sets
   VkDescriptorPool descriptor_pool_{VK_NULL_HANDLE};
   bool descriptor_pool_initialized_{false};
   std::unordered_map<
       int,
-      std::unordered_map<uint64_t, std::vector<VkDescriptorSet>>>
+      std::unordered_map<uint64_t, std::vector<DescriptorSetRecord>>>
       deferred_descriptor_sets_;
   std::mutex deferred_descriptor_sets_mutex_;
+  std::unordered_map<
+      VkDescriptorSetLayout,
+      std::vector<VkDescriptorSet>,
+      VulkanHandleHash>
+      reusable_descriptor_sets_;
+  std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout, VulkanHandleHash>
+      descriptor_set_layouts_;
+  std::mutex descriptor_sets_mutex_;
 
   void init_descriptor_pool();
 };
