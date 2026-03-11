@@ -4,23 +4,43 @@
 #include <shaderc/shaderc.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <optional>
 #include <sstream>
 #include <unordered_set>
 
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/common/utils.h"
+#include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/dtype_utils.h"
+#include "mlx/ops.h"
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
 
 namespace mlx::core {
 
 namespace {
+
+bool trace_compiled_glsl_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_VULKAN_TRACE_COMPILED_GLSL");
+    return env != nullptr && std::string(env) != "0";
+  }();
+  return enabled;
+}
+
+bool trace_compiled_runtime_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_VULKAN_TRACE_COMPILED_RUNTIME");
+    return env != nullptr && std::string(env) != "0";
+  }();
+  return enabled;
+}
 
 std::string join_primitive_names(const std::vector<array>& arrays) {
   std::ostringstream os;
@@ -312,7 +332,14 @@ inline void build_glsl_kernel(
     const std::unordered_set<uintptr_t>& constant_ids,
     bool contiguous,
     int ndim,
-    int work_per_thread) {
+    int work_per_thread,
+    const Shape* strided_shape = nullptr,
+    const std::vector<Strides>* strided_strides = nullptr) {
+  if (!contiguous && (strided_shape == nullptr || strided_strides == nullptr)) {
+    throw std::runtime_error(
+        "Missing runtime shape/strides for Vulkan compiled strided kernel");
+  }
+
   // Maps to store array identifiers - use simple valid GLSL names
   std::unordered_map<std::uintptr_t, std::string> var_names;
   int var_counter = 0;
@@ -390,14 +417,6 @@ inline void build_glsl_kernel(
   }
 
   // Strides buffer for non-contiguous access
-  int strides_binding = -1;
-  if (!contiguous && !input_bindings.empty()) {
-    strides_binding = binding++;
-    os += fmt::format(
-        "layout(binding = {}) readonly buffer StridesBuf {{ int in_strides[]; }};\n",
-        strides_binding);
-  }
-
   // Output buffers
   for (size_t i = 0; i < outputs.size(); ++i) {
     auto& x = outputs[i];
@@ -414,27 +433,9 @@ inline void build_glsl_kernel(
   os += R"(
 layout(push_constant) uniform PushConstants {
   uint size;
+} pc;
+ 
 )";
-  if (!contiguous) {
-    os += "  int shape[8];\n";
-    os += "  int ndim;\n";
-  }
-  os += "} pc;\n\n";
-
-  // Helper function for index calculation (strided)
-  if (!contiguous) {
-    os += R"(
-uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
-  uint loc = 0;
-  for (int i = ndim - 1; i >= 0; --i) {
-    loc += (idx % uint(pc.shape[i])) * uint(in_strides[start_stride_idx + i]);
-    idx /= uint(pc.shape[i]);
-  }
-  return loc;
-}
-
-)";
-  }
 
   // Main kernel function
   os += "void main() {\n";
@@ -486,19 +487,30 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
       }
     } else {
       // Strided: compute location from strides
-      // Find the binding index for this input
-      int binding_idx = 0;
-      for (size_t j = 0; j < input_bindings.size(); ++j) {
-        if (input_bindings[j].first == static_cast<int>(i)) {
-          binding_idx = static_cast<int>(j);
-          break;
+      int stride_idx = 1;
+      for (size_t j = 0; j < i; ++j) {
+        if (!is_constant(j) && !is_scalar(inputs[j])) {
+          stride_idx++;
         }
       }
-      os += fmt::format(
-          "    uint loc_{} = elem_to_loc(idx, {}, {});\n",
-          xname,
-          binding_idx * ndim,
-          ndim);
+      const auto& runtime_shape = *strided_shape;
+      const auto& runtime_input_strides = (*strided_strides)[stride_idx];
+      os += fmt::format("    uint loc_{} = 0u;\n", xname);
+      os += fmt::format("    uint rem_{} = idx;\n", xname);
+      for (int axis = ndim - 1; axis >= 0; --axis) {
+        os += fmt::format(
+            "    uint coord_{0}_{1} = rem_{0} % uint({2});\n",
+            xname,
+            axis,
+            runtime_shape[axis]);
+        os += fmt::format(
+            "    rem_{0} /= uint({1});\n", xname, runtime_shape[axis]);
+        os += fmt::format(
+            "    loc_{0} += coord_{0}_{1} * uint({2});\n",
+            xname,
+            axis,
+            runtime_input_strides[axis]);
+      }
       if (x.dtype() == bool_) {
         os += fmt::format(
             "    {} t_{} = ({}[loc_{}] != uint8_t(0));\n",
@@ -681,23 +693,14 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
         os += fmt::format("    {}[idx] = t_{};\n", xname, xname);
       }
     } else {
-      // For strided outputs, compute output location
-      os += fmt::format(
-          "    uint out_loc_{} = elem_to_loc(idx, 0, {});\n", xname, ndim);
       if (x.dtype() == bool_) {
-        os += fmt::format(
-            "    {}[out_loc_{}] = uint8_t(t_{} ? 1 : 0);\n",
-            xname,
-            xname,
-            xname);
+        os +=
+            fmt::format("    {}[idx] = uint8_t(t_{} ? 1 : 0);\n", xname, xname);
       } else if (x.dtype() == bfloat16) {
         os += fmt::format(
-            "    {}[out_loc_{}] = uint16_t(fp32_to_bf16(t_{}));\n",
-            xname,
-            xname,
-            xname);
+            "    {}[idx] = uint16_t(fp32_to_bf16(t_{}));\n", xname, xname);
       } else {
-        os += fmt::format("    {}[out_loc_{}] = t_{};\n", xname, xname, xname);
+        os += fmt::format("    {}[idx] = t_{};\n", xname, xname);
       }
     }
   }
@@ -785,19 +788,20 @@ void Compiled::eval_gpu(
   // Collapse contiguous dims to route to a faster kernel if possible
   auto [contiguous, shape, strides] =
       compiled_collapse_contiguous_dims(inputs, outputs[0], is_constant_);
+  auto dispatch_inputs = inputs;
+
+  if (!contiguous) {
+    work_per_thread = 1;
+  }
 
   const auto requires_cpu_fallback = [&]() {
-    if (!contiguous) {
-      return true;
-    }
-
     auto has_nonzero_offset = [](const std::vector<array>& arrays) {
       return std::any_of(arrays.begin(), arrays.end(), [](const array& x) {
         return x.offset() != 0;
       });
     };
 
-    if (has_nonzero_offset(inputs) || has_nonzero_offset(outputs) ||
+    if (has_nonzero_offset(dispatch_inputs) || has_nonzero_offset(outputs) ||
         has_nonzero_offset(tape_)) {
       return true;
     }
@@ -842,7 +846,7 @@ void Compiled::eval_gpu(
   }
 
   // Use large index if needed
-  bool large = compiled_use_large_index(inputs, outputs, contiguous);
+  bool large = compiled_use_large_index(dispatch_inputs, outputs, contiguous);
 
   // Build kernel name based on configuration
   std::string kernel_name = kernel_lib_;
@@ -850,6 +854,28 @@ void Compiled::eval_gpu(
     kernel_name += "_contiguous";
   } else {
     kernel_name += fmt::format("_strided_{}", shape.size());
+    std::ostringstream layout_key;
+    layout_key << "shape=";
+    for (auto dim : shape) {
+      layout_key << dim << ",";
+    }
+    for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
+      if (is_constant_(i) || is_scalar(dispatch_inputs[i])) {
+        continue;
+      }
+      int stride_idx = 1;
+      for (size_t j = 0; j < i; ++j) {
+        if (!is_constant_(j) && !is_scalar(dispatch_inputs[j])) {
+          stride_idx++;
+        }
+      }
+      layout_key << "s" << i << "=";
+      for (auto stride : strides[stride_idx]) {
+        layout_key << stride << ",";
+      }
+    }
+    kernel_name +=
+        fmt::format("_layout_{}", std::hash<std::string>{}(layout_key.str()));
   }
   if (large) {
     kernel_name += "_large";
@@ -873,7 +899,14 @@ void Compiled::eval_gpu(
         constant_ids_,
         contiguous,
         static_cast<int>(shape.size()),
-        work_per_thread);
+        work_per_thread,
+        contiguous ? nullptr : &shape,
+        contiguous ? nullptr : &strides);
+
+    if (trace_compiled_glsl_enabled()) {
+      std::cerr << "=== Vulkan compiled GLSL: " << kernel_name << " ===\n"
+                << glsl_source << "\n=== End GLSL ===\n";
+    }
 
     // Compile to SPIR-V
     try {
@@ -892,8 +925,12 @@ void Compiled::eval_gpu(
   }
 
   // Allocate outputs with buffer donation
+  std::vector<array> allocation_inputs;
+  if (contiguous) {
+    allocation_inputs = dispatch_inputs;
+  }
   compiled_allocate_outputs(
-      inputs, outputs, is_constant_, contiguous, [&](size_t n) {
+      allocation_inputs, outputs, is_constant_, contiguous, [&](size_t n) {
         return vulkan::allocator().malloc(n);
       });
 
@@ -902,20 +939,10 @@ void Compiled::eval_gpu(
   uint32_t binding_idx = 0;
 
   // Input bindings
-  for (size_t i = 0; i < inputs.size(); ++i) {
+  for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
     if (is_constant_(i)) {
       continue;
     }
-    bindings.push_back(
-        {binding_idx++,
-         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-         1,
-         VK_SHADER_STAGE_COMPUTE_BIT,
-         nullptr});
-  }
-
-  // Strides binding (for non-contiguous)
-  if (!contiguous && binding_idx > 0) {
     bindings.push_back(
         {binding_idx++,
          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -935,8 +962,7 @@ void Compiled::eval_gpu(
   }
 
   // Get or create pipeline
-  uint32_t push_constant_size =
-      contiguous ? sizeof(uint32_t) : sizeof(uint32_t) + sizeof(int) * 9;
+  uint32_t push_constant_size = sizeof(uint32_t);
 
   auto* pipeline =
       manager.get_pipeline(kernel_name, bindings, push_constant_size);
@@ -972,13 +998,13 @@ void Compiled::eval_gpu(
 
   // Input buffers
   uint32_t write_idx = 0;
-  std::vector<int64_t> all_strides;
+  std::vector<int32_t> all_strides;
 
-  for (size_t i = 0; i < inputs.size(); ++i) {
+  for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
     if (is_constant_(i)) {
       continue;
     }
-    add_buffer(inputs[i]);
+    add_buffer(dispatch_inputs[i]);
     writes.push_back({});
     writes[write_idx].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[write_idx].dstSet = descriptor_set;
@@ -988,30 +1014,23 @@ void Compiled::eval_gpu(
     writes[write_idx].descriptorCount = 1;
     writes[write_idx].pBufferInfo = &buffer_infos[write_idx];
     ++write_idx;
-
-    // Collect strides for non-contiguous access
-    if (!contiguous && !is_scalar(inputs[i])) {
-      // strides[0] is output strides, find the right stride index for this
-      // input
-      int stride_idx = 1; // Start after output strides
-      for (size_t j = 0; j < i; ++j) {
-        if (!is_constant_(j) && !is_scalar(inputs[j])) {
-          stride_idx++;
-        }
-      }
-      if (stride_idx < static_cast<int>(strides.size())) {
-        all_strides.insert(
-            all_strides.end(),
-            strides[stride_idx].begin(),
-            strides[stride_idx].end());
-      }
-    }
   }
 
-  // Strides buffer (for non-contiguous) - skip for now, use push constants
-  if (!contiguous && !all_strides.empty()) {
-    // TODO: Upload strides to a buffer
-    // For now we'll skip this complex case
+  if (trace_compiled_runtime_enabled()) {
+    std::cerr << "[vulkan-compiled] kernel=" << kernel_name
+              << " contiguous=" << contiguous << " shape=" << shape
+              << " all_strides=" << all_strides
+              << " out_data_size=" << outputs[0].data_size()
+              << " out_size=" << outputs[0].size() << "\n";
+    for (size_t i = 0; i < dispatch_inputs.size(); ++i) {
+      if (dispatch_inputs[i].dtype() == float32 &&
+          dispatch_inputs[i].size() > 0) {
+        auto* ptr =
+            static_cast<const float*>(dispatch_inputs[i].buffer().raw_ptr());
+        std::cerr << "  input[" << i << "] first=" << ptr[0]
+                  << " size=" << dispatch_inputs[i].size() << "\n";
+      }
+    }
   }
 
   // Output buffers
@@ -1054,25 +1073,17 @@ void Compiled::eval_gpu(
   // Set push constants
   struct PushConstants {
     uint32_t size;
-    int shape[8];
-    int ndim;
   } pc;
 
   // TODO: Handle arrays larger than 2^32 elements
   pc.size = static_cast<uint32_t>(outputs[0].data_size());
-  if (!contiguous) {
-    pc.ndim = static_cast<int>(shape.size());
-    for (size_t i = 0; i < shape.size() && i < 8; ++i) {
-      pc.shape[i] = static_cast<int>(shape[i]);
-    }
-  }
 
   vkCmdPushConstants(
       cmd_buffer,
       pipeline->layout,
       VK_SHADER_STAGE_COMPUTE_BIT,
       0,
-      contiguous ? sizeof(uint32_t) : sizeof(pc),
+      sizeof(pc),
       &pc);
 
   // Dispatch
