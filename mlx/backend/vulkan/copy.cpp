@@ -303,8 +303,9 @@ void copy_gpu_inplace(
 
   const auto shader_name = get_copy_shader_name(in_view, out_view);
 
-  const bool shader_copy_type =
-      ctype == CopyType::General || ctype == CopyType::GeneralGeneral;
+  const bool shader_copy_type = ctype == CopyType::General ||
+      ctype == CopyType::GeneralGeneral ||
+      (ctype == CopyType::Vector && !same_dtype);
 
   const bool shader_copy = shader_copy_type &&
       is_supported_copy_layout(in_view) && is_supported_copy_layout(out_view) &&
@@ -370,7 +371,7 @@ void copy_gpu_inplace(
       const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
   auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
 
-  if (ctype == CopyType::Vector) {
+  if (raw_buffer_copy) {
     // Simple contiguous memory copy using Vulkan command buffer
     VkBufferCopy copy_region{};
     copy_region.srcOffset =
