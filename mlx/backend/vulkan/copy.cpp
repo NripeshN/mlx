@@ -24,6 +24,23 @@ using mlx::core::Dtype;
 using mlx::core::Shape;
 using mlx::core::Strides;
 
+bool has_row_contiguous_strides(const mlx::core::array& arr) {
+  if (arr.ndim() == 0) {
+    return true;
+  }
+  int64_t expected = 1;
+  for (int i = static_cast<int>(arr.ndim()) - 1; i >= 0; --i) {
+    if (arr.shape(i) == 1) {
+      continue;
+    }
+    if (arr.strides(i) != expected) {
+      return false;
+    }
+    expected *= arr.shape(i);
+  }
+  return true;
+}
+
 size_t num_elements(const Shape& shape) {
   return std::accumulate(
       shape.begin(), shape.end(), size_t{1}, std::multiplies<size_t>());
@@ -720,6 +737,39 @@ void concatenate_gpu(
 
   out.set_data(allocator::malloc(out.nbytes()));
 
+  if (axis == 0 && out.flags().row_contiguous) {
+    bool supported_axis0_concat = true;
+    for (const auto& in : inputs) {
+      if (in.dtype() != out.dtype()) {
+        supported_axis0_concat = false;
+        break;
+      }
+    }
+    if (supported_axis0_concat) {
+      auto* out_buf =
+          static_cast<mlx::core::vulkan::VulkanBuffer*>(out.buffer().ptr());
+      auto command_buffer = vulkan::begin_command_recording(s.index);
+      size_t dst_offset = 0;
+      for (auto in : inputs) {
+        if (!has_row_contiguous_strides(in)) {
+          in = contiguous_copy_gpu(in, s);
+        }
+        auto* in_buf = static_cast<mlx::core::vulkan::VulkanBuffer*>(
+            const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
+        VkBufferCopy copy_region{};
+        copy_region.srcOffset =
+            static_cast<VkDeviceSize>(in.offset() * size_of(in.dtype()));
+        copy_region.dstOffset = static_cast<VkDeviceSize>(dst_offset);
+        copy_region.size = static_cast<VkDeviceSize>(in.nbytes());
+        vkCmdCopyBuffer(
+            command_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
+        dst_offset += in.nbytes();
+      }
+      vulkan::end_command_recording(s.index);
+      return;
+    }
+  }
+
   auto strides = out.strides();
   auto flags = out.flags();
   flags.row_contiguous = false;
@@ -731,7 +781,14 @@ void concatenate_gpu(
     size_t data_offset = strides[axis] * sizes[i];
     out_slice.copy_shared_buffer(
         out, strides, flags, out_slice.size(), data_offset);
-    copy_gpu_inplace(inputs[i], out_slice, CopyType::GeneralGeneral, s);
+    const bool vector_copy = has_row_contiguous_strides(inputs[i]) &&
+        has_row_contiguous_strides(out_slice) &&
+        inputs[i].shape() == out_slice.shape();
+    copy_gpu_inplace(
+        inputs[i],
+        out_slice,
+        vector_copy ? CopyType::Vector : CopyType::GeneralGeneral,
+        s);
   }
 }
 
