@@ -105,11 +105,11 @@ bool try_eval_binary_op_vulkan(
   }
 
   const bool staged_output =
-      use_f32_staging_io || bool_add || !is_supported_elementwise_layout(out);
+      use_f32_staging_io || !is_supported_elementwise_layout(out);
   array out_work = staged_output
       ? array(
             out.shape(),
-            bool_add ? uint32 : (use_f32_staging_io ? float32 : out.dtype()),
+            use_f32_staging_io ? float32 : out.dtype(),
             nullptr,
             {})
       : out;
@@ -134,8 +134,9 @@ bool try_eval_binary_op_vulkan(
     return true;
   }
 
-  std::string shader_name =
-      shader_op_name + "_" + suffix_a + "_" + suffix_b + "_" + suffix_out;
+  std::string shader_name = bool_add
+      ? "maximum_u32_u32_u8"
+      : shader_op_name + "_" + suffix_a + "_" + suffix_b + "_" + suffix_out;
   if (out_work.dtype() == float16) {
     shader_name += "_rte";
   }

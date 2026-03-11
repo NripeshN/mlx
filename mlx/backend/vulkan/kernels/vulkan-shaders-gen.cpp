@@ -1692,6 +1692,8 @@ void process_shaders() {
                  {"B_TYPE", get_type_str(src1_f16)},
                  {"D_TYPE", get_type_str(dst_f16)},
                  {"FLOAT_TYPE", "float"},
+                 {"NAN_GUARD",
+                  (op == "minimum" || op == "maximum") ? "1" : "0"},
                  {"RTE16", rte ? "1" : "0"},
                  {"ADD_RMS", add_rms}});
           }
@@ -1723,10 +1725,22 @@ void process_shaders() {
            {"B_TYPE", t},
            {"D_TYPE", t},
            {"FLOAT_TYPE", t},
+           {"NAN_GUARD", "0"},
            {"RTE16", "0"},
            {"ADD_RMS", "0"}});
     }
   }
+
+  string_to_spv(
+      "maximum_u32_u32_u8",
+      "maximum.comp",
+      {{"A_TYPE", "uint"},
+       {"B_TYPE", "uint"},
+       {"D_TYPE", "uint8_t"},
+       {"FLOAT_TYPE", "uint"},
+       {"NAN_GUARD", "0"},
+       {"RTE16", "0"},
+       {"ADD_RMS", "0"}});
 
   for (std::string op : {"greater_equal"}) {
     for (auto src0_f16 : {false, true}) {

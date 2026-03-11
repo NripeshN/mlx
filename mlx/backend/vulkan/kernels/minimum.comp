@@ -17,7 +17,7 @@ void main() {
 
     const FLOAT_TYPE a = FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]);
     const FLOAT_TYPE b = FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]);
-#if defined(DATA_A_F16) || defined(DATA_A_F32) || defined(DATA_A_BF16)
+#if NAN_GUARD
     const FLOAT_TYPE result = (isnan(a) || isnan(b)) ? (a + b) : min(a, b);
 #else
     const FLOAT_TYPE result = min(a, b);
