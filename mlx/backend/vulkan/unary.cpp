@@ -87,7 +87,9 @@ void eval_unary_vulkan(
     float param2 = 0.0f) {
   if (!try_eval_unary_op_vulkan<Primitive>(
           inputs, out, shader_name, s, param1, param2)) {
-    eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
+    throw std::runtime_error(
+        std::string("Unary operation ") + shader_name +
+        " failed on Vulkan (unsupported dtype or layout).");
   }
 }
 
@@ -185,7 +187,9 @@ void eval_generic_unary_vulkan(
     float param4 = 0.0f) {
   if (!try_eval_generic_unary_op_vulkan<Primitive>(
           inputs, out, shader_name, s, param1, param2, param3, param4)) {
-    eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
+    throw std::runtime_error(
+        std::string("Unary operation ") + shader_name +
+        " failed on Vulkan (unsupported dtype or layout).");
   }
 }
 
@@ -246,7 +250,8 @@ void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
   }
-  eval_cpu_fallback_on_stream<Cos>(inputs, out, stream());
+  throw std::runtime_error(
+      "Cos operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void Erf::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -256,7 +261,8 @@ void Erf::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
   }
-  eval_cpu_fallback_on_stream<Erf>(inputs, out, stream());
+  throw std::runtime_error(
+      "Erf operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void ErfInv::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -266,7 +272,8 @@ void ErfInv::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
   }
-  eval_cpu_fallback_on_stream<ErfInv>(inputs, out, stream());
+  throw std::runtime_error(
+      "ErfInv operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -282,7 +289,8 @@ void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
       }
     }
   }
-  eval_cpu_fallback_with_state_on_stream<Log>(inputs, out, stream(), state());
+  throw std::runtime_error(
+      "Log operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -292,27 +300,39 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
   }
-  eval_cpu_fallback_on_stream<Sin>(inputs, out, stream());
+  throw std::runtime_error(
+      "Sin operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void Square::eval_gpu(const std::vector<array>& inputs, array& out) {
-  if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
-      out.dtype() == float32) {
-    eval_unary_vulkan<Square>(inputs, out, "sqr_f32", stream());
-    return;
+  if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
+    if (out.dtype() == float32 || out.dtype() == bfloat16) {
+      eval_unary_vulkan<Square>(inputs, out, "sqr_f32", stream());
+      return;
+    }
+    if (out.dtype() == float16) {
+      eval_unary_vulkan<Square>(inputs, out, "sqr_f16", stream());
+      return;
+    }
   }
-  eval_cpu_fallback_on_stream<Square>(inputs, out, stream());
+  throw std::runtime_error(
+      "Square operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 void Sqrt::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 &&
-      (inputs[0].dtype() == float32 || inputs[0].dtype() == bfloat16) &&
+      (inputs[0].dtype() == float32 || inputs[0].dtype() == bfloat16 ||
+       inputs[0].dtype() == float16) &&
       out.dtype() == inputs[0].dtype()) {
-    eval_unary_vulkan<Sqrt>(
-        inputs, out, state() ? "rsqrt_f32" : "sqrt_f32", stream(), 0.0f, 0.0f);
+    const char* shader = state() ? "rsqrt_f32" : "sqrt_f32";
+    if (out.dtype() == float16) {
+      shader = state() ? "rsqrt_f16" : "sqrt_f16";
+    }
+    eval_unary_vulkan<Sqrt>(inputs, out, shader, stream(), 0.0f, 0.0f);
     return;
   }
-  eval_cpu_fallback_with_state_on_stream<Sqrt>(inputs, out, stream(), state());
+  throw std::runtime_error(
+      "Sqrt operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 } // namespace mlx::core

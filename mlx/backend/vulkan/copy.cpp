@@ -387,7 +387,9 @@ std::string get_copy_shader_name(
       (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::int32) ||
       (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::float32) ||
       (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int32) ||
+      (in.dtype() == mlx::core::int64 && out.dtype() == mlx::core::int64) ||
       (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::uint32) ||
+      (in.dtype() == mlx::core::uint64 && out.dtype() == mlx::core::uint64) ||
       (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::float32) ||
       (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int64) ||
       (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::complex64);

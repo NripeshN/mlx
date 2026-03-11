@@ -9,6 +9,18 @@ namespace mlx::core {
 
 namespace {
 
+bool is_vulkan_integer_dtype(Dtype dtype) {
+  switch (dtype) {
+    case int32:
+    case int64:
+    case uint32:
+    case uint64:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool is_vulkan_compare_dtype(Dtype dtype) {
   switch (dtype) {
     case float16:
@@ -45,9 +57,25 @@ bool try_eval_binary_op_vulkan(
 
   array a = inputs[0];
   array b = inputs[1];
-  if (!is_vulkan_float_dtype(a.dtype()) || !is_vulkan_float_dtype(b.dtype()) ||
-      !is_vulkan_float_dtype(out.dtype())) {
+  std::string shader_op_name = op_name;
+  const bool bool_add = std::is_same_v<Primitive, Add> && a.dtype() == bool_ &&
+      b.dtype() == bool_ && out.dtype() == bool_;
+  const bool float_case = is_vulkan_float_dtype(a.dtype()) &&
+      is_vulkan_float_dtype(b.dtype()) && is_vulkan_float_dtype(out.dtype());
+  const bool integer_case = a.dtype() == b.dtype() &&
+      a.dtype() == out.dtype() && is_vulkan_integer_dtype(a.dtype());
+  if (!float_case && !integer_case && !bool_add) {
     return false;
+  }
+
+  if (bool_add) {
+    array a_u32(a.shape(), uint32, nullptr, {});
+    array b_u32(b.shape(), uint32, nullptr, {});
+    copy_gpu(a, a_u32, CopyType::General, s);
+    copy_gpu(b, b_u32, CopyType::General, s);
+    a = a_u32;
+    b = b_u32;
+    shader_op_name = "maximum";
   }
 
   const bool low_precision_div = std::string_view(op_name) == "div" &&
@@ -77,11 +105,11 @@ bool try_eval_binary_op_vulkan(
   }
 
   const bool staged_output =
-      use_f32_staging_io || !is_supported_elementwise_layout(out);
+      use_f32_staging_io || bool_add || !is_supported_elementwise_layout(out);
   array out_work = staged_output
       ? array(
             out.shape(),
-            use_f32_staging_io ? float32 : out.dtype(),
+            bool_add ? uint32 : (use_f32_staging_io ? float32 : out.dtype()),
             nullptr,
             {})
       : out;
@@ -107,7 +135,7 @@ bool try_eval_binary_op_vulkan(
   }
 
   std::string shader_name =
-      std::string(op_name) + "_" + suffix_a + "_" + suffix_b + "_" + suffix_out;
+      shader_op_name + "_" + suffix_a + "_" + suffix_b + "_" + suffix_out;
   if (out_work.dtype() == float16) {
     shader_name += "_rte";
   }
@@ -116,7 +144,7 @@ bool try_eval_binary_op_vulkan(
     auto command_buffer = vulkan::begin_command_recording(s.index);
     auto dispatch_variant = binary_dispatch_variant<Primitive>();
     if constexpr (std::is_same_v<Primitive, Add>) {
-      if (use_f32_staging_io) {
+      if (use_f32_staging_io || bool_add || integer_case) {
         dispatch_variant = vulkan::BinaryDispatchVariant::Standard;
       }
     }
@@ -144,7 +172,9 @@ void eval_binary_vulkan(
     const char* op_name,
     Stream s) {
   if (!try_eval_binary_op_vulkan<Primitive>(inputs, out, op_name, s)) {
-    eval_cpu_fallback_on_stream<Primitive>(inputs, out, s);
+    throw std::runtime_error(
+        std::string("Binary operation ") + op_name +
+        " failed on Vulkan (unsupported dtype or layout).");
   }
 }
 

@@ -1700,6 +1700,34 @@ void process_shaders() {
     }
   }
 
+  for (std::string op : {"add", "sub", "mul", "minimum", "maximum"}) {
+    for (const auto& t :
+         {std::string("int"),
+          std::string("int64_t"),
+          std::string("uint"),
+          std::string("uint64_t")}) {
+      std::string suffix;
+      if (t == "int") {
+        suffix = "i32";
+      } else if (t == "int64_t") {
+        suffix = "i64";
+      } else if (t == "uint") {
+        suffix = "u32";
+      } else {
+        suffix = "u64";
+      }
+      string_to_spv(
+          (op + "_" + suffix + "_" + suffix + "_" + suffix).c_str(),
+          op + ".comp",
+          {{"A_TYPE", t},
+           {"B_TYPE", t},
+           {"D_TYPE", t},
+           {"FLOAT_TYPE", t},
+           {"RTE16", "0"},
+           {"ADD_RMS", "0"}});
+    }
+  }
+
   for (std::string op : {"greater_equal"}) {
     for (auto src0_f16 : {false, true}) {
       for (auto src1_f16 : {false, true}) {
@@ -1807,16 +1835,34 @@ void process_shaders() {
       "sqr_f32",
       "square.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "sqr_f16",
+      "square.comp",
+      {{"A_TYPE", "float16_t"},
+       {"D_TYPE", "float16_t"},
+       {"FLOAT_TYPE", "float"}});
 
   string_to_spv(
       "sqrt_f32",
       "sqrt.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "sqrt_f16",
+      "sqrt.comp",
+      {{"A_TYPE", "float16_t"},
+       {"D_TYPE", "float16_t"},
+       {"FLOAT_TYPE", "float"}});
 
   string_to_spv(
       "rsqrt_f32",
       "rsqrt.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "rsqrt_f16",
+      "rsqrt.comp",
+      {{"A_TYPE", "float16_t"},
+       {"D_TYPE", "float16_t"},
+       {"FLOAT_TYPE", "float"}});
 
   string_to_spv(
       "erf_f32",
