@@ -914,6 +914,8 @@ void ScaledDotProductAttention::eval_gpu(
     result = astype(result, outputs[0].dtype(), s);
   }
 
+  eval(result);
+
   copy_gpu(result, outputs[0], CopyType::General, s);
 
   if (output_logsumexp_) {
