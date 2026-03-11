@@ -28,9 +28,7 @@ void AsStrided::eval_gpu(const std::vector<array>& inputs, array& out) {
 void AsType::eval_gpu(const std::vector<array>& inputs, array& out) {
   MLX_PROFILER_RANGE("AsType::eval_gpu");
   CopyType ctype =
-      inputs[0].flags().contiguous && inputs[0].dtype() == out.dtype()
-      ? CopyType::Vector
-      : CopyType::General;
+      inputs[0].flags().contiguous ? CopyType::Vector : CopyType::General;
   copy_gpu(inputs[0], out, ctype);
 }
 

@@ -85,6 +85,8 @@ std::string copy_dtype_suffix(Dtype dtype) {
       return "bf16";
     case mlx::core::int32:
       return "i32";
+    case mlx::core::uint32:
+      return "u32";
     default:
       return {};
   }
@@ -203,7 +205,8 @@ std::string get_copy_shader_name(
        out.dtype() == mlx::core::bfloat16) ||
       (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::int32) ||
       (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::float32) ||
-      (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int32);
+      (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int32) ||
+      (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::uint32);
 
   if (!supported_pair) {
     return {};
@@ -345,8 +348,19 @@ void copy_gpu_inplace(
 
   if (!raw_buffer_copy && !shader_copy && !is_slice_copy &&
       !contiguous_large_rank_copy) {
-    throw std::runtime_error(
-        "Copy operation failed on Vulkan (unsupported dtype or layout).");
+    std::ostringstream oss;
+    oss << "Copy operation failed on Vulkan (unsupported dtype or layout): "
+        << "ctype=" << copy_type_name(ctype) << " "
+        << "in_dtype=" << static_cast<int>(in.dtype().val()) << " "
+        << "out_dtype=" << static_cast<int>(out.dtype().val()) << " "
+        << "in_shape=" << seq_to_string(in_view.shape()) << " "
+        << "out_shape=" << seq_to_string(out_view.shape()) << " "
+        << "in_strides=" << seq_to_string(in_view.strides()) << " "
+        << "out_strides=" << seq_to_string(out_view.strides()) << " "
+        << "in_offset=" << in_view.offset() << " "
+        << "out_offset=" << out_view.offset() << " "
+        << "shader_name=" << (shader_name.empty() ? "<none>" : shader_name);
+    throw std::runtime_error(oss.str());
   }
 
   VkCommandBuffer cmd_buffer = vulkan::begin_command_recording(s.index);

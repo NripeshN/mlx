@@ -6,6 +6,13 @@ namespace mlx::core {
 
 namespace {
 
+array stage_zero_offset_row_contiguous(const array& in, Stream s) {
+  array staged(in.shape(), in.dtype(), nullptr, {});
+  staged.set_data(allocator::malloc(staged.nbytes()));
+  copy_gpu_inplace(in, staged, CopyType::Vector, s);
+  return staged;
+}
+
 bool try_eval_reduce_sum_rows_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -26,6 +33,9 @@ bool try_eval_reduce_sum_rows_vulkan(
 
   const bool use_f32_staging_io = f16_io || bf16_io;
   if (use_f32_staging_io) {
+    if (in.offset() > 0xFFFF && in.flags().row_contiguous) {
+      in = stage_zero_offset_row_contiguous(in, s);
+    }
     array in_f32(in.shape(), float32, nullptr, {});
     copy_gpu(in, in_f32, CopyType::General, s);
     in = in_f32;
@@ -132,6 +142,9 @@ bool try_eval_arg_reduce_vulkan(
   }
 
   if (f16_input || bf16_input) {
+    if (in.offset() > 0xFFFF && in.flags().row_contiguous) {
+      in = stage_zero_offset_row_contiguous(in, s);
+    }
     array in_f32(in.shape(), float32, nullptr, {});
     copy_gpu(in, in_f32, CopyType::General, s);
     in = in_f32;

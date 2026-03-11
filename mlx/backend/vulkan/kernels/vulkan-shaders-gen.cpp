@@ -1516,6 +1516,10 @@ void process_shaders() {
       "contig_copy.comp",
       {{"A_TYPE", "int"}, {"D_TYPE", "int"}});
   string_to_spv(
+      "contig_cpy_u32_u32",
+      "contig_copy.comp",
+      {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
+  string_to_spv(
       "contig_cpy_i32_f32",
       "contig_copy.comp",
       {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
@@ -1554,6 +1558,8 @@ void process_shaders() {
       "cpy_f32_i32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "int"}});
   string_to_spv(
       "cpy_i32_i32", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "int"}});
+  string_to_spv(
+      "cpy_u32_u32", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
   string_to_spv(
       "cpy_i32_f32", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
 
