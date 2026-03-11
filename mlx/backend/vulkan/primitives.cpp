@@ -128,9 +128,8 @@ CPU_FALLBACK(Sign)
 CPU_FALLBACK(Sinh)
 CPU_FALLBACK_STATE(Sort)
 CPU_FALLBACK(Tan)
-CPU_FALLBACK(MaskedScatter)
-// Scatter is implemented in scatter.cpp
-CPU_FALLBACK_STATE(ScatterAxis)
+NO_GPU(MaskedScatter)
+// Scatter and ScatterAxis are implemented in scatter.cpp
 
 // SliceUpdate uses the generic GPU implementation in
 // mlx/backend/gpu/primitives.cpp

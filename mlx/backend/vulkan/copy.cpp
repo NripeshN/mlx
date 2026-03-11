@@ -20,6 +20,60 @@
 namespace {
 
 using mlx::core::Dtype;
+using mlx::core::Shape;
+using mlx::core::Strides;
+
+size_t num_elements(const Shape& shape) {
+  return std::accumulate(
+      shape.begin(), shape.end(), size_t{1}, std::multiplies<size_t>());
+}
+
+int64_t resolve_dynamic_offset(const std::optional<mlx::core::array>& offset) {
+  if (!offset.has_value()) {
+    return 0;
+  }
+  auto offset_value = *offset;
+  if (offset_value.has_primitive()) {
+    offset_value.eval();
+  }
+  if (offset_value.size() != 1 || offset_value.dtype() != mlx::core::int64) {
+    throw std::runtime_error(
+        "Dynamic Vulkan copy offsets must be int64 scalars.");
+  }
+  return offset_value.data<int64_t>()[0];
+}
+
+mlx::core::array make_copy_view(
+    const mlx::core::array& base,
+    const Shape& shape,
+    const Strides& strides,
+    int64_t elem_offset) {
+  mlx::core::array view(shape, base.dtype(), nullptr, {});
+  const auto [data_size, row_contiguous, col_contiguous] =
+      mlx::core::check_contiguity(shape, strides);
+  view.copy_shared_buffer(
+      base,
+      strides,
+      {data_size == num_elements(shape), row_contiguous, col_contiguous},
+      data_size,
+      elem_offset);
+  return view;
+}
+
+std::tuple<Shape, Strides, Strides> collapse_copy_dims(
+    const Shape& shape,
+    const Strides& in_strides,
+    const Strides& out_strides) {
+  auto [collapsed_shape, collapsed_strides] =
+      mlx::core::collapse_contiguous_dims(
+          shape,
+          {in_strides, out_strides},
+          std::numeric_limits<uint32_t>::max());
+  return {
+      std::move(collapsed_shape),
+      std::move(collapsed_strides[0]),
+      std::move(collapsed_strides[1])};
+}
 
 std::string copy_dtype_suffix(Dtype dtype) {
   switch (dtype) {
@@ -215,29 +269,46 @@ void copy_gpu_inplace(
     return;
   }
 
+  const int64_t resolved_i_offset =
+      i_offset + resolve_dynamic_offset(dynamic_i_offset);
+  const int64_t resolved_o_offset =
+      o_offset + resolve_dynamic_offset(dynamic_o_offset);
+
+  auto dispatch_shape = data_shape;
+  auto dispatch_i_strides = i_strides;
+  auto dispatch_o_strides = o_strides;
+
+  if (dispatch_shape.size() > 4) {
+    std::tie(dispatch_shape, dispatch_i_strides, dispatch_o_strides) =
+        collapse_copy_dims(
+            dispatch_shape, dispatch_i_strides, dispatch_o_strides);
+  }
+
+  const auto dispatch_elements = num_elements(dispatch_shape);
+  auto in_view =
+      make_copy_view(in, dispatch_shape, dispatch_i_strides, resolved_i_offset);
+  auto out_view = make_copy_view(
+      out, dispatch_shape, dispatch_o_strides, resolved_o_offset);
+
   const bool same_dtype = in.dtype() == out.dtype();
   const bool raw_buffer_copy = same_dtype && ctype == CopyType::Vector;
 
   const bool full_tensor_copy = data_shape == in.shape() &&
       data_shape == out.shape() && i_strides == in.strides() &&
-      o_strides == out.strides();
+      o_strides == out.strides() && resolved_i_offset == 0 &&
+      resolved_o_offset == 0;
 
-  const auto shader_name = get_copy_shader_name(in, out);
+  const auto shader_name = get_copy_shader_name(in_view, out_view);
 
   const bool shader_copy_type =
       ctype == CopyType::General || ctype == CopyType::GeneralGeneral;
 
-  // Allow shader copy for both full tensor copies and strided copies
-  // as long as total element count matches and layouts are supported
-  const bool same_element_count = in.size() == out.size();
-  const bool shader_copy = shader_copy_type && !dynamic_i_offset &&
-      !dynamic_o_offset && i_offset == 0 && o_offset == 0 &&
-      same_element_count && is_supported_copy_layout(in) &&
-      is_supported_copy_layout(out) && !shader_name.empty();
+  const bool shader_copy = shader_copy_type &&
+      is_supported_copy_layout(in_view) && is_supported_copy_layout(out_view) &&
+      !shader_name.empty();
 
   const bool staging_scalar_fill = ctype == CopyType::Scalar &&
-      !dynamic_i_offset && !dynamic_o_offset && i_offset == 0 &&
-      o_offset == 0 && full_tensor_copy &&
+      resolved_i_offset == 0 && resolved_o_offset == 0 && full_tensor_copy &&
       (out.flags().contiguous || out.flags().row_contiguous ||
        out.flags().col_contiguous);
 
@@ -264,13 +335,16 @@ void copy_gpu_inplace(
     return;
   }
 
-  // For GeneralGeneral copies with mismatched sizes (slice updates),
-  // we need special handling
-  const bool is_slice_copy = shader_copy_type && !dynamic_i_offset &&
-      !dynamic_o_offset && !shader_name.empty() && in.size() != out.size() &&
-      i_offset == 0;
+  const bool is_slice_copy =
+      shader_copy_type && !shader_name.empty() && in.size() != out.size();
 
-  if (!raw_buffer_copy && !shader_copy && !is_slice_copy) {
+  const bool contiguous_large_rank_copy = same_dtype &&
+      dispatch_shape.size() > 4 && in_view.flags().contiguous &&
+      out_view.flags().contiguous && in_view.size() == out_view.size() &&
+      !is_slice_copy;
+
+  if (!raw_buffer_copy && !shader_copy && !is_slice_copy &&
+      !contiguous_large_rank_copy) {
     throw std::runtime_error(
         "Copy operation failed on Vulkan (unsupported dtype or layout).");
   }
@@ -286,10 +360,11 @@ void copy_gpu_inplace(
     // Simple contiguous memory copy using Vulkan command buffer
     VkBufferCopy copy_region{};
     copy_region.srcOffset =
-        static_cast<VkDeviceSize>(i_offset * size_of(in.dtype()));
+        static_cast<VkDeviceSize>(resolved_i_offset * size_of(in.dtype()));
     copy_region.dstOffset =
-        static_cast<VkDeviceSize>(o_offset * size_of(out.dtype()));
-    copy_region.size = static_cast<VkDeviceSize>(out.nbytes());
+        static_cast<VkDeviceSize>(resolved_o_offset * size_of(out.dtype()));
+    copy_region.size =
+        static_cast<VkDeviceSize>(dispatch_elements * size_of(out.dtype()));
 
     vkCmdCopyBuffer(
         cmd_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
@@ -297,68 +372,36 @@ void copy_gpu_inplace(
     vulkan::retain_array_for_stream(s, in);
     vulkan::retain_array_for_stream(s, out);
 
+  } else if (contiguous_large_rank_copy) {
+    VkBufferCopy copy_region{};
+    copy_region.srcOffset = static_cast<VkDeviceSize>(in_view.offset());
+    copy_region.dstOffset = static_cast<VkDeviceSize>(out_view.offset());
+    copy_region.size = static_cast<VkDeviceSize>(in_view.nbytes());
+
+    vkCmdCopyBuffer(
+        cmd_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
+
+    vulkan::retain_array_for_stream(s, in_view);
+    vulkan::retain_array_for_stream(s, out_view);
   } else if (shader_copy || is_slice_copy) {
     if (trace_copy_dispatch_enabled() &&
         (shader_name == "cpy_bf16_f32" || shader_name == "cpy_bf16_bf16")) {
       std::cerr << "[vulkan-copy] shader=" << shader_name
                 << " ctype=" << copy_type_name(ctype)
-                << " in_shape=" << seq_to_string(in.shape())
-                << " out_shape=" << seq_to_string(out.shape())
-                << " in_offset=" << in.offset()
-                << " out_offset=" << out.offset() << " i_offset=" << i_offset
-                << " o_offset=" << o_offset
-                << " in_strides=" << seq_to_string(in.strides())
-                << " out_strides=" << seq_to_string(out.strides()) << "\n";
+                << " in_shape=" << seq_to_string(in_view.shape())
+                << " out_shape=" << seq_to_string(out_view.shape())
+                << " in_offset=" << in_view.offset()
+                << " out_offset=" << out_view.offset()
+                << " in_strides=" << seq_to_string(in_view.strides())
+                << " out_strides=" << seq_to_string(out_view.strides()) << "\n";
     }
     try {
-      // For >4D arrays, we need to use a different approach since the shader
-      // only supports up to 4D. For contiguous arrays, use raw buffer copy.
-      // For non-contiguous >4D arrays, throw an error.
-      if (in.ndim() > 4 || out.ndim() > 4) {
-        if (in.flags().contiguous && out.flags().contiguous &&
-            in.size() == out.size() && !is_slice_copy) {
-          // Use raw buffer copy for contiguous >4D arrays
-          VkBufferCopy copy_region{};
-          copy_region.srcOffset =
-              static_cast<VkDeviceSize>(in.offset() * size_of(in.dtype()));
-          copy_region.dstOffset =
-              static_cast<VkDeviceSize>(out.offset() * size_of(out.dtype()));
-          copy_region.size = static_cast<VkDeviceSize>(in.nbytes());
-
-          auto* in_buf = static_cast<vulkan::VulkanBuffer*>(
-              const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
-          auto* out_buf =
-              static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
-          vkCmdCopyBuffer(
-              cmd_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
-
-          vulkan::retain_array_for_stream(s, in);
-          vulkan::retain_array_for_stream(s, out);
-          vulkan::end_command_recording(s.index);
-          return;
-        } else {
-          throw std::runtime_error(
-              "Copy operation failed on Vulkan: >4D non-contiguous arrays not supported");
-        }
+      if (dispatch_shape.size() > 4) {
+        throw std::runtime_error(
+            "Copy operation failed on Vulkan: >4D non-contiguous arrays not supported");
       }
 
-      if (is_slice_copy) {
-        // For slice copies, use a custom dispatch that handles mismatched sizes
-        // Create temporary arrays with proper shapes for the copy
-        array in_view(in.shape(), in.dtype(), nullptr, {});
-        in_view.copy_shared_buffer(
-            in, in.strides(), in.flags(), in.size(), in.offset());
-
-        // Create output view with the slice shape and strides
-        array out_view(in.shape(), out.dtype(), nullptr, {});
-        out_view.copy_shared_buffer(
-            out, o_strides, out.flags(), in.size(), o_offset);
-
-        vulkan::dispatch_unary_op(
-            in_view, out_view, shader_name, cmd_buffer, s);
-      } else {
-        vulkan::dispatch_unary_op(in, out, shader_name, cmd_buffer, s);
-      }
+      vulkan::dispatch_unary_op(in_view, out_view, shader_name, cmd_buffer, s);
     } catch (const std::runtime_error& e) {
       vulkan::end_command_recording(s.index);
       throw std::runtime_error(

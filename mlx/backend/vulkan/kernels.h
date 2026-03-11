@@ -555,6 +555,18 @@ void dispatch_gather_axis_op(
     uint32_t size_post,
     uint32_t idx_axis_size);
 
+void dispatch_scatter_axis_op(
+    const array& updates,
+    const array& indices,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t size_pre,
+    uint32_t size_axis,
+    uint32_t size_post,
+    uint32_t idx_axis_size);
+
 void dispatch_rope_op(
     const array& in,
     const array& positions,

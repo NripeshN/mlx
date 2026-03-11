@@ -2014,6 +2014,42 @@ void dispatch_gather_axis_op(
       s);
 }
 
+void dispatch_scatter_axis_op(
+    const array& updates,
+    const array& indices,
+    array& out,
+    const std::string& shader_name,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s,
+    uint32_t size_pre,
+    uint32_t size_axis,
+    uint32_t size_post,
+    uint32_t idx_axis_size) {
+  GatherAxisPushConstants push_constants{};
+  const uint32_t elems_per_prefix = checked_mul_u32(
+      idx_axis_size, size_post, "scatter_axis elems_per_prefix");
+  push_constants.ne =
+      checked_mul_u32(size_pre, elems_per_prefix, "scatter_axis elements");
+  push_constants.size_pre = size_pre;
+  push_constants.size_axis = size_axis;
+  push_constants.size_post = size_post;
+  push_constants.idx_axis_size = idx_axis_size;
+
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&updates, "updates"},
+      {&indices, "indices"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_name,
+      KernelSpecId::GatherAxis,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s);
+}
+
 void dispatch_rope_op(
     const array& in,
     const array& positions,

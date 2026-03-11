@@ -150,6 +150,32 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             rtol=5e-2,
         )
 
+    def test_dynamic_slice_update_5d_regression(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.slice_update(
+                mx.zeros((2, 3, 4, 5, 6), dtype=mx.float32),
+                mx.arange(1, 1 + 2 * 3 * 4 * 1 * 6, dtype=mx.float32).reshape(
+                    2, 3, 4, 1, 6
+                ),
+                mx.array([0, 0, 0, 2, 0], dtype=mx.int32),
+                (0, 1, 2, 3, 4),
+            ),
+            atol=1e-6,
+            rtol=1e-6,
+        )
+
+    def test_put_along_axis_vulkan(self):
+        self._assert_cpu_gpu_same(
+            lambda: mx.put_along_axis(
+                mx.array([[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]], dtype=mx.float32),
+                mx.array([[2, 1], [0, 2]], dtype=mx.uint32),
+                mx.array([[7.0, 8.0], [9.0, 10.0]], dtype=mx.float32),
+                axis=1,
+            ),
+            atol=0.0,
+            rtol=0.0,
+        )
+
 
 def _cases():
     return [

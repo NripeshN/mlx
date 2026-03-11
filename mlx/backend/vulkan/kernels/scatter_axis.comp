@@ -1,0 +1,61 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+
+#if defined(INDEX_IS_I64)
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#if defined(INDEX_IS_UNSIGNED)
+#define INDEX_TYPE uint64_t
+#else
+#define INDEX_TYPE int64_t
+#endif
+#elif defined(INDEX_IS_UNSIGNED)
+#define INDEX_TYPE uint
+#else
+#define INDEX_TYPE int
+#endif
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint ne;
+    uint size_pre;
+    uint size_axis;
+    uint size_post;
+    uint idx_axis_size;
+} p;
+
+layout(binding = 0) readonly buffer U { VALUE_TYPE data_u[]; };
+layout(binding = 1) readonly buffer I { INDEX_TYPE data_i[]; };
+layout(binding = 2) buffer D { VALUE_TYPE data_d[]; };
+
+uint get_idx() {
+    return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+}
+
+uint normalize_index(INDEX_TYPE idx) {
+#if defined(INDEX_IS_UNSIGNED)
+    return uint(idx);
+#elif defined(INDEX_IS_I64)
+    return uint(idx < 0 ? idx + int64_t(p.size_axis) : idx);
+#else
+    return uint(idx < 0 ? idx + int(p.size_axis) : idx);
+#endif
+}
+
+void main() {
+    const uint linear_idx = get_idx();
+
+    if (linear_idx >= p.ne) {
+        return;
+    }
+
+    const uint suffix = linear_idx % p.size_post;
+    const uint tmp = linear_idx / p.size_post;
+    const uint prefix = tmp / p.idx_axis_size;
+    const uint axis_idx = tmp - prefix * p.idx_axis_size;
+    const uint scatter_idx = normalize_index(data_i[linear_idx]);
+    const uint out_idx = (prefix * p.size_axis + scatter_idx) * p.size_post + suffix;
+
+    data_d[out_idx] = data_u[linear_idx];
+}

@@ -148,6 +148,15 @@ std::string gather_axis_shader_name(Dtype value_dtype, Dtype index_dtype) {
   return "gather_axis_" + value_suffix + "_" + index_suffix;
 }
 
+std::string scatter_axis_shader_name(Dtype value_dtype, Dtype index_dtype) {
+  auto value_suffix = dtype_suffix(value_dtype);
+  auto index_suffix = gather_index_suffix(index_dtype);
+  if (value_suffix.empty() || index_suffix.empty()) {
+    return {};
+  }
+  return "scatter_axis_" + value_suffix + "_" + index_suffix;
+}
+
 bool is_supported_elementwise_layout(const array& arr) {
   if (arr.ndim() > 4 || !arr.flags().row_contiguous || arr.offset() != 0) {
     return false;

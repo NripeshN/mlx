@@ -63,6 +63,7 @@ std::string dtype_suffix(Dtype dtype);
 std::string gather_index_suffix(Dtype dtype);
 std::string gather_shader_name(Dtype value_dtype, Dtype index_dtype);
 std::string gather_axis_shader_name(Dtype value_dtype, Dtype index_dtype);
+std::string scatter_axis_shader_name(Dtype value_dtype, Dtype index_dtype);
 bool is_supported_elementwise_layout(const array& arr);
 bool is_supported_unary_layout(const array& arr);
 bool is_supported_generic_unary_layout(const array& arr);
