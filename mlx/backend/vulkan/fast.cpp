@@ -679,9 +679,11 @@ bool try_eval_rms_norm_vulkan(
 
   array x = inputs[0];
   array w = inputs[1];
-  if (x.ndim() == 0 || x.shape() != out.shape() || w.ndim() == 0) {
+  if (x.ndim() == 0 || x.shape() != out.shape()) {
     return false;
   }
+
+  const bool has_weight = w.ndim() != 0;
 
   if (!is_vulkan_float_dtype(x.dtype()) || !is_vulkan_float_dtype(w.dtype()) ||
       !is_vulkan_float_dtype(out.dtype())) {
@@ -699,14 +701,20 @@ bool try_eval_rms_norm_vulkan(
     w = w_f32;
   }
 
-  if (x.ndim() > 4 || w.ndim() > 4) {
+  if (w.ndim() > 4) {
+    return false;
+  }
+
+  const uint32_t axis_size =
+      checked_u32_size(x.shape(x.ndim() - 1), "axis_size");
+  if (axis_size == 0 || axis_size > 32u * 512u) {
     return false;
   }
 
   if (!x.flags().contiguous || x.strides().back() != 1) {
     x = contiguous_copy_gpu(x, s);
   }
-  if (!w.flags().row_contiguous || w.offset() != 0) {
+  if (has_weight && (!w.flags().row_contiguous || w.offset() != 0)) {
     w = contiguous_copy_gpu(w, s);
   }
 
@@ -729,12 +737,6 @@ bool try_eval_rms_norm_vulkan(
       copy_gpu(out_work, out, CopyType::General, s);
     }
     return true;
-  }
-
-  const uint32_t axis_size =
-      checked_u32_size(x.shape(x.ndim() - 1), "axis_size");
-  if (axis_size == 0 || axis_size > 32u * 512u) {
-    return false;
   }
 
   const uint32_t nrows =
@@ -761,7 +763,7 @@ bool try_eval_rms_norm_vulkan(
         s,
         vulkan::BinaryDispatchVariant::Standard,
         std::array<uint32_t, 3>{nrows, nchannels, nsamples},
-        {0u, 1u});
+        {0u, has_weight ? 1u : 0u});
     vulkan::end_command_recording(s.index);
     if (staged_output) {
       copy_gpu(out_work, out, CopyType::General, s);
