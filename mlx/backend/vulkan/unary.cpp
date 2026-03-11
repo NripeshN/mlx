@@ -204,7 +204,7 @@ void eval_generic_unary_suffix_vulkan(
     bool f16_with_rte = false) {
   if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
     auto suffix = dtype_suffix(out.dtype());
-    if (suffix.empty() && out.dtype() == bfloat16) {
+    if (out.dtype() == bfloat16) {
       suffix = "f32";
     }
     if (!suffix.empty()) {

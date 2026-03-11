@@ -22,6 +22,19 @@ namespace mlx::core {
 
 namespace {
 
+std::string join_primitive_names(const std::vector<array>& arrays) {
+  std::ostringstream os;
+  bool first = true;
+  for (const auto& x : arrays) {
+    if (!first) {
+      os << ",";
+    }
+    first = false;
+    os << x.primitive().name();
+  }
+  return os.str();
+}
+
 std::string dtype_to_glsl_storage(Dtype d) {
   switch (d) {
     case float32:
@@ -150,10 +163,10 @@ std::string glsl_cast_expr(Dtype dst, Dtype src, const std::string& expr) {
 
 bool supports_primitive_name(const std::string& prim_name) {
   static const std::unordered_set<std::string> supported = {
-      "Abs",     "Add",     "AsType",   "Broadcast", "Ceil",  "Conjugate",
-      "Cos",     "Divide",  "Exp",      "Floor",     "Imag",  "Log",
-      "Maximum", "Minimum", "Multiply", "Real",      "Round", "Sigmoid",
-      "Sin",     "Sqrt",    "Subtract", "Tan"};
+      "Abs",       "Add",     "AsType",  "Broadcast", "Ceil",     "Conjugate",
+      "Cos",       "Divide",  "Exp",     "Floor",     "Imag",     "Log",
+      "LogAddExp", "Maximum", "Minimum", "Multiply",  "Negative", "Real",
+      "Round",     "Sigmoid", "Sin",     "Sqrt",      "Subtract", "Tan"};
   return supported.contains(prim_name);
 }
 
@@ -557,7 +570,16 @@ uint elem_to_loc(uint idx, int start_stride_idx, int ndim) {
 
       bool is_complex = x.dtype() == complex64;
 
-      if (is_binary_op && x.inputs().size() == 2) {
+      if (prim_name == "Negative" && x.inputs().size() == 1) {
+        os += fmt::format("(-{});\n", get_input_expr(x.inputs()[0]));
+      } else if (prim_name == "LogAddExp" && x.inputs().size() == 2) {
+        auto lhs = get_input_expr(x.inputs()[0]);
+        auto rhs = get_input_expr(x.inputs()[1]);
+        os += fmt::format(
+            "((min({0}, {1}) == -1.0 / 0.0 || max({0}, {1}) == 1.0 / 0.0) ? max({0}, {1}) : (max({0}, {1}) + log(1.0 + exp(min({0}, {1}) - max({0}, {1})))));\n",
+            lhs,
+            rhs);
+      } else if (is_binary_op && x.inputs().size() == 2) {
         if (is_complex && op == "*") {
           os += fmt::format(
               "complex_mul({}, {});\n",
@@ -798,8 +820,25 @@ void Compiled::eval_gpu(
   }();
 
   if (requires_cpu_fallback) {
-    throw std::runtime_error(
-        "Compiled kernel failed on Vulkan (complex tape operations or unsupported layout).");
+    std::ostringstream msg;
+    msg << "Compiled kernel failed on Vulkan (complex tape operations or unsupported layout)."
+        << " contiguous=" << contiguous << " inputs_offset="
+        << std::any_of(
+               inputs.begin(),
+               inputs.end(),
+               [](const array& x) { return x.offset() != 0; })
+        << " outputs_offset="
+        << std::any_of(
+               outputs.begin(),
+               outputs.end(),
+               [](const array& x) { return x.offset() != 0; })
+        << " tape_offset="
+        << std::any_of(
+               tape_.begin(),
+               tape_.end(),
+               [](const array& x) { return x.offset() != 0; })
+        << " tape_primitives=" << join_primitive_names(tape_);
+    throw std::runtime_error(msg.str());
   }
 
   // Use large index if needed
