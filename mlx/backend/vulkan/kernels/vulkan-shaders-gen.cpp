@@ -1562,6 +1562,14 @@ void process_shaders() {
       "cpy_u32_u32", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
   string_to_spv(
       "cpy_i32_f32", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "cpy_u32_f32", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "cpy_i32_i64", "copy.comp", {{"A_TYPE", "int"}, {"D_TYPE", "int64_t"}});
+  string_to_spv(
+      "cpy_f32_c64",
+      "copy.comp",
+      {{"A_TYPE", "float"}, {"D_TYPE", "vec2"}, {"DATA_D_C64", "1"}});
 
   string_to_spv(
       "cpy_transpose_16",

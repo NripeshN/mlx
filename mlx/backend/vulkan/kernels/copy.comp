@@ -17,6 +17,9 @@ void main() {
 #elif defined(DATA_A_BF16)
     float f = bf16_to_fp32(uint(data_a[get_aoffset() + src0_idx(idx)]));
     data_d[get_doffset() + dst_idx(idx)] = D_TYPE(f);
+#elif defined(DATA_D_C64)
+    float f = float(data_a[get_aoffset() + src0_idx(idx)]);
+    data_d[get_doffset() + dst_idx(idx)] = vec2(f, 0.0);
 #elif defined(DATA_D_BF16)
     float f = float(data_a[get_aoffset() + src0_idx(idx)]);
     data_d[get_doffset() + dst_idx(idx)] = D_TYPE(fp32_to_bf16(f));

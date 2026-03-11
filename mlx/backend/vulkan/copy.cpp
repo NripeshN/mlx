@@ -87,6 +87,10 @@ std::string copy_dtype_suffix(Dtype dtype) {
       return "i32";
     case mlx::core::uint32:
       return "u32";
+    case mlx::core::int64:
+      return "i64";
+    case mlx::core::complex64:
+      return "c64";
     default:
       return {};
   }
@@ -206,7 +210,10 @@ std::string get_copy_shader_name(
       (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::int32) ||
       (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::float32) ||
       (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int32) ||
-      (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::uint32);
+      (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::uint32) ||
+      (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::float32) ||
+      (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int64) ||
+      (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::complex64);
 
   if (!supported_pair) {
     return {};

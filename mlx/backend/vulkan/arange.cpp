@@ -1,5 +1,6 @@
 // Copyright © 2024 Apple Inc.
 
+#include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 
 namespace mlx::core {
@@ -12,12 +13,28 @@ bool try_eval_arange_vulkan(
     Stream s,
     double start,
     double step) {
-  if (!inputs.empty() || out.dtype() != float32 ||
-      !is_supported_generic_unary_layout(out)) {
+  if (!inputs.empty() || !is_supported_generic_unary_layout(out)) {
     return false;
   }
 
-  out.set_data(allocator::malloc(out.nbytes()));
+  const bool direct_output = out.dtype() == float32;
+  const bool low_precision_output =
+      out.dtype() == float16 || out.dtype() == bfloat16;
+  if (!direct_output && !low_precision_output) {
+    return false;
+  }
+
+  array* dispatch_out = &out;
+  std::optional<array> temp_out;
+  if (!direct_output) {
+    temp_out = array(out.shape(), float32, nullptr, {});
+    temp_out->set_data(allocator::malloc(temp_out->nbytes()));
+    dispatch_out = &(*temp_out);
+  }
+
+  if (direct_output) {
+    out.set_data(allocator::malloc(out.nbytes()));
+  }
   if (out.size() == 0) {
     return true;
   }
@@ -25,13 +42,18 @@ bool try_eval_arange_vulkan(
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_arange_op(
-        out,
+        *dispatch_out,
         "arange_f32",
         command_buffer,
         s,
         static_cast<float>(start),
         static_cast<float>(step));
     vulkan::end_command_recording(s.index);
+
+    if (temp_out.has_value()) {
+      copy_gpu(*temp_out, out, CopyType::Vector, s);
+    }
+
     return true;
   } catch (const std::runtime_error& e) {
     if (trace_fallback_enabled()) {
