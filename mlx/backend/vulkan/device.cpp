@@ -61,6 +61,103 @@ uint32_t max_deferred_ops() {
   return value;
 }
 
+uint32_t min_deferred_ops_before_inflight_submit() {
+  static const uint32_t value = []() {
+    if (const char* env =
+            std::getenv("MLX_VULKAN_MIN_DEFERRED_OPS_BEFORE_INFLIGHT_SUBMIT");
+        env != nullptr) {
+      try {
+        const int parsed = std::stoi(env);
+        return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
+      } catch (...) {
+        return 4u;
+      }
+    }
+    return 4u;
+  }();
+  return value;
+}
+
+uint32_t max_adaptive_deferred_ops() {
+  static const uint32_t value = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_MAX_ADAPTIVE_DEFERRED_OPS");
+        env != nullptr) {
+      try {
+        const int parsed = std::stoi(env);
+        return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
+      } catch (...) {
+        return 64u;
+      }
+    }
+    return 64u;
+  }();
+  return value;
+}
+
+uint32_t max_inflight_submissions() {
+  static const uint32_t value = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_MAX_INFLIGHT_SUBMISSIONS");
+        env != nullptr) {
+      try {
+        const int parsed = std::stoi(env);
+        return parsed > 0 ? static_cast<uint32_t>(parsed) : 1u;
+      } catch (...) {
+        return 2u;
+      }
+    }
+    return 2u;
+  }();
+  return value;
+}
+
+uint64_t max_deferred_total_bytes() {
+  static const uint64_t value = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_MAX_DEFERRED_TOTAL_BYTES");
+        env != nullptr) {
+      try {
+        const long long parsed = std::stoll(env);
+        return parsed > 0 ? static_cast<uint64_t>(parsed) : 1ull;
+      } catch (...) {
+        return 32ull * 1024ull * 1024ull;
+      }
+    }
+    return 32ull * 1024ull * 1024ull;
+  }();
+  return value;
+}
+
+uint64_t max_deferred_heavy_bytes() {
+  static const uint64_t value = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_MAX_DEFERRED_HEAVY_BYTES");
+        env != nullptr) {
+      try {
+        const long long parsed = std::stoll(env);
+        return parsed > 0 ? static_cast<uint64_t>(parsed) : 1ull;
+      } catch (...) {
+        return 8ull * 1024ull * 1024ull;
+      }
+    }
+    return 8ull * 1024ull * 1024ull;
+  }();
+  return value;
+}
+
+uint64_t max_deferred_compiled_bytes() {
+  static const uint64_t value = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_MAX_DEFERRED_COMPILED_BYTES");
+        env != nullptr) {
+      try {
+        const long long parsed = std::stoll(env);
+        return parsed > 0 ? static_cast<uint64_t>(parsed) : 1ull;
+      } catch (...) {
+        return 4ull * 1024ull * 1024ull;
+      }
+    }
+    return 4ull * 1024ull * 1024ull;
+  }();
+  return value;
+}
+
 bool barrier_between_deferred_ops() {
   static const bool enabled = []() {
     if (const char* env =
@@ -326,6 +423,11 @@ struct StreamData {
   std::vector<BufferAccessRange> unsynced_writes;
   std::unordered_map<std::string, ScratchSlot> scratch_slots;
   std::deque<std::string> recent_primitives;
+  uint64_t deferred_total_bytes{0};
+  uint64_t deferred_heavy_bytes{0};
+  uint64_t deferred_compiled_bytes{0};
+  uint32_t deferred_heavy_ops{0};
+  uint32_t submission_count{0};
 };
 
 class VulkanDevice {
@@ -552,6 +654,141 @@ class VulkanDevice {
     }
   }
 
+  static uint64_t safe_array_nbytes(const array& arr) {
+    if (arr.size() == 0) {
+      return 0;
+    }
+    return static_cast<uint64_t>(arr.data_size()) *
+        static_cast<uint64_t>(size_of(arr.dtype()));
+  }
+
+  static bool primitive_name_contains(
+      const std::string& primitive,
+      const char* needle) {
+    return primitive.find(needle) != std::string::npos;
+  }
+
+  static bool is_heavy_primitive_name(const std::string& primitive) {
+    return primitive_name_contains(primitive, "Matmul") ||
+        primitive_name_contains(primitive, "GatherMM") ||
+        primitive_name_contains(primitive, "BlockMaskedMM") ||
+        primitive_name_contains(primitive, "SegmentedMM") ||
+        primitive_name_contains(primitive, "QuantizedMatmul") ||
+        primitive_name_contains(primitive, "ScaledDotProductAttention") ||
+        primitive_name_contains(primitive, "Compiled");
+  }
+
+  static bool is_compiled_primitive_name(const std::string& primitive) {
+    return primitive_name_contains(primitive, "Compiled");
+  }
+
+  static uint64_t weighted_heavy_bytes(
+      const std::string& primitive,
+      uint64_t input_bytes,
+      uint64_t output_bytes) {
+    uint64_t weighted = input_bytes + output_bytes;
+    if (primitive_name_contains(primitive, "Matmul") ||
+        primitive_name_contains(primitive, "GatherMM") ||
+        primitive_name_contains(primitive, "BlockMaskedMM") ||
+        primitive_name_contains(primitive, "SegmentedMM") ||
+        primitive_name_contains(primitive, "QuantizedMatmul")) {
+      weighted += 4 * std::max(input_bytes, output_bytes);
+    }
+    if (primitive_name_contains(primitive, "ScaledDotProductAttention")) {
+      weighted += 6 * std::max(input_bytes, output_bytes);
+    }
+    if (primitive_name_contains(primitive, "Compiled")) {
+      weighted += 8 * output_bytes + 2 * input_bytes;
+    }
+    return weighted;
+  }
+
+  void update_deferred_work_estimate(
+      StreamData* stream,
+      const std::vector<array>& inputs,
+      const std::vector<array>& outputs) {
+    uint64_t input_bytes = 0;
+    uint64_t output_bytes = 0;
+    for (const auto& in : inputs) {
+      input_bytes += safe_array_nbytes(in);
+    }
+    for (const auto& out : outputs) {
+      output_bytes += safe_array_nbytes(out);
+    }
+
+    const uint64_t total_bytes = input_bytes + output_bytes;
+    stream->deferred_total_bytes += total_bytes;
+
+    const std::string primitive = stream->recent_primitives.empty()
+        ? std::string{}
+        : stream->recent_primitives.back();
+    if (is_heavy_primitive_name(primitive)) {
+      stream->deferred_heavy_bytes +=
+          weighted_heavy_bytes(primitive, input_bytes, output_bytes);
+      stream->deferred_heavy_ops += 1;
+    }
+    if (is_compiled_primitive_name(primitive)) {
+      stream->deferred_compiled_bytes += total_bytes + 4 * output_bytes;
+    }
+  }
+
+  static uint64_t adaptive_scale(uint32_t submission_count) {
+    return 1ull << std::min<uint32_t>(submission_count, 2u);
+  }
+
+  bool should_submit_recording(StreamData* stream, std::string* reason) {
+    if (!deferred_submission_enabled() || !stream->recording) {
+      return false;
+    }
+
+    const uint64_t scale = adaptive_scale(stream->submission_count);
+    const uint32_t op_budget = std::min<uint32_t>(
+        max_adaptive_deferred_ops(),
+        std::max<uint32_t>(max_deferred_ops(), max_deferred_ops() * scale));
+    const uint64_t total_budget = max_deferred_total_bytes() * scale;
+    const uint64_t heavy_budget = max_deferred_heavy_bytes() * scale;
+    const uint64_t compiled_budget = max_deferred_compiled_bytes() * scale;
+
+    if (stream->recorded_ops >= op_budget) {
+      if (reason != nullptr) {
+        *reason = "adaptive op budget";
+      }
+      return true;
+    }
+    if (stream->deferred_compiled_bytes >= compiled_budget) {
+      if (reason != nullptr) {
+        *reason = "adaptive compiled budget";
+      }
+      return true;
+    }
+    if (stream->deferred_heavy_bytes >= heavy_budget) {
+      if (reason != nullptr) {
+        *reason = "adaptive heavy budget";
+      }
+      return true;
+    }
+    if (stream->deferred_total_bytes >= total_budget) {
+      if (reason != nullptr) {
+        *reason = "adaptive total budget";
+      }
+      return true;
+    }
+
+    const bool inflight_pressure =
+        stream->in_flight_submissions.size() >= max_inflight_submissions();
+    const bool enough_work =
+        stream->recorded_ops >= min_deferred_ops_before_inflight_submit() ||
+        stream->deferred_heavy_ops > 0;
+    if (inflight_pressure && enough_work) {
+      if (reason != nullptr) {
+        *reason = "adaptive inflight pressure";
+      }
+      return true;
+    }
+
+    return false;
+  }
+
   void begin_primitive(
       const Stream& s,
       const std::vector<array>& inputs,
@@ -612,6 +849,8 @@ class VulkanDevice {
       return;
     }
 
+    update_deferred_work_estimate(stream, inputs, outputs);
+
     auto reads = make_access_ranges(inputs);
     auto writes = make_access_ranges(outputs);
     stream->unsynced_reads.insert(
@@ -652,6 +891,10 @@ class VulkanDevice {
       stream->recording_completion_callbacks.clear();
       stream->unsynced_reads.clear();
       stream->unsynced_writes.clear();
+      stream->deferred_total_bytes = 0;
+      stream->deferred_heavy_bytes = 0;
+      stream->deferred_compiled_bytes = 0;
+      stream->deferred_heavy_ops = 0;
       if (trace_sync_enabled()) {
         std::ostringstream oss;
         oss << "begin_recording(stream=" << stream_index
@@ -687,16 +930,22 @@ class VulkanDevice {
     }
 
     stream->recorded_ops += 1;
-    if (stream->recorded_ops >= max_deferred_ops()) {
+    std::string submit_reason;
+    if (should_submit_recording(stream, &submit_reason)) {
       if (trace_sync_enabled()) {
         std::ostringstream oss;
-        oss << "end_recording action=submit threshold stream=" << stream_index
+        oss << "end_recording action=submit adaptive stream=" << stream_index
             << " rec_epoch=" << stream->recording_epoch
             << " rec_ops=" << stream->recorded_ops
-            << " threshold=" << max_deferred_ops();
+            << " total_bytes=" << stream->deferred_total_bytes
+            << " heavy_bytes=" << stream->deferred_heavy_bytes
+            << " compiled_bytes=" << stream->deferred_compiled_bytes
+            << " heavy_ops=" << stream->deferred_heavy_ops
+            << " inflight=" << stream->in_flight_submissions.size()
+            << " reason='" << submit_reason << "'";
         trace_sync(oss.str());
       }
-      submit_commands(stream, "threshold reached");
+      submit_commands(stream, submit_reason);
       return;
     }
 
@@ -1078,6 +1327,10 @@ class VulkanDevice {
       stream->recording_completion_callbacks.clear();
       stream->unsynced_reads.clear();
       stream->unsynced_writes.clear();
+      stream->deferred_total_bytes = 0;
+      stream->deferred_heavy_bytes = 0;
+      stream->deferred_compiled_bytes = 0;
+      stream->deferred_heavy_ops = 0;
       clear_scratch_barriers(stream);
       stream->recent_primitives.clear();
       stream->recording_resources.reset();
@@ -1208,9 +1461,14 @@ class VulkanDevice {
     stream->recording_completion_callbacks.clear();
     stream->unsynced_reads.clear();
     stream->unsynced_writes.clear();
+    stream->deferred_total_bytes = 0;
+    stream->deferred_heavy_bytes = 0;
+    stream->deferred_compiled_bytes = 0;
+    stream->deferred_heavy_ops = 0;
     clear_scratch_barriers(stream);
     stream->recent_primitives.clear();
     stream->in_flight_submissions.push_back(std::move(submission));
+    stream->submission_count += 1;
 
     if (trace_sync_enabled()) {
       std::ostringstream oss;
