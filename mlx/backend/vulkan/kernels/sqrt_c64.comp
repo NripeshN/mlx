@@ -1,0 +1,46 @@
+#version 450
+
+#include "types.glsl"
+#include "generic_unary_head.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+vec2 complex_sqrt(vec2 z) {
+    if (z.x == 0.0 && z.y == 0.0) {
+        return vec2(0.0, 0.0);
+    }
+
+    if (z.y == 0.0) {
+        if (z.x < 0.0) {
+            return vec2(0.0, sqrt(-z.x));
+        }
+        return vec2(sqrt(z.x), 0.0);
+    }
+
+    float r = length(z);
+    float real_part = sqrt(max((r + z.x) * 0.5, 0.0));
+    float imag_mag = sqrt(max((r - z.x) * 0.5, 0.0));
+    float imag_part = z.y < 0.0 ? -imag_mag : imag_mag;
+    return vec2(real_part, imag_part);
+}
+
+vec2 complex_rsqrt(vec2 z) {
+    vec2 root = complex_sqrt(z);
+    float denom = root.x * root.x + root.y * root.y;
+    return vec2(root.x / denom, -root.y / denom);
+}
+
+void main() {
+    const uint idx = get_idx();
+
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const vec2 z = data_a[get_aoffset() + src0_idx(idx)];
+#if RSQRT
+    data_d[get_doffset() + dst_idx(idx)] = complex_rsqrt(z);
+#else
+    data_d[get_doffset() + dst_idx(idx)] = complex_sqrt(z);
+#endif
+}

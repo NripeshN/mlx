@@ -19,12 +19,14 @@ bool try_eval_unary_op_vulkan(
   }
 
   array in = inputs[0];
-  if (!is_vulkan_float_dtype(in.dtype()) || in.dtype() != out.dtype()) {
+  const bool complex_io = in.dtype() == complex64 && out.dtype() == complex64;
+  if ((!is_vulkan_float_dtype(in.dtype()) && !complex_io) ||
+      in.dtype() != out.dtype()) {
     return false;
   }
 
   const bool use_f32_staging_io =
-      in.dtype() == bfloat16 || out.dtype() == bfloat16;
+      !complex_io && (in.dtype() == bfloat16 || out.dtype() == bfloat16);
   if (use_f32_staging_io) {
     array in_f32(in.shape(), float32, nullptr, {});
     copy_gpu(in, in_f32, CopyType::General, s);
@@ -314,6 +316,10 @@ void Square::eval_gpu(const std::vector<array>& inputs, array& out) {
       eval_unary_vulkan<Square>(inputs, out, "sqr_f16", stream());
       return;
     }
+    if (out.dtype() == complex64) {
+      eval_unary_vulkan<Square>(inputs, out, "sqr_c64", stream());
+      return;
+    }
   }
   throw std::runtime_error(
       "Square operation failed on Vulkan (unsupported dtype or layout).");
@@ -322,10 +328,12 @@ void Square::eval_gpu(const std::vector<array>& inputs, array& out) {
 void Sqrt::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 &&
       (inputs[0].dtype() == float32 || inputs[0].dtype() == bfloat16 ||
-       inputs[0].dtype() == float16) &&
+       inputs[0].dtype() == float16 || inputs[0].dtype() == complex64) &&
       out.dtype() == inputs[0].dtype()) {
     const char* shader = state() ? "rsqrt_f32" : "sqrt_f32";
-    if (out.dtype() == float16) {
+    if (out.dtype() == complex64) {
+      shader = state() ? "rsqrt_c64" : "sqrt_c64";
+    } else if (out.dtype() == float16) {
       shader = state() ? "rsqrt_f16" : "sqrt_f16";
     }
     eval_unary_vulkan<Sqrt>(inputs, out, shader, stream(), 0.0f, 0.0f);

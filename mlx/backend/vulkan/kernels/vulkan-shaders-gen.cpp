@@ -1890,6 +1890,10 @@ void process_shaders() {
       "square.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
+      "sqr_c64",
+      "square_c64.comp",
+      {{"A_TYPE", "vec2"}, {"D_TYPE", "vec2"}, {"FLOAT_TYPE", "vec2"}});
+  string_to_spv(
       "sqr_f16",
       "square.comp",
       {{"A_TYPE", "float16_t"},
@@ -1901,6 +1905,10 @@ void process_shaders() {
       "sqrt.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
   string_to_spv(
+      "sqrt_c64",
+      "sqrt_c64.comp",
+      {{"A_TYPE", "vec2"}, {"D_TYPE", "vec2"}, {"FLOAT_TYPE", "vec2"}});
+  string_to_spv(
       "sqrt_f16",
       "sqrt.comp",
       {{"A_TYPE", "float16_t"},
@@ -1911,6 +1919,13 @@ void process_shaders() {
       "rsqrt_f32",
       "rsqrt.comp",
       {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+  string_to_spv(
+      "rsqrt_c64",
+      "sqrt_c64.comp",
+      {{"A_TYPE", "vec2"},
+       {"D_TYPE", "vec2"},
+       {"FLOAT_TYPE", "vec2"},
+       {"RSQRT", "1"}});
   string_to_spv(
       "rsqrt_f16",
       "rsqrt.comp",
