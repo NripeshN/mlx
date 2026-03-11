@@ -190,28 +190,53 @@ bool try_eval_matvec_vulkan(
     return false;
   }
 
-  array vec = inputs[0];
-  array matrix_t = inputs[1];
-  if (vec.ndim() != 2 || matrix_t.ndim() != 2 || out.ndim() != 2) {
+  array a = inputs[0];
+  array b = inputs[1];
+  if (a.ndim() != 2 || b.ndim() != 2 || out.ndim() != 2) {
     return false;
   }
-  if (vec.dtype() != matrix_t.dtype() || out.dtype() != vec.dtype() ||
-      !is_supported_matmul_dtype(vec.dtype())) {
+  if (a.dtype() != b.dtype() || out.dtype() != a.dtype() ||
+      !is_supported_matmul_dtype(a.dtype())) {
     return false;
   }
-  if (vec.shape(0) != 1 || out.shape(0) != 1 ||
-      vec.shape(1) != matrix_t.shape(0) || out.shape(1) != matrix_t.shape(1)) {
+
+  bool a_is_vec = (a.shape(0) == 1);
+  bool b_is_vec = (b.shape(1) == 1);
+  bool is_matvec = a_is_vec || b_is_vec;
+
+  if (!is_matvec) {
+    return false;
+  }
+
+  array vec = a;
+  array matrix = b;
+  if (a_is_vec && b_is_vec) {
+    if (a.shape(1) != b.shape(0)) {
+      return false;
+    }
+    vec = a;
+    matrix = b;
+  } else if (a_is_vec) {
+    if (a.shape(1) != b.shape(0)) {
+      return false;
+    }
+    vec = a;
+    matrix = b;
+  } else {
+    if (b.shape(1) != a.shape(0)) {
+      return false;
+    }
+    vec = b;
+    matrix = a;
+  }
+
+  if (out.shape(0) != vec.shape(0) || out.shape(1) != matrix.shape(1)) {
     return false;
   }
 
   if (vec.shape(1) == 0) {
     zero_initialize_output(out, s);
     return true;
-  }
-
-  if (!matrix_t.flags().col_contiguous || matrix_t.offset() != 0 ||
-      matrix_t.strides(0) != 1) {
-    return false;
   }
 
   if (!is_row_contiguous_zero_offset(vec)) {
@@ -221,16 +246,25 @@ bool try_eval_matvec_vulkan(
     return false;
   }
 
-  if (vec.dtype() == bfloat16) {
+  if (!is_row_contiguous_zero_offset(matrix)) {
+    matrix = contiguous_copy_gpu(matrix, s);
+  }
+  if (!is_row_contiguous_zero_offset(matrix)) {
+    return false;
+  }
+
+  Dtype vec_shader_dtype = vec.dtype();
+  if (vec_shader_dtype == bfloat16) {
     array vec_f16 = vulkan::acquire_scratch_array(
         s, kMatvecVectorCastScratchLane, vec.shape(), float16);
     copy_gpu(vec, vec_f16, CopyType::General, s);
     vulkan::mark_scratch_array_written(s, kMatvecVectorCastScratchLane);
     vec = vec_f16;
+    vec_shader_dtype = float16;
   }
 
   auto shader_candidates =
-      matvec_shader_candidates(matrix_t.dtype(), vec.dtype());
+      matvec_shader_candidates(matrix.dtype(), vec_shader_dtype);
   if (shader_candidates.empty()) {
     return false;
   }
@@ -247,7 +281,7 @@ bool try_eval_matvec_vulkan(
     try {
       auto command_buffer = vulkan::begin_command_recording(s.index);
       vulkan::dispatch_mul_mat_vec_op(
-          matrix_t, vec, out_work, shader_name, command_buffer, s);
+          matrix, vec, out_work, shader_name, command_buffer, s);
       vulkan::end_command_recording(s.index);
       dispatched = true;
     } catch (const std::runtime_error& e) {
