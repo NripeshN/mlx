@@ -66,6 +66,23 @@ constexpr vulkan::BinaryDispatchVariant binary_dispatch_variant() {
 }
 
 template <typename Primitive>
+constexpr BinaryShaderOp binary_shader_op() {
+  if constexpr (std::is_same_v<Primitive, Add>) {
+    return BinaryShaderOp::Add;
+  } else if constexpr (std::is_same_v<Primitive, Divide>) {
+    return BinaryShaderOp::Divide;
+  } else if constexpr (std::is_same_v<Primitive, Maximum>) {
+    return BinaryShaderOp::Maximum;
+  } else if constexpr (std::is_same_v<Primitive, Minimum>) {
+    return BinaryShaderOp::Minimum;
+  } else if constexpr (std::is_same_v<Primitive, Multiply>) {
+    return BinaryShaderOp::Multiply;
+  } else {
+    return BinaryShaderOp::Subtract;
+  }
+}
+
+template <typename Primitive>
 bool try_eval_binary_op_vulkan(
     const std::vector<array>& inputs,
     array& out,
@@ -77,7 +94,6 @@ bool try_eval_binary_op_vulkan(
 
   array a = inputs[0];
   array b = inputs[1];
-  std::string shader_op_name = op_name;
   const bool mixed_numeric_div = std::string_view(op_name) == "div" &&
       out.dtype() == float32 && is_vulkan_div_cast_dtype(a.dtype()) &&
       is_vulkan_div_cast_dtype(b.dtype());
@@ -102,7 +118,6 @@ bool try_eval_binary_op_vulkan(
     copy_gpu(b, b_u32, CopyType::General, s);
     a = a_u32;
     b = b_u32;
-    shader_op_name = "maximum";
   }
 
   if (mixed_numeric_div) {
@@ -170,13 +185,6 @@ bool try_eval_binary_op_vulkan(
             {})
       : out;
 
-  auto suffix_a = dtype_suffix(a.dtype());
-  auto suffix_b = dtype_suffix(b.dtype());
-  auto suffix_out = dtype_suffix(out_work.dtype());
-  if (suffix_a.empty() || suffix_b.empty() || suffix_out.empty()) {
-    return false;
-  }
-
   auto bopt = get_binary_op_type(a, b);
   if (small_signed_integer_case || small_unsigned_integer_case) {
     out_work.set_data(allocator::malloc(out_work.nbytes()));
@@ -194,11 +202,17 @@ bool try_eval_binary_op_vulkan(
     return true;
   }
 
-  std::string shader_name = bool_add
-      ? "maximum_u32_u32_u8"
-      : shader_op_name + "_" + suffix_a + "_" + suffix_b + "_" + suffix_out;
-  if (out_work.dtype() == float16) {
-    shader_name += "_rte";
+  const auto shader_id = bool_add
+      ? std::optional<vulkan::StaticShaderId>(
+            vulkan::StaticShaderId::maximum_u32_u32_u8)
+      : binary_shader_id(
+            binary_shader_op<Primitive>(),
+            a.dtype(),
+            b.dtype(),
+            out_work.dtype(),
+            out_work.dtype() == float16);
+  if (!shader_id.has_value()) {
+    return false;
   }
 
   try {
@@ -210,7 +224,7 @@ bool try_eval_binary_op_vulkan(
       }
     }
     vulkan::dispatch_binary_op(
-        a, b, out_work, shader_name, command_buffer, s, dispatch_variant);
+        a, b, out_work, *shader_id, command_buffer, s, dispatch_variant);
     vulkan::end_command_recording(s.index);
     if (staged_output || use_f32_staging_io) {
       copy_gpu(out_work, out, CopyType::General, s);
@@ -279,9 +293,9 @@ bool try_eval_greater_equal_vulkan(
     b = contiguous_copy_gpu(b, s);
   }
 
-  auto suffix_a = dtype_suffix(a.dtype());
-  auto suffix_b = dtype_suffix(b.dtype());
-  if (suffix_a.empty() || suffix_b.empty()) {
+  const auto shader_id = binary_shader_id(
+      BinaryShaderOp::GreaterEqual, a.dtype(), b.dtype(), uint8, false);
+  if (!shader_id.has_value()) {
     return false;
   }
 
@@ -300,7 +314,7 @@ bool try_eval_greater_equal_vulkan(
         a,
         b,
         out_u8,
-        std::string("greater_equal_") + suffix_a + "_" + suffix_b + "_u8",
+        *shader_id,
         command_buffer,
         s,
         vulkan::BinaryDispatchVariant::Standard);

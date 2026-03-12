@@ -130,32 +130,241 @@ std::string gather_index_suffix(Dtype dtype) {
   }
 }
 
-std::string gather_shader_name(Dtype value_dtype, Dtype index_dtype) {
-  auto value_suffix = dtype_suffix(value_dtype);
-  auto index_suffix = gather_index_suffix(index_dtype);
-  if (value_suffix.empty() || index_suffix.empty()) {
-    return {};
+#define MLX_VK_BINARY_CASE(OP, A, B, O, RTE, SHADER)              \
+  if (op == BinaryShaderOp::OP && a_dtype == A && b_dtype == B && \
+      out_dtype == O && rte == RTE) {                             \
+    return vulkan::StaticShaderId::SHADER;                        \
   }
-  return "gather_" + value_suffix + "_" + index_suffix;
+
+#define MLX_VK_FLOAT_BINARY_CASES(OP, PREFIX)                        \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float32, float32, float32, false, PREFIX##_f32_f32_f32)    \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float32, float32, float32, true, PREFIX##_f32_f32_f32_rte) \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float32, float32, float16, false, PREFIX##_f32_f32_f16)    \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float32, float32, float16, true, PREFIX##_f32_f32_f16_rte) \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float32, float16, float32, false, PREFIX##_f32_f16_f32)    \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float32, float16, float32, true, PREFIX##_f32_f16_f32_rte) \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float32, float16, float16, false, PREFIX##_f32_f16_f16)    \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float32, float16, float16, true, PREFIX##_f32_f16_f16_rte) \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float16, float32, float32, false, PREFIX##_f16_f32_f32)    \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float16, float32, float32, true, PREFIX##_f16_f32_f32_rte) \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float16, float32, float16, false, PREFIX##_f16_f32_f16)    \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float16, float32, float16, true, PREFIX##_f16_f32_f16_rte) \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float16, float16, float32, false, PREFIX##_f16_f16_f32)    \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float16, float16, float32, true, PREFIX##_f16_f16_f32_rte) \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float16, float16, float16, false, PREFIX##_f16_f16_f16)    \
+  MLX_VK_BINARY_CASE(                                                \
+      OP, float16, float16, float16, true, PREFIX##_f16_f16_f16_rte)
+
+#define MLX_VK_INTEGER_BINARY_CASES(OP, PREFIX)                               \
+  MLX_VK_BINARY_CASE(OP, int32, int32, int32, false, PREFIX##_i32_i32_i32)    \
+  MLX_VK_BINARY_CASE(OP, int64, int64, int64, false, PREFIX##_i64_i64_i64)    \
+  MLX_VK_BINARY_CASE(OP, uint32, uint32, uint32, false, PREFIX##_u32_u32_u32) \
+  MLX_VK_BINARY_CASE(OP, uint64, uint64, uint64, false, PREFIX##_u64_u64_u64)
+
+std::optional<vulkan::StaticShaderId> binary_shader_id(
+    BinaryShaderOp op,
+    Dtype a_dtype,
+    Dtype b_dtype,
+    Dtype out_dtype,
+    bool rte) {
+  MLX_VK_FLOAT_BINARY_CASES(Add, add);
+  MLX_VK_FLOAT_BINARY_CASES(Divide, div);
+  MLX_VK_FLOAT_BINARY_CASES(Maximum, maximum);
+  MLX_VK_FLOAT_BINARY_CASES(Minimum, minimum);
+  MLX_VK_FLOAT_BINARY_CASES(Multiply, mul);
+  MLX_VK_FLOAT_BINARY_CASES(Subtract, sub);
+
+  MLX_VK_INTEGER_BINARY_CASES(Add, add);
+  MLX_VK_INTEGER_BINARY_CASES(Divide, div);
+  MLX_VK_INTEGER_BINARY_CASES(Maximum, maximum);
+  MLX_VK_INTEGER_BINARY_CASES(Minimum, minimum);
+  MLX_VK_INTEGER_BINARY_CASES(Multiply, mul);
+  MLX_VK_INTEGER_BINARY_CASES(Subtract, sub);
+
+  MLX_VK_BINARY_CASE(
+      GreaterEqual, float32, float32, uint8, false, greater_equal_f32_f32_u8);
+  MLX_VK_BINARY_CASE(
+      GreaterEqual, float32, float16, uint8, false, greater_equal_f32_f16_u8);
+  MLX_VK_BINARY_CASE(
+      GreaterEqual, float16, float32, uint8, false, greater_equal_f16_f32_u8);
+  MLX_VK_BINARY_CASE(
+      GreaterEqual, float16, float16, uint8, false, greater_equal_f16_f16_u8);
+  MLX_VK_BINARY_CASE(
+      GreaterEqual, int32, int32, uint8, false, greater_equal_i32_i32_u8);
+  MLX_VK_BINARY_CASE(
+      GreaterEqual, int64, int64, uint8, false, greater_equal_i64_i64_u8);
+  MLX_VK_BINARY_CASE(
+      GreaterEqual, uint32, uint32, uint8, false, greater_equal_u32_u32_u8);
+  MLX_VK_BINARY_CASE(
+      GreaterEqual, uint64, uint64, uint8, false, greater_equal_u64_u64_u8);
+
+  MLX_VK_BINARY_CASE(Maximum, uint32, uint32, uint8, false, maximum_u32_u32_u8);
+  return std::nullopt;
 }
 
-std::string gather_axis_shader_name(Dtype value_dtype, Dtype index_dtype) {
-  auto value_suffix = dtype_suffix(value_dtype);
-  auto index_suffix = gather_index_suffix(index_dtype);
-  if (value_suffix.empty() || index_suffix.empty()) {
-    return {};
+#undef MLX_VK_INTEGER_BINARY_CASES
+#undef MLX_VK_FLOAT_BINARY_CASES
+#undef MLX_VK_BINARY_CASE
+
+#define MLX_VK_GENERIC_UNARY_CASE(OP, DTYPE, RTE, SHADER)               \
+  if (op == GenericUnaryShaderOp::OP && dtype == DTYPE && rte == RTE) { \
+    return vulkan::StaticShaderId::SHADER;                              \
   }
-  return "gather_axis_" + value_suffix + "_" + index_suffix;
+
+std::optional<vulkan::StaticShaderId>
+generic_unary_shader_id(GenericUnaryShaderOp op, Dtype dtype, bool rte) {
+  MLX_VK_GENERIC_UNARY_CASE(Abs, float32, false, abs_f32);
+  MLX_VK_GENERIC_UNARY_CASE(Abs, float16, false, abs_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Ceil, float32, false, ceil_f32);
+  MLX_VK_GENERIC_UNARY_CASE(Ceil, float16, false, ceil_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Exp, float32, false, exp_f32);
+  MLX_VK_GENERIC_UNARY_CASE(Exp, float16, false, exp_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Exp, float16, true, exp_f16_rte);
+  MLX_VK_GENERIC_UNARY_CASE(Floor, float32, false, floor_f32);
+  MLX_VK_GENERIC_UNARY_CASE(Floor, float16, false, floor_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Negative, float32, false, neg_f32);
+  MLX_VK_GENERIC_UNARY_CASE(Negative, float16, false, neg_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Round, float32, false, round_f32);
+  MLX_VK_GENERIC_UNARY_CASE(Round, float16, false, round_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Sigmoid, float32, false, sigmoid_f32);
+  MLX_VK_GENERIC_UNARY_CASE(Sigmoid, float16, false, sigmoid_f16);
+  MLX_VK_GENERIC_UNARY_CASE(Tanh, float32, false, tanh_f32);
+  MLX_VK_GENERIC_UNARY_CASE(Tanh, float16, false, tanh_f16);
+  return std::nullopt;
 }
 
-std::string scatter_axis_shader_name(Dtype value_dtype, Dtype index_dtype) {
-  auto value_suffix = dtype_suffix(value_dtype);
-  auto index_suffix = gather_index_suffix(index_dtype);
-  if (value_suffix.empty() || index_suffix.empty()) {
-    return {};
+#undef MLX_VK_GENERIC_UNARY_CASE
+
+#define MLX_VK_UNARY_CASE(OP, DTYPE, SHADER)       \
+  if (op == UnaryShaderOp::OP && dtype == DTYPE) { \
+    return vulkan::StaticShaderId::SHADER;         \
   }
-  return "scatter_axis_" + value_suffix + "_" + index_suffix;
+
+std::optional<vulkan::StaticShaderId> unary_shader_id(
+    UnaryShaderOp op,
+    Dtype dtype) {
+  MLX_VK_UNARY_CASE(Cos, float32, cos_f32);
+  MLX_VK_UNARY_CASE(Erf, float32, erf_f32);
+  MLX_VK_UNARY_CASE(ErfInv, float32, erfinv_f32);
+  MLX_VK_UNARY_CASE(Log, float32, log_f32);
+  MLX_VK_UNARY_CASE(Log, float16, log_f16_rte);
+  MLX_VK_UNARY_CASE(Sin, float32, sin_f32);
+  MLX_VK_UNARY_CASE(Square, float32, sqr_f32);
+  MLX_VK_UNARY_CASE(Square, float16, sqr_f16);
+  MLX_VK_UNARY_CASE(Square, bfloat16, sqr_f32);
+  MLX_VK_UNARY_CASE(Square, complex64, sqr_c64);
+  MLX_VK_UNARY_CASE(Sqrt, float32, sqrt_f32);
+  MLX_VK_UNARY_CASE(Sqrt, float16, sqrt_f16);
+  MLX_VK_UNARY_CASE(Sqrt, bfloat16, sqrt_f32);
+  MLX_VK_UNARY_CASE(Sqrt, complex64, sqrt_c64);
+  MLX_VK_UNARY_CASE(Rsqrt, float32, rsqrt_f32);
+  MLX_VK_UNARY_CASE(Rsqrt, float16, rsqrt_f16);
+  MLX_VK_UNARY_CASE(Rsqrt, bfloat16, rsqrt_f32);
+  MLX_VK_UNARY_CASE(Rsqrt, complex64, rsqrt_c64);
+  return std::nullopt;
 }
+
+#undef MLX_VK_UNARY_CASE
+
+#define MLX_VK_GATHER_CASE(VALUE, INDEX, SHADER)      \
+  if (value_dtype == VALUE && index_dtype == INDEX) { \
+    return vulkan::StaticShaderId::SHADER;            \
+  }
+
+std::optional<vulkan::StaticShaderId> gather_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype) {
+  MLX_VK_GATHER_CASE(float32, int32, gather_f32_i32);
+  MLX_VK_GATHER_CASE(float16, int32, gather_f16_i32);
+  MLX_VK_GATHER_CASE(bfloat16, int32, gather_bf16_i32);
+  MLX_VK_GATHER_CASE(int32, int32, gather_i32_i32);
+  MLX_VK_GATHER_CASE(uint32, int32, gather_u32_i32);
+  MLX_VK_GATHER_CASE(float32, int64, gather_f32_i64);
+  MLX_VK_GATHER_CASE(float16, int64, gather_f16_i64);
+  MLX_VK_GATHER_CASE(bfloat16, int64, gather_bf16_i64);
+  MLX_VK_GATHER_CASE(int32, int64, gather_i32_i64);
+  MLX_VK_GATHER_CASE(uint32, int64, gather_u32_i64);
+  MLX_VK_GATHER_CASE(float32, uint32, gather_f32_u32);
+  MLX_VK_GATHER_CASE(float16, uint32, gather_f16_u32);
+  MLX_VK_GATHER_CASE(bfloat16, uint32, gather_bf16_u32);
+  MLX_VK_GATHER_CASE(int32, uint32, gather_i32_u32);
+  MLX_VK_GATHER_CASE(uint32, uint32, gather_u32_u32);
+  MLX_VK_GATHER_CASE(float32, uint64, gather_f32_u64);
+  MLX_VK_GATHER_CASE(float16, uint64, gather_f16_u64);
+  MLX_VK_GATHER_CASE(bfloat16, uint64, gather_bf16_u64);
+  MLX_VK_GATHER_CASE(int32, uint64, gather_i32_u64);
+  MLX_VK_GATHER_CASE(uint32, uint64, gather_u32_u64);
+  return std::nullopt;
+}
+
+std::optional<vulkan::StaticShaderId> gather_axis_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype) {
+  MLX_VK_GATHER_CASE(float32, int32, gather_axis_f32_i32);
+  MLX_VK_GATHER_CASE(float16, int32, gather_axis_f16_i32);
+  MLX_VK_GATHER_CASE(bfloat16, int32, gather_axis_bf16_i32);
+  MLX_VK_GATHER_CASE(int32, int32, gather_axis_i32_i32);
+  MLX_VK_GATHER_CASE(uint32, int32, gather_axis_u32_i32);
+  MLX_VK_GATHER_CASE(float32, int64, gather_axis_f32_i64);
+  MLX_VK_GATHER_CASE(float16, int64, gather_axis_f16_i64);
+  MLX_VK_GATHER_CASE(bfloat16, int64, gather_axis_bf16_i64);
+  MLX_VK_GATHER_CASE(int32, int64, gather_axis_i32_i64);
+  MLX_VK_GATHER_CASE(uint32, int64, gather_axis_u32_i64);
+  MLX_VK_GATHER_CASE(float32, uint32, gather_axis_f32_u32);
+  MLX_VK_GATHER_CASE(float16, uint32, gather_axis_f16_u32);
+  MLX_VK_GATHER_CASE(bfloat16, uint32, gather_axis_bf16_u32);
+  MLX_VK_GATHER_CASE(int32, uint32, gather_axis_i32_u32);
+  MLX_VK_GATHER_CASE(uint32, uint32, gather_axis_u32_u32);
+  MLX_VK_GATHER_CASE(float32, uint64, gather_axis_f32_u64);
+  MLX_VK_GATHER_CASE(float16, uint64, gather_axis_f16_u64);
+  MLX_VK_GATHER_CASE(bfloat16, uint64, gather_axis_bf16_u64);
+  MLX_VK_GATHER_CASE(int32, uint64, gather_axis_i32_u64);
+  MLX_VK_GATHER_CASE(uint32, uint64, gather_axis_u32_u64);
+  return std::nullopt;
+}
+
+std::optional<vulkan::StaticShaderId> scatter_axis_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype) {
+  MLX_VK_GATHER_CASE(float32, int32, scatter_axis_f32_i32);
+  MLX_VK_GATHER_CASE(float16, int32, scatter_axis_f16_i32);
+  MLX_VK_GATHER_CASE(bfloat16, int32, scatter_axis_bf16_i32);
+  MLX_VK_GATHER_CASE(int32, int32, scatter_axis_i32_i32);
+  MLX_VK_GATHER_CASE(uint32, int32, scatter_axis_u32_i32);
+  MLX_VK_GATHER_CASE(float32, int64, scatter_axis_f32_i64);
+  MLX_VK_GATHER_CASE(float16, int64, scatter_axis_f16_i64);
+  MLX_VK_GATHER_CASE(bfloat16, int64, scatter_axis_bf16_i64);
+  MLX_VK_GATHER_CASE(int32, int64, scatter_axis_i32_i64);
+  MLX_VK_GATHER_CASE(uint32, int64, scatter_axis_u32_i64);
+  MLX_VK_GATHER_CASE(float32, uint32, scatter_axis_f32_u32);
+  MLX_VK_GATHER_CASE(float16, uint32, scatter_axis_f16_u32);
+  MLX_VK_GATHER_CASE(bfloat16, uint32, scatter_axis_bf16_u32);
+  MLX_VK_GATHER_CASE(int32, uint32, scatter_axis_i32_u32);
+  MLX_VK_GATHER_CASE(uint32, uint32, scatter_axis_u32_u32);
+  MLX_VK_GATHER_CASE(float32, uint64, scatter_axis_f32_u64);
+  MLX_VK_GATHER_CASE(float16, uint64, scatter_axis_f16_u64);
+  MLX_VK_GATHER_CASE(bfloat16, uint64, scatter_axis_bf16_u64);
+  MLX_VK_GATHER_CASE(int32, uint64, scatter_axis_i32_u64);
+  MLX_VK_GATHER_CASE(uint32, uint64, scatter_axis_u32_u64);
+  return std::nullopt;
+}
+
+#undef MLX_VK_GATHER_CASE
 
 bool is_supported_elementwise_layout(const array& arr) {
   if (arr.ndim() > 4 || !arr.flags().row_contiguous || arr.offset() != 0) {

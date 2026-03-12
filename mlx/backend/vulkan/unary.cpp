@@ -10,7 +10,7 @@ template <typename Primitive>
 bool try_eval_unary_op_vulkan(
     const std::vector<array>& inputs,
     array& out,
-    const std::string& shader_name,
+    vulkan::StaticShaderId shader_id,
     Stream s,
     float param1 = 0.0f,
     float param2 = 0.0f) {
@@ -62,7 +62,7 @@ bool try_eval_unary_op_vulkan(
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_unary_op(
-        in, out_work, shader_name, command_buffer, s, param1, param2);
+        in, out_work, shader_id, command_buffer, s, param1, param2);
     vulkan::end_command_recording(s.index);
     if (staged_output || use_f32_staging_io) {
       copy_gpu(out_work, out, CopyType::General, s);
@@ -71,8 +71,8 @@ bool try_eval_unary_op_vulkan(
   } catch (const std::runtime_error& e) {
     if (trace_fallback_enabled()) {
       std::ostringstream oss;
-      oss << "unary_dispatch_failed shader=" << shader_name
-          << " reason=" << e.what();
+      oss << "unary_dispatch_failed shader="
+          << vulkan::static_shader_name(shader_id) << " reason=" << e.what();
       trace_fallback(oss.str());
     }
     return false;
@@ -83,14 +83,15 @@ template <typename Primitive>
 void eval_unary_vulkan(
     const std::vector<array>& inputs,
     array& out,
-    const std::string& shader_name,
+    vulkan::StaticShaderId shader_id,
     Stream s,
     float param1 = 0.0f,
     float param2 = 0.0f) {
   if (!try_eval_unary_op_vulkan<Primitive>(
-          inputs, out, shader_name, s, param1, param2)) {
+          inputs, out, shader_id, s, param1, param2)) {
     throw std::runtime_error(
-        std::string("Unary operation ") + shader_name +
+        std::string("Unary operation ") +
+        vulkan::static_shader_name(shader_id) +
         " failed on Vulkan (unsupported dtype or layout).");
   }
 }
@@ -99,7 +100,7 @@ template <typename Primitive>
 bool try_eval_generic_unary_op_vulkan(
     const std::vector<array>& inputs,
     array& out,
-    const std::string& shader_name,
+    vulkan::StaticShaderId shader_id,
     Stream s,
     float param1 = 0.0f,
     float param2 = 0.0f,
@@ -154,7 +155,7 @@ bool try_eval_generic_unary_op_vulkan(
     vulkan::dispatch_generic_unary_op(
         in,
         out_work,
-        shader_name,
+        shader_id,
         command_buffer,
         s,
         param1,
@@ -169,8 +170,8 @@ bool try_eval_generic_unary_op_vulkan(
   } catch (const std::runtime_error& e) {
     if (trace_fallback_enabled()) {
       std::ostringstream oss;
-      oss << "generic_unary_dispatch_failed shader=" << shader_name
-          << " reason=" << e.what();
+      oss << "generic_unary_dispatch_failed shader="
+          << vulkan::static_shader_name(shader_id) << " reason=" << e.what();
       trace_fallback(oss.str());
     }
     return false;
@@ -181,16 +182,17 @@ template <typename Primitive>
 void eval_generic_unary_vulkan(
     const std::vector<array>& inputs,
     array& out,
-    const std::string& shader_name,
+    vulkan::StaticShaderId shader_id,
     Stream s,
     float param1 = 0.0f,
     float param2 = 0.0f,
     float param3 = 0.0f,
     float param4 = 0.0f) {
   if (!try_eval_generic_unary_op_vulkan<Primitive>(
-          inputs, out, shader_name, s, param1, param2, param3, param4)) {
+          inputs, out, shader_id, s, param1, param2, param3, param4)) {
     throw std::runtime_error(
-        std::string("Unary operation ") + shader_name +
+        std::string("Unary operation ") +
+        vulkan::static_shader_name(shader_id) +
         " failed on Vulkan (unsupported dtype or layout).");
   }
 }
@@ -199,26 +201,20 @@ template <typename Primitive>
 void eval_generic_unary_suffix_vulkan(
     const std::vector<array>& inputs,
     array& out,
-    std::string_view op_name,
+    GenericUnaryShaderOp op,
     Stream s,
     bool f16_with_rte = false) {
   if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
-    auto suffix = dtype_suffix(out.dtype());
-    if (out.dtype() == bfloat16) {
-      suffix = "f32";
-    }
-    if (!suffix.empty()) {
-      std::string shader_name = std::string(op_name) + "_" + suffix;
-      if (f16_with_rte && out.dtype() == float16) {
-        shader_name += "_rte";
-      }
-      eval_generic_unary_vulkan<Primitive>(inputs, out, shader_name, s);
+    Dtype shader_dtype = out.dtype() == bfloat16 ? float32 : out.dtype();
+    auto shader_id = generic_unary_shader_id(
+        op, shader_dtype, f16_with_rte && out.dtype() == float16);
+    if (shader_id.has_value()) {
+      eval_generic_unary_vulkan<Primitive>(inputs, out, *shader_id, s);
       return;
     }
   }
   throw std::runtime_error(
-      std::string("Unary operation ") + std::string(op_name) +
-      " failed on Vulkan (unsupported dtype or layout).");
+      "Unary operation failed on Vulkan (unsupported dtype or layout).");
 }
 
 } // namespace
@@ -235,20 +231,21 @@ void eval_generic_unary_suffix_vulkan(
   }
 
 // Generic unary ops
-VULKAN_GENERIC_UNARY_GPU(Abs, "abs")
-VULKAN_GENERIC_UNARY_GPU(Ceil, "ceil")
-VULKAN_GENERIC_UNARY_RTE_GPU(Exp, "exp")
-VULKAN_GENERIC_UNARY_GPU(Floor, "floor")
-VULKAN_GENERIC_UNARY_GPU(Negative, "neg")
-VULKAN_GENERIC_UNARY_GPU(Round, "round")
-VULKAN_GENERIC_UNARY_GPU(Sigmoid, "sigmoid")
-VULKAN_GENERIC_UNARY_GPU(Tanh, "tanh")
+VULKAN_GENERIC_UNARY_GPU(Abs, GenericUnaryShaderOp::Abs)
+VULKAN_GENERIC_UNARY_GPU(Ceil, GenericUnaryShaderOp::Ceil)
+VULKAN_GENERIC_UNARY_RTE_GPU(Exp, GenericUnaryShaderOp::Exp)
+VULKAN_GENERIC_UNARY_GPU(Floor, GenericUnaryShaderOp::Floor)
+VULKAN_GENERIC_UNARY_GPU(Negative, GenericUnaryShaderOp::Negative)
+VULKAN_GENERIC_UNARY_GPU(Round, GenericUnaryShaderOp::Round)
+VULKAN_GENERIC_UNARY_GPU(Sigmoid, GenericUnaryShaderOp::Sigmoid)
+VULKAN_GENERIC_UNARY_GPU(Tanh, GenericUnaryShaderOp::Tanh)
 
 // Specialized unary ops
 void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
       out.dtype() == float32) {
-    if (try_eval_unary_op_vulkan<Cos>(inputs, out, "cos_f32", stream())) {
+    if (try_eval_unary_op_vulkan<Cos>(
+            inputs, out, vulkan::StaticShaderId::cos_f32, stream())) {
       return;
     }
   }
@@ -259,7 +256,8 @@ void Cos::eval_gpu(const std::vector<array>& inputs, array& out) {
 void Erf::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
       out.dtype() == float32) {
-    if (try_eval_unary_op_vulkan<Erf>(inputs, out, "erf_f32", stream())) {
+    if (try_eval_unary_op_vulkan<Erf>(
+            inputs, out, vulkan::StaticShaderId::erf_f32, stream())) {
       return;
     }
   }
@@ -270,7 +268,8 @@ void Erf::eval_gpu(const std::vector<array>& inputs, array& out) {
 void ErfInv::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
       out.dtype() == float32) {
-    if (try_eval_unary_op_vulkan<ErfInv>(inputs, out, "erfinv_f32", stream())) {
+    if (try_eval_unary_op_vulkan<ErfInv>(
+            inputs, out, vulkan::StaticShaderId::erfinv_f32, stream())) {
       return;
     }
   }
@@ -280,13 +279,10 @@ void ErfInv::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
-    if (state() == Log::e && out.dtype() == float32) {
-      if (try_eval_unary_op_vulkan<Log>(inputs, out, "log_f32", stream())) {
-        return;
-      }
-    }
-    if (state() == Log::e && out.dtype() == float16) {
-      if (try_eval_unary_op_vulkan<Log>(inputs, out, "log_f16_rte", stream())) {
+    if (state() == Log::e) {
+      auto shader_id = unary_shader_id(UnaryShaderOp::Log, out.dtype());
+      if (shader_id.has_value() &&
+          try_eval_unary_op_vulkan<Log>(inputs, out, *shader_id, stream())) {
         return;
       }
     }
@@ -298,7 +294,8 @@ void Log::eval_gpu(const std::vector<array>& inputs, array& out) {
 void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 && inputs[0].dtype() == float32 &&
       out.dtype() == float32) {
-    if (try_eval_unary_op_vulkan<Sin>(inputs, out, "sin_f32", stream())) {
+    if (try_eval_unary_op_vulkan<Sin>(
+            inputs, out, vulkan::StaticShaderId::sin_f32, stream())) {
       return;
     }
   }
@@ -308,16 +305,9 @@ void Sin::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 void Square::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (inputs.size() == 1 && inputs[0].dtype() == out.dtype()) {
-    if (out.dtype() == float32 || out.dtype() == bfloat16) {
-      eval_unary_vulkan<Square>(inputs, out, "sqr_f32", stream());
-      return;
-    }
-    if (out.dtype() == float16) {
-      eval_unary_vulkan<Square>(inputs, out, "sqr_f16", stream());
-      return;
-    }
-    if (out.dtype() == complex64) {
-      eval_unary_vulkan<Square>(inputs, out, "sqr_c64", stream());
+    auto shader_id = unary_shader_id(UnaryShaderOp::Square, out.dtype());
+    if (shader_id.has_value()) {
+      eval_unary_vulkan<Square>(inputs, out, *shader_id, stream());
       return;
     }
   }
@@ -330,14 +320,12 @@ void Sqrt::eval_gpu(const std::vector<array>& inputs, array& out) {
       (inputs[0].dtype() == float32 || inputs[0].dtype() == bfloat16 ||
        inputs[0].dtype() == float16 || inputs[0].dtype() == complex64) &&
       out.dtype() == inputs[0].dtype()) {
-    const char* shader = state() ? "rsqrt_f32" : "sqrt_f32";
-    if (out.dtype() == complex64) {
-      shader = state() ? "rsqrt_c64" : "sqrt_c64";
-    } else if (out.dtype() == float16) {
-      shader = state() ? "rsqrt_f16" : "sqrt_f16";
+    auto shader_id = unary_shader_id(
+        state() ? UnaryShaderOp::Rsqrt : UnaryShaderOp::Sqrt, out.dtype());
+    if (shader_id.has_value()) {
+      eval_unary_vulkan<Sqrt>(inputs, out, *shader_id, stream(), 0.0f, 0.0f);
+      return;
     }
-    eval_unary_vulkan<Sqrt>(inputs, out, shader, stream(), 0.0f, 0.0f);
-    return;
   }
   throw std::runtime_error(
       "Sqrt operation failed on Vulkan (unsupported dtype or layout).");

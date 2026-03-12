@@ -137,15 +137,13 @@ bool try_eval_reduce_sum_rows_vulkan(
     } else {
       try {
         auto command_buffer = vulkan::begin_command_recording(s.index);
+        const auto shader_id = sum_reduce
+            ? vulkan::StaticShaderId::sum_rows_f32
+            : (reduce_type == Reduce::And
+                   ? vulkan::StaticShaderId::all_rows_u8
+                   : vulkan::StaticShaderId::any_rows_u8);
         vulkan::dispatch_sum_rows_op(
-            in_kernel,
-            out_work,
-            sum_reduce
-                ? "sum_rows_f32"
-                : (reduce_type == Reduce::And ? "all_rows_u8" : "any_rows_u8"),
-            command_buffer,
-            s,
-            1.0f);
+            in_kernel, out_work, shader_id, command_buffer, s, 1.0f);
         vulkan::end_command_recording(s.index);
       } catch (const std::runtime_error&) {
         return false;
@@ -271,12 +269,11 @@ bool try_eval_arg_reduce_vulkan(
 
   try {
     auto command_buffer = vulkan::begin_command_recording(s.index);
+    const auto shader_id = reduce_type == ArgReduce::ArgMin
+        ? vulkan::StaticShaderId::argmin_f32
+        : vulkan::StaticShaderId::argmax_f32;
     vulkan::dispatch_argmax_op(
-        in_kernel,
-        out_work,
-        reduce_type == ArgReduce::ArgMin ? "argmin_f32" : "argmax_f32",
-        command_buffer,
-        s);
+        in_kernel, out_work, shader_id, command_buffer, s);
     vulkan::end_command_recording(s.index);
     if (staged_output) {
       copy_gpu(out_work, kernel_out, CopyType::GeneralGeneral, s);

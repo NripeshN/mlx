@@ -7,6 +7,7 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <string_view>
 #include <tuple>
@@ -61,9 +62,59 @@ uint32_t checked_product_u32(const Shape& shape, const char* name);
 bool is_vulkan_float_dtype(Dtype dtype);
 std::string dtype_suffix(Dtype dtype);
 std::string gather_index_suffix(Dtype dtype);
-std::string gather_shader_name(Dtype value_dtype, Dtype index_dtype);
-std::string gather_axis_shader_name(Dtype value_dtype, Dtype index_dtype);
-std::string scatter_axis_shader_name(Dtype value_dtype, Dtype index_dtype);
+
+enum class BinaryShaderOp {
+  Add,
+  Divide,
+  GreaterEqual,
+  Maximum,
+  Minimum,
+  Multiply,
+  Subtract,
+};
+
+enum class GenericUnaryShaderOp {
+  Abs,
+  Ceil,
+  Exp,
+  Floor,
+  Negative,
+  Round,
+  Sigmoid,
+  Tanh,
+};
+
+enum class UnaryShaderOp {
+  Cos,
+  Erf,
+  ErfInv,
+  Log,
+  Sin,
+  Square,
+  Sqrt,
+  Rsqrt,
+};
+
+std::optional<vulkan::StaticShaderId> binary_shader_id(
+    BinaryShaderOp op,
+    Dtype a_dtype,
+    Dtype b_dtype,
+    Dtype out_dtype,
+    bool rte = false);
+std::optional<vulkan::StaticShaderId>
+generic_unary_shader_id(GenericUnaryShaderOp op, Dtype dtype, bool rte = false);
+std::optional<vulkan::StaticShaderId> unary_shader_id(
+    UnaryShaderOp op,
+    Dtype dtype);
+std::optional<vulkan::StaticShaderId> gather_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype);
+std::optional<vulkan::StaticShaderId> gather_axis_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype);
+std::optional<vulkan::StaticShaderId> scatter_axis_shader_id(
+    Dtype value_dtype,
+    Dtype index_dtype);
 bool is_supported_elementwise_layout(const array& arr);
 bool is_supported_unary_layout(const array& arr);
 bool is_supported_generic_unary_layout(const array& arr);

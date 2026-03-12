@@ -121,9 +121,8 @@ bool try_eval_scatter_vulkan(
       Shape{1, static_cast<int>(index_count), static_cast<int>(slice_size)},
       s);
 
-  const auto shader_name =
-      scatter_axis_shader_name(out.dtype(), idx_flat.dtype());
-  if (shader_name.empty()) {
+  const auto shader_id = scatter_axis_shader_id(out.dtype(), idx_flat.dtype());
+  if (!shader_id.has_value()) {
     return false;
   }
 
@@ -133,7 +132,7 @@ bool try_eval_scatter_vulkan(
         upd_flat,
         idx_flat,
         out_flat,
-        shader_name,
+        *shader_id,
         command_buffer,
         s,
         1,
@@ -190,8 +189,8 @@ bool try_eval_scatter_axis_vulkan(
     return false;
   }
 
-  const auto shader_name = scatter_axis_shader_name(out.dtype(), idx.dtype());
-  if (shader_name.empty()) {
+  const auto shader_id = scatter_axis_shader_id(out.dtype(), idx.dtype());
+  if (!shader_id.has_value()) {
     trace_vulkan_unsupported(
         "ScatterAxis",
         "value/index dtype combination is not supported by Vulkan scatter_axis");
@@ -278,7 +277,7 @@ bool try_eval_scatter_axis_vulkan(
         upd_flat,
         idx_flat,
         out_flat,
-        shader_name,
+        *shader_id,
         command_buffer,
         s,
         size_pre,

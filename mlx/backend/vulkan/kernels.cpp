@@ -12,6 +12,7 @@
 #include <span>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/vulkan.h"
 
@@ -44,29 +45,10 @@ void trace_descriptor_epochs(const std::string& msg) {
   std::cerr << "[vulkan-descriptor] " << msg << std::endl;
 }
 
-std::string make_pipeline_key(
-    const std::string& shader_name,
-    const std::vector<VkDescriptorSetLayoutBinding>& bindings,
-    uint32_t push_constant_size,
-    const std::vector<uint32_t>& specialization_constants) {
-  std::ostringstream key;
-  key << shader_name << "|pc=" << push_constant_size
-      << "|n=" << bindings.size();
-  for (const auto& binding : bindings) {
-    key << "|b=" << binding.binding << ",t=" << binding.descriptorType
-        << ",c=" << binding.descriptorCount << ",s=" << binding.stageFlags
-        << ",i=" << (binding.pImmutableSamplers != nullptr ? 1 : 0);
-  }
-  if (!specialization_constants.empty()) {
-    key << "|sc=";
-    for (size_t i = 0; i < specialization_constants.size(); ++i) {
-      if (i != 0) {
-        key << ",";
-      }
-      key << specialization_constants[i];
-    }
-  }
-  return key.str();
+template <typename T>
+void hash_combine(size_t& seed, const T& value) {
+  seed ^=
+      std::hash<T>{}(value) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
 }
 
 const std::vector<uint32_t>& matmul_specialization_constants() {
@@ -104,6 +86,19 @@ uint32_t checked_mul_u32(uint32_t a, uint32_t b, const char* name) {
         std::string("[vulkan::kernels] ") + name + " is out of uint32 range.");
   }
   return static_cast<uint32_t>(product);
+}
+
+std::vector<uint32_t> copy_spirv_code(const void* data, size_t size_bytes) {
+  if ((size_bytes % sizeof(uint32_t)) != 0) {
+    throw std::runtime_error(
+        "[vulkan::kernels] SPIR-V payload size must be a multiple of 4 bytes.");
+  }
+
+  std::vector<uint32_t> spirv_code(size_bytes / sizeof(uint32_t));
+  if (!spirv_code.empty()) {
+    std::memcpy(spirv_code.data(), data, size_bytes);
+  }
+  return spirv_code;
 }
 
 struct TensorLayout4D {
@@ -572,11 +567,11 @@ SoftmaxPushConstants make_softmax_push_constants(
   return push_constants;
 }
 
-template <typename PushConstants>
+template <typename PushConstants, size_t N>
 void dispatch_with_spec(
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     KernelSpecId spec_id,
-    std::span<const BoundArray> bound_arrays,
+    const std::array<BoundArray, N>& bound_arrays,
     const PushConstants& push_constants,
     uint32_t num_elements,
     VkCommandBuffer cmd_buffer,
@@ -603,7 +598,7 @@ void dispatch_with_spec(
 
   auto& manager = KernelManager::get();
   auto* pipeline = manager.get_pipeline(
-      shader_name,
+      shader_id,
       bindings,
       static_cast<uint32_t>(sizeof(PushConstants)),
       specialization_constants);
@@ -705,6 +700,8 @@ ComputePipeline::~ComputePipeline() {
   }
 }
 
+KernelManager::KernelManager() : static_shaders_(kStaticShaderCount) {}
+
 KernelManager::~KernelManager() {
   cleanup();
 }
@@ -714,18 +711,110 @@ KernelManager& KernelManager::get() {
   return *manager;
 }
 
+void KernelManager::initialize_static_registry() {
+  ensure_static_registry_initialized();
+}
+
+size_t KernelManager::PipelineKeyHash::operator()(
+    const PipelineKey& key) const {
+  size_t seed = 0;
+  hash_combine(seed, key.is_dynamic);
+  hash_combine(seed, static_cast<uint32_t>(key.static_shader_id));
+  hash_combine(seed, key.dynamic_shader_name);
+  hash_combine(seed, key.push_constant_size);
+  for (const auto& binding : key.bindings) {
+    hash_combine(seed, binding.binding);
+    hash_combine(seed, binding.descriptor_type);
+    hash_combine(seed, binding.descriptor_count);
+    hash_combine(seed, binding.stage_flags);
+    hash_combine(seed, binding.has_immutable_samplers);
+  }
+  for (uint32_t value : key.specialization_constants) {
+    hash_combine(seed, value);
+  }
+  return seed;
+}
+
+KernelManager::DescriptorBindingKey KernelManager::make_descriptor_binding_key(
+    const VkDescriptorSetLayoutBinding& binding) {
+  return {
+      binding.binding,
+      static_cast<uint32_t>(binding.descriptorType),
+      binding.descriptorCount,
+      binding.stageFlags,
+      binding.pImmutableSamplers != nullptr,
+  };
+}
+
+void KernelManager::register_static_shader(
+    StaticShaderId id,
+    const void* data,
+    size_t size_bytes) {
+  const size_t index = static_cast<size_t>(id);
+  auto& shader = static_shaders_[index];
+  if (!shader) {
+    shader = std::make_unique<ShaderModule>();
+  } else if (shader->module != VK_NULL_HANDLE) {
+    vkDestroyShaderModule(
+        VulkanContext::get().device(), shader->module, nullptr);
+  }
+  shader->debug_name = static_shader_name(id);
+  shader->spirv_code = copy_spirv_code(data, size_bytes);
+  shader->compiled = false;
+  shader->module = VK_NULL_HANDLE;
+}
+
 void KernelManager::register_shader(
     const std::string& name,
     const void* data,
     size_t size_bytes) {
-  auto& shader = shaders_[name];
+  auto& shader = dynamic_shaders_[name];
   if (!shader) {
     shader = std::make_unique<ShaderModule>();
+  } else if (shader->module != VK_NULL_HANDLE) {
+    vkDestroyShaderModule(
+        VulkanContext::get().device(), shader->module, nullptr);
   }
-  // Convert bytes to uint32_t words (SPIR-V is word-based)
-  size_t num_words = size_bytes / sizeof(uint32_t);
-  const uint32_t* words = static_cast<const uint32_t*>(data);
-  shader->spirv_code.assign(words, words + num_words);
+
+  std::unordered_set<VkDescriptorSetLayout, VulkanHandleHash> evicted_layouts;
+  for (const auto& [key, pipeline] : pipelines_) {
+    if (!key.is_dynamic || key.dynamic_shader_name != name ||
+        pipeline == nullptr || pipeline->descriptor_layout == VK_NULL_HANDLE) {
+      continue;
+    }
+    evicted_layouts.insert(pipeline->descriptor_layout);
+  }
+  purge_descriptor_sets_for_layouts(evicted_layouts);
+
+  for (auto it = pipelines_.begin(); it != pipelines_.end();) {
+    if (it->first.is_dynamic && it->first.dynamic_shader_name == name) {
+      it = pipelines_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  shader->debug_name = name;
+  shader->spirv_code = copy_spirv_code(data, size_bytes);
+  shader->compiled = false;
+  shader->module = VK_NULL_HANDLE;
+}
+
+void KernelManager::ensure_static_registry_initialized() {
+  if (static_registry_initialized_) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(static_registry_mutex_);
+  if (static_registry_initialized_) {
+    return;
+  }
+
+  const auto registry = make_static_shader_registry();
+  for (const auto& record : registry) {
+    register_static_shader(record.id, record.data, record.len);
+  }
+  static_registry_initialized_ = true;
 }
 
 VkShaderModule KernelManager::compile_shader(
@@ -746,9 +835,29 @@ VkShaderModule KernelManager::compile_shader(
   return module;
 }
 
+ShaderModule* KernelManager::get_shader(StaticShaderId id) {
+  ensure_static_registry_initialized();
+
+  const size_t index = static_cast<size_t>(id);
+  if (index >= static_shaders_.size()) {
+    return nullptr;
+  }
+
+  auto* shader = static_shaders_[index].get();
+  if (shader == nullptr) {
+    return nullptr;
+  }
+  if (!shader->compiled) {
+    shader->module = compile_shader(shader->spirv_code);
+    shader->compiled = true;
+  }
+
+  return shader;
+}
+
 ShaderModule* KernelManager::get_shader(const std::string& name) {
-  auto it = shaders_.find(name);
-  if (it == shaders_.end()) {
+  auto it = dynamic_shaders_.find(name);
+  if (it == dynamic_shaders_.end()) {
     return nullptr;
   }
 
@@ -762,12 +871,143 @@ ShaderModule* KernelManager::get_shader(const std::string& name) {
 }
 
 ComputePipeline* KernelManager::get_pipeline(
+    StaticShaderId shader_id,
+    const std::vector<VkDescriptorSetLayoutBinding>& bindings,
+    uint32_t push_constant_size,
+    const std::vector<uint32_t>& specialization_constants) {
+  ensure_static_registry_initialized();
+
+  PipelineKey pipeline_key;
+  pipeline_key.is_dynamic = false;
+  pipeline_key.static_shader_id = shader_id;
+  pipeline_key.push_constant_size = push_constant_size;
+  pipeline_key.specialization_constants = specialization_constants;
+  pipeline_key.bindings.reserve(bindings.size());
+  for (const auto& binding : bindings) {
+    pipeline_key.bindings.push_back(make_descriptor_binding_key(binding));
+  }
+
+  auto it = pipelines_.find(pipeline_key);
+  if (it != pipelines_.end()) {
+    return it->second.get();
+  }
+
+  VkDevice device = VulkanContext::get().device();
+  ShaderModule* shader = get_shader(shader_id);
+  if (!shader) {
+    throw std::runtime_error(
+        std::string("Shader not found: ") + static_shader_name(shader_id));
+  }
+
+  VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
+  if (!bindings.empty()) {
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+    layoutInfo.pBindings = bindings.data();
+
+    if (vkCreateDescriptorSetLayout(
+            device, &layoutInfo, nullptr, &descriptor_layout) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to create descriptor set layout");
+    }
+  }
+
+  VkPipelineLayout pipeline_layout;
+  VkPushConstantRange push_constant_range{};
+
+  if (push_constant_size > 0) {
+    push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    push_constant_range.offset = 0;
+    push_constant_range.size = push_constant_size;
+  }
+
+  VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+  pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  if (descriptor_layout != VK_NULL_HANDLE) {
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &descriptor_layout;
+  }
+  if (push_constant_size > 0) {
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &push_constant_range;
+  }
+
+  if (vkCreatePipelineLayout(
+          device, &pipelineLayoutInfo, nullptr, &pipeline_layout) !=
+      VK_SUCCESS) {
+    if (descriptor_layout != VK_NULL_HANDLE) {
+      vkDestroyDescriptorSetLayout(device, descriptor_layout, nullptr);
+    }
+    throw std::runtime_error("Failed to create pipeline layout");
+  }
+
+  VkComputePipelineCreateInfo pipelineInfo{};
+  pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  pipelineInfo.stage.sType =
+      VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  pipelineInfo.stage.module = shader->module;
+  pipelineInfo.stage.pName = "main";
+
+  std::vector<VkSpecializationMapEntry> specialization_entries;
+  VkSpecializationInfo specialization_info{};
+  if (!specialization_constants.empty()) {
+    specialization_entries.reserve(specialization_constants.size());
+    for (uint32_t i = 0; i < specialization_constants.size(); ++i) {
+      VkSpecializationMapEntry entry{};
+      entry.constantID = i;
+      entry.offset = i * sizeof(uint32_t);
+      entry.size = sizeof(uint32_t);
+      specialization_entries.push_back(entry);
+    }
+    specialization_info.mapEntryCount =
+        static_cast<uint32_t>(specialization_entries.size());
+    specialization_info.pMapEntries = specialization_entries.data();
+    specialization_info.dataSize =
+        specialization_constants.size() * sizeof(uint32_t);
+    specialization_info.pData = specialization_constants.data();
+    pipelineInfo.stage.pSpecializationInfo = &specialization_info;
+  }
+
+  pipelineInfo.layout = pipeline_layout;
+
+  VkPipeline pipeline;
+  if (vkCreateComputePipelines(
+          device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline) !=
+      VK_SUCCESS) {
+    vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+    if (descriptor_layout != VK_NULL_HANDLE) {
+      vkDestroyDescriptorSetLayout(device, descriptor_layout, nullptr);
+    }
+    throw std::runtime_error("Failed to create compute pipeline");
+  }
+
+  auto pipeline_ptr = std::make_unique<ComputePipeline>();
+  pipeline_ptr->pipeline = pipeline;
+  pipeline_ptr->layout = pipeline_layout;
+  pipeline_ptr->descriptor_layout = descriptor_layout;
+  pipeline_ptr->push_constant_size = push_constant_size;
+
+  auto* result = pipeline_ptr.get();
+  pipelines_.emplace(std::move(pipeline_key), std::move(pipeline_ptr));
+
+  return result;
+}
+
+ComputePipeline* KernelManager::get_pipeline(
     const std::string& shader_name,
     const std::vector<VkDescriptorSetLayoutBinding>& bindings,
     uint32_t push_constant_size,
     const std::vector<uint32_t>& specialization_constants) {
-  std::string pipeline_key = make_pipeline_key(
-      shader_name, bindings, push_constant_size, specialization_constants);
+  PipelineKey pipeline_key;
+  pipeline_key.is_dynamic = true;
+  pipeline_key.dynamic_shader_name = shader_name;
+  pipeline_key.push_constant_size = push_constant_size;
+  pipeline_key.specialization_constants = specialization_constants;
+  pipeline_key.bindings.reserve(bindings.size());
+  for (const auto& binding : bindings) {
+    pipeline_key.bindings.push_back(make_descriptor_binding_key(binding));
+  }
 
   auto it = pipelines_.find(pipeline_key);
   if (it != pipelines_.end()) {
@@ -875,7 +1115,7 @@ ComputePipeline* KernelManager::get_pipeline(
   pipeline_ptr->push_constant_size = push_constant_size;
 
   auto* result = pipeline_ptr.get();
-  pipelines_[pipeline_key] = std::move(pipeline_ptr);
+  pipelines_.emplace(std::move(pipeline_key), std::move(pipeline_ptr));
 
   return result;
 }
@@ -1198,10 +1438,90 @@ void KernelManager::reclaim_all_descriptor_sets() {
   }
 }
 
+void KernelManager::purge_descriptor_sets_for_layouts(
+    const std::unordered_set<VkDescriptorSetLayout, VulkanHandleHash>&
+        layouts) {
+  if (layouts.empty()) {
+    return;
+  }
+
+  std::vector<VkDescriptorSet> freeable_sets;
+  {
+    std::lock_guard<std::mutex> lock(deferred_descriptor_sets_mutex_);
+    for (auto deferred_it = deferred_descriptor_sets_.begin();
+         deferred_it != deferred_descriptor_sets_.end();) {
+      auto& epoch_map = deferred_it->second;
+      for (auto epoch_it = epoch_map.begin(); epoch_it != epoch_map.end();) {
+        auto& records = epoch_it->second;
+        for (auto record_it = records.begin(); record_it != records.end();) {
+          if (record_it->layout != VK_NULL_HANDLE &&
+              layouts.contains(record_it->layout)) {
+            freeable_sets.push_back(record_it->set);
+            record_it = records.erase(record_it);
+          } else {
+            ++record_it;
+          }
+        }
+        if (records.empty()) {
+          epoch_it = epoch_map.erase(epoch_it);
+        } else {
+          ++epoch_it;
+        }
+      }
+      if (epoch_map.empty()) {
+        deferred_it = deferred_descriptor_sets_.erase(deferred_it);
+      } else {
+        ++deferred_it;
+      }
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
+    for (auto layout : layouts) {
+      auto reusable_it = reusable_descriptor_sets_.find(layout);
+      if (reusable_it != reusable_descriptor_sets_.end()) {
+        freeable_sets.insert(
+            freeable_sets.end(),
+            reusable_it->second.begin(),
+            reusable_it->second.end());
+        reusable_descriptor_sets_.erase(reusable_it);
+      }
+    }
+
+    for (auto it = descriptor_set_layouts_.begin();
+         it != descriptor_set_layouts_.end();) {
+      if (layouts.contains(it->second)) {
+        it = descriptor_set_layouts_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  if (freeable_sets.empty() || descriptor_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+
+  VkDevice device = VulkanContext::get().device();
+  vkFreeDescriptorSets(
+      device,
+      descriptor_pool_,
+      static_cast<uint32_t>(freeable_sets.size()),
+      freeable_sets.data());
+}
+
 void KernelManager::cleanup() {
   reclaim_all_descriptor_sets();
   pipelines_.clear();
-  shaders_.clear();
+  dynamic_shaders_.clear();
+  {
+    std::lock_guard<std::mutex> lock(static_registry_mutex_);
+    static_registry_initialized_ = false;
+  }
+  for (auto& shader : static_shaders_) {
+    shader.reset();
+  }
 
   if (descriptor_pool_ != VK_NULL_HANDLE) {
     VkDevice device = VulkanContext::get().device();
@@ -1236,7 +1556,7 @@ void dispatch_binary_op(
     const array& a,
     const array& b,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     BinaryDispatchVariant variant,
@@ -1253,7 +1573,7 @@ void dispatch_binary_op(
         {&out, "partial"},
     }};
     dispatch_with_spec(
-        shader_name,
+        shader_id,
         spec_id,
         bound_arrays,
         push_constants,
@@ -1271,7 +1591,7 @@ void dispatch_binary_op(
       {&out, "dst"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       spec_id,
       bound_arrays,
       push_constants,
@@ -1286,7 +1606,7 @@ void dispatch_binary_op(
     const array& a,
     const array& b,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     BinaryDispatchVariant variant,
@@ -1307,7 +1627,7 @@ void dispatch_binary_op(
         {&out, "partial"},
     }};
     dispatch_with_spec(
-        shader_name,
+        shader_id,
         spec_id,
         bound_arrays,
         push_constants,
@@ -1325,7 +1645,7 @@ void dispatch_binary_op(
       {&out, "dst"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       spec_id,
       bound_arrays,
       push_constants,
@@ -1339,7 +1659,7 @@ void dispatch_binary_op(
 void dispatch_unary_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     float param1,
@@ -1351,7 +1671,7 @@ void dispatch_unary_op(
       {&out, "dst"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::Unary,
       bound_arrays,
       push_constants,
@@ -1363,7 +1683,7 @@ void dispatch_unary_op(
 void dispatch_generic_unary_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     float param1,
@@ -1380,7 +1700,7 @@ void dispatch_generic_unary_op(
       {&out, "dst"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::GenericUnary,
       bound_arrays,
       push_constants,
@@ -1391,7 +1711,7 @@ void dispatch_generic_unary_op(
 
 void dispatch_arange_op(
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     float start,
@@ -1402,7 +1722,7 @@ void dispatch_arange_op(
   const std::array<BoundArray, 1> bound_arrays = {{{&out, "dst"}}};
 
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::Arange,
       bound_arrays,
       push_constants,
@@ -1414,7 +1734,7 @@ void dispatch_arange_op(
 void dispatch_sum_rows_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     float weight) {
@@ -1430,7 +1750,7 @@ void dispatch_sum_rows_op(
       {&out, "dst"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::SumRows,
       bound_arrays,
       push_constants,
@@ -1444,7 +1764,7 @@ void dispatch_sum_rows_op(
 void dispatch_argmax_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s) {
   if (out.size() == 0) {
@@ -1468,7 +1788,7 @@ void dispatch_argmax_op(
       {&out, "dst"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::Argmax,
       bound_arrays,
       push_constants,
@@ -1482,7 +1802,7 @@ void dispatch_argmax_op(
 void dispatch_softmax_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s) {
   if (out.size() == 0) {
@@ -1515,7 +1835,7 @@ void dispatch_softmax_op(
       {&out, "dst"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::Softmax,
       bound_arrays,
       push_constants,
@@ -1529,9 +1849,9 @@ void dispatch_softmax_op(
 void dispatch_softmax_large_op(
     const array& in,
     array& out,
-    const std::string& shader_name_pass1,
-    const std::string& shader_name_pass2,
-    const std::string& shader_name_pass3,
+    StaticShaderId shader_id_pass1,
+    StaticShaderId shader_id_pass2,
+    StaticShaderId shader_id_pass3,
     VkCommandBuffer cmd_buffer,
     const Stream& s) {
   if (out.size() == 0) {
@@ -1595,7 +1915,7 @@ void dispatch_softmax_large_op(
   const std::array<uint32_t, 3> grid = {num_workgroups_x, row_count, 1};
 
   dispatch_with_spec(
-      shader_name_pass1,
+      shader_id_pass1,
       KernelSpecId::SoftmaxLarge,
       bound_arrays,
       push_constants,
@@ -1624,7 +1944,7 @@ void dispatch_softmax_large_op(
       nullptr);
 
   dispatch_with_spec(
-      shader_name_pass2,
+      shader_id_pass2,
       KernelSpecId::SoftmaxLarge,
       bound_arrays,
       push_constants,
@@ -1647,7 +1967,7 @@ void dispatch_softmax_large_op(
       nullptr);
 
   dispatch_with_spec(
-      shader_name_pass3,
+      shader_id_pass3,
       KernelSpecId::SoftmaxLarge,
       bound_arrays,
       push_constants,
@@ -1661,7 +1981,7 @@ void dispatch_softmax_large_op(
 void dispatch_diag_mask_inf_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t rows_per_channel,
@@ -1711,7 +2031,7 @@ void dispatch_diag_mask_inf_op(
   };
 
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::DiagMaskInf,
       bound_arrays,
       push_constants,
@@ -1729,7 +2049,7 @@ void dispatch_flash_attention_op(
     const array& sinks,
     array& out,
     const array& mask_opt,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     const FlashAttentionPushConstants& push_constants,
@@ -1745,7 +2065,7 @@ void dispatch_flash_attention_op(
       {&mask_opt, "mask_opt"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::FlashAttention,
       bound_arrays,
       push_constants,
@@ -1760,7 +2080,7 @@ void dispatch_flash_attention_split_k_reduce_op(
     const array& in,
     const array& sinks,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     const FlashAttentionSplitKReducePushConstants& push_constants,
@@ -1772,7 +2092,7 @@ void dispatch_flash_attention_split_k_reduce_op(
       {&out, "dst"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::FlashAttentionSplitKReduce,
       bound_arrays,
       push_constants,
@@ -1787,7 +2107,7 @@ void dispatch_flash_attention_split_k_reduce_op(
 void dispatch_flash_attention_mask_opt_op(
     const array& mask,
     array& mask_opt,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     const FlashAttentionMaskOptPushConstants& push_constants,
@@ -1798,7 +2118,7 @@ void dispatch_flash_attention_mask_opt_op(
       {&mask_opt, "mask_opt"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::FlashAttentionMaskOpt,
       bound_arrays,
       push_constants,
@@ -1813,7 +2133,7 @@ void dispatch_flash_attention_mask_opt_op(
 void dispatch_cumsum_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s) {
   if (out.size() == 0) {
@@ -1851,7 +2171,7 @@ void dispatch_cumsum_op(
         {&out, "dst"},
     }};
     dispatch_with_spec(
-        shader_name,
+        shader_id,
         KernelSpecId::SumRows,
         bound_arrays,
         push_constants,
@@ -1884,7 +2204,7 @@ void dispatch_cumsum_op(
   const std::array<uint32_t, 3> grid = {num_workgroups_x, row_count, 1};
 
   dispatch_with_spec(
-      "cumsum_multipass1_f32",
+      StaticShaderId::cumsum_multipass1_f32,
       KernelSpecId::CumsumMultipass,
       bound_arrays,
       push_constants,
@@ -1913,7 +2233,7 @@ void dispatch_cumsum_op(
       nullptr);
 
   dispatch_with_spec(
-      "cumsum_multipass2_f32",
+      StaticShaderId::cumsum_multipass2_f32,
       KernelSpecId::CumsumMultipass,
       bound_arrays,
       push_constants,
@@ -1928,7 +2248,7 @@ void dispatch_mul_mm_op(
     const array& a,
     const array& b,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     const MatmulPushConstants& push_constants,
@@ -1955,7 +2275,7 @@ void dispatch_mul_mm_op(
   }};
   const uint32_t num_elements = checked_mul_u32(m, n, "mul_mm output elements");
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::Matmul,
       bound_arrays,
       push_constants,
@@ -1970,7 +2290,7 @@ void dispatch_mul_mat_vec_op(
     const array& matrix,
     const array& vec,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s) {
   if (matrix.ndim() != 2 || vec.ndim() != 2 || out.ndim() != 2) {
@@ -2020,7 +2340,7 @@ void dispatch_mul_mat_vec_op(
   const std::array<uint32_t, 3> grid = {groups_x, 1u, groups_z};
 
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::MatVec,
       bound_arrays,
       push_constants,
@@ -2033,7 +2353,7 @@ void dispatch_mul_mat_vec_op(
 void dispatch_random_bits_op(
     const array& keys,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     const RandomBitsPushConstants& push_constants,
@@ -2043,7 +2363,7 @@ void dispatch_random_bits_op(
       {&out, "out"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::RandomBits,
       bound_arrays,
       push_constants,
@@ -2057,7 +2377,7 @@ void dispatch_gather_op(
     const array& src,
     const array& indices,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t slice_size,
@@ -2076,7 +2396,7 @@ void dispatch_gather_op(
       {&out, "dst"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::Gather,
       bound_arrays,
       push_constants,
@@ -2089,7 +2409,7 @@ void dispatch_gather_axis_op(
     const array& src,
     const array& indices,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t size_pre,
@@ -2112,7 +2432,7 @@ void dispatch_gather_axis_op(
       {&out, "dst"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::GatherAxis,
       bound_arrays,
       push_constants,
@@ -2125,7 +2445,7 @@ void dispatch_scatter_axis_op(
     const array& updates,
     const array& indices,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t size_pre,
@@ -2148,7 +2468,7 @@ void dispatch_scatter_axis_op(
       {&out, "dst"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::GatherAxis,
       bound_arrays,
       push_constants,
@@ -2163,7 +2483,7 @@ void dispatch_rope_op(
     const array& freqs,
     array& out,
     const array& indices,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     const RopePushConstants& push_constants,
@@ -2176,7 +2496,7 @@ void dispatch_rope_op(
       {&indices, "indices"},
   }};
   dispatch_with_spec(
-      shader_name,
+      shader_id,
       KernelSpecId::Rope,
       bound_arrays,
       push_constants,

@@ -108,9 +108,8 @@ bool try_eval_gather_vulkan(
         Shape{static_cast<int>(index_count), static_cast<int>(slice_size)},
         s);
 
-    const auto shader_name =
-        gather_shader_name(src_input.dtype(), idx_1d.dtype());
-    if (shader_name.empty()) {
+    const auto shader_id = gather_shader_id(src_input.dtype(), idx_1d.dtype());
+    if (!shader_id.has_value()) {
       return false;
     }
 
@@ -120,7 +119,7 @@ bool try_eval_gather_vulkan(
           src_2d,
           idx_1d,
           out_2d,
-          shader_name,
+          *shader_id,
           command_buffer,
           s,
           slice_size,
@@ -165,8 +164,8 @@ bool try_eval_gather_vulkan(
     }
   }
 
-  const auto shader_name = gather_shader_name(src_input.dtype(), idx.dtype());
-  if (shader_name.empty()) {
+  const auto shader_id = gather_shader_id(src_input.dtype(), idx.dtype());
+  if (!shader_id.has_value()) {
     trace_vulkan_unsupported(
         "Gather",
         "value/index dtype combination is not supported by Vulkan gather");
@@ -232,7 +231,7 @@ bool try_eval_gather_vulkan(
         src_2d,
         idx_1d,
         out_2d,
-        shader_name,
+        *shader_id,
         command_buffer,
         s,
         slice_size,
@@ -274,8 +273,8 @@ bool try_eval_gather_axis_vulkan(
     return false;
   }
 
-  const auto shader_name = gather_axis_shader_name(src.dtype(), idx.dtype());
-  if (shader_name.empty()) {
+  const auto shader_id = gather_axis_shader_id(src.dtype(), idx.dtype());
+  if (!shader_id.has_value()) {
     trace_vulkan_unsupported(
         "GatherAxis",
         "value/index dtype combination is not supported by Vulkan gather_axis");
@@ -353,7 +352,7 @@ bool try_eval_gather_axis_vulkan(
         src_flat,
         idx_flat,
         out_flat,
-        shader_name,
+        *shader_id,
         command_buffer,
         s,
         size_pre,

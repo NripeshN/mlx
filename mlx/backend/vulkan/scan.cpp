@@ -73,7 +73,11 @@ bool try_eval_scan_cumsum_vulkan(
     auto command_buffer = vulkan::begin_command_recording(s.index);
 
     vulkan::dispatch_cumsum_op(
-        scan_input, inclusive_out, "cumsum_f32", command_buffer, s);
+        scan_input,
+        inclusive_out,
+        vulkan::StaticShaderId::cumsum_f32,
+        command_buffer,
+        s);
 
     array scan_result = inclusive_out;
     if (!inclusive) {
@@ -83,7 +87,7 @@ bool try_eval_scan_cumsum_vulkan(
           inclusive_out,
           scan_input,
           exclusive_out,
-          "sub_f32_f32_f32",
+          vulkan::StaticShaderId::sub_f32_f32_f32,
           command_buffer,
           s,
           vulkan::BinaryDispatchVariant::Standard);

@@ -108,73 +108,100 @@ void log_matmul_path(const std::vector<array>& inputs, const char* path) {
             << " b_shape=" << inputs[1].shape() << "\n";
 }
 
-std::string matvec_shader_name(Dtype matrix_dtype, Dtype vec_dtype) {
-  auto matrix_suffix = [&]() -> std::string {
-    switch (matrix_dtype) {
-      case float32:
-        return "f32";
-      case float16:
-        return "f16";
-      case bfloat16:
-        return "bf16";
-      default:
-        return {};
-    }
-  }();
-
-  auto vec_suffix = [&]() -> std::string {
-    switch (vec_dtype) {
-      case float32:
-        return "f32";
-      case float16:
-        return "f16";
-      default:
-        return {};
-    }
-  }();
-
-  if (matrix_suffix.empty() || vec_suffix.empty()) {
-    return {};
+std::optional<vulkan::StaticShaderId> matvec_shader_name(
+    Dtype matrix_dtype,
+    Dtype vec_dtype) {
+  if (matrix_dtype == float32 && vec_dtype == float32) {
+    return vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32;
   }
-  return "mul_mat_vec_" + matrix_suffix + "_" + vec_suffix + "_f32";
+  if (matrix_dtype == float16 && vec_dtype == float32) {
+    return vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32;
+  }
+  if (matrix_dtype == bfloat16 && vec_dtype == float32) {
+    return vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32;
+  }
+  if (matrix_dtype == float32 && vec_dtype == float16) {
+    return vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32;
+  }
+  if (matrix_dtype == float16 && vec_dtype == float16) {
+    return vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32;
+  }
+  if (matrix_dtype == bfloat16 && vec_dtype == float16) {
+    return vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32;
+  }
+  return std::nullopt;
 }
 
-std::vector<std::string> matvec_shader_candidates(
+std::vector<vulkan::StaticShaderId> matvec_shader_candidates(
     Dtype matrix_dtype,
     Dtype vec_dtype) {
   auto base = matvec_shader_name(matrix_dtype, vec_dtype);
-  if (base.empty()) {
+  if (!base.has_value()) {
     return {};
   }
-  return {
-      base,
-      base + "_subgroup",
-      base + "_subgroup_no_shmem",
-  };
+  switch (*base) {
+    case vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32:
+      return {
+          vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32,
+          vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_f32_f32_f32_subgroup_no_shmem,
+      };
+    case vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32:
+      return {
+          vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32,
+          vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_f16_f32_f32_subgroup_no_shmem,
+      };
+    case vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32:
+      return {
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f32_f32_subgroup_no_shmem,
+      };
+    case vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32:
+      return {
+          vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32,
+          vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_f32_f16_f32_subgroup_no_shmem,
+      };
+    case vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32:
+      return {
+          vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32,
+          vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_f16_f16_f32_subgroup_no_shmem,
+      };
+    case vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32:
+      return {
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32_subgroup,
+          vulkan::StaticShaderId::mul_mat_vec_bf16_f16_f32_subgroup_no_shmem,
+      };
+    case vulkan::StaticShaderId::Count:
+      break;
+  }
+  return {};
 }
 
-std::vector<std::string> mul_mm_shader_candidates(Dtype dtype) {
-  std::string base;
+std::vector<vulkan::StaticShaderId> mul_mm_shader_candidates(Dtype dtype) {
   switch (dtype) {
     case float16:
-      base = "matmul_f16";
-      break;
-    case bfloat16:
-      base = "matmul_bf16";
-      break;
-    case float32:
-      base = "matmul_f32_f32";
       return {
-          base + "_fp32",
-          base,
+          vulkan::StaticShaderId::matmul_f16,
+          vulkan::StaticShaderId::matmul_f16_fp32,
+      };
+    case bfloat16:
+      return {
+          vulkan::StaticShaderId::matmul_bf16,
+          vulkan::StaticShaderId::matmul_bf16_fp32,
+      };
+    case float32:
+      return {
+          vulkan::StaticShaderId::matmul_f32_f32_fp32,
+          vulkan::StaticShaderId::matmul_f32_f32,
       };
     default:
       return {};
   }
-  return {
-      base,
-      base + "_fp32",
-  };
 }
 
 bool is_row_contiguous_zero_offset(const array& arr) {
@@ -287,17 +314,18 @@ bool try_eval_matvec_vulkan(
     return true;
   }
 
-  for (const auto& shader_name : shader_candidates) {
+  for (const auto shader_id : shader_candidates) {
     bool dispatched = false;
     try {
       auto command_buffer = vulkan::begin_command_recording(s.index);
       vulkan::dispatch_mul_mat_vec_op(
-          matrix, vec, out_work, shader_name, command_buffer, s);
+          matrix, vec, out_work, shader_id, command_buffer, s);
       vulkan::end_command_recording(s.index);
       dispatched = true;
     } catch (const std::runtime_error& e) {
       if (matmul_debug_enabled()) {
-        std::cerr << "[vulkan::matvec] shader=" << shader_name
+        std::cerr << "[vulkan::matvec] shader="
+                  << vulkan::static_shader_name(shader_id)
                   << " failed: " << e.what() << "\n";
       }
     }
@@ -444,7 +472,7 @@ bool try_eval_mul_mm_vulkan(
               << " batch=" << num_batches << "\n";
   }
 
-  for (const auto& shader_name : shader_candidates) {
+  for (const auto shader_id : shader_candidates) {
     bool dispatched = true;
     bool should_recover_stream = false;
     for (uint32_t base_z = 0; base_z < num_batches; base_z += kMaxGridZ) {
@@ -455,18 +483,12 @@ bool try_eval_mul_mm_vulkan(
       try {
         auto command_buffer = vulkan::begin_command_recording(s.index);
         vulkan::dispatch_mul_mm_op(
-            a,
-            b_t,
-            out_t,
-            shader_name,
-            command_buffer,
-            s,
-            push_constants,
-            grid);
+            a, b_t, out_t, shader_id, command_buffer, s, push_constants, grid);
         vulkan::end_command_recording(s.index);
       } catch (const std::runtime_error& e) {
         if (matmul_debug_enabled()) {
-          std::cerr << "[vulkan::mul_mm] shader=" << shader_name
+          std::cerr << "[vulkan::mul_mm] shader="
+                    << vulkan::static_shader_name(shader_id)
                     << " failed: " << e.what() << "\n";
         }
         const std::string message = e.what();
@@ -483,8 +505,8 @@ bool try_eval_mul_mm_vulkan(
 
     if (dispatched) {
       if (matmul_debug_enabled()) {
-        std::cerr << "[vulkan::mul_mm] shader=" << shader_name
-                  << " dispatched\n";
+        std::cerr << "[vulkan::mul_mm] shader="
+                  << vulkan::static_shader_name(shader_id) << " dispatched\n";
       }
       vulkan::mark_scratch_array_written(s, kMulMmOutScratchLane);
       try {

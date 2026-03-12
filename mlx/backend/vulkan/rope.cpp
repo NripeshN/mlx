@@ -14,17 +14,22 @@ namespace fast {
 
 namespace {
 
-std::string rope_shader_name(Dtype dtype, bool traditional) {
+std::optional<vulkan::StaticShaderId> rope_shader_id(
+    Dtype dtype,
+    bool traditional) {
   if (dtype == float32) {
-    return traditional ? "rope_norm_f32" : "rope_neox_f32";
+    return traditional ? vulkan::StaticShaderId::rope_norm_f32
+                       : vulkan::StaticShaderId::rope_neox_f32;
   }
   if (dtype == float16) {
-    return traditional ? "rope_norm_f16_rte" : "rope_neox_f16_rte";
+    return traditional ? vulkan::StaticShaderId::rope_norm_f16_rte
+                       : vulkan::StaticShaderId::rope_neox_f16_rte;
   }
   if (dtype == bfloat16) {
-    return traditional ? "rope_norm_bf16_rte" : "rope_neox_bf16_rte";
+    return traditional ? vulkan::StaticShaderId::rope_norm_bf16_rte
+                       : vulkan::StaticShaderId::rope_neox_bf16_rte;
   }
-  return {};
+  return std::nullopt;
 }
 
 bool normalize_rope_input(
@@ -178,8 +183,8 @@ bool try_eval_rope_vulkan(
     x = contiguous_copy_gpu(x, s);
   }
 
-  const auto shader_name = rope_shader_name(x.dtype(), traditional);
-  if (shader_name.empty() || x.dtype() != out.dtype() || dims <= 0 ||
+  const auto shader_id = rope_shader_id(x.dtype(), traditional);
+  if (!shader_id.has_value() || x.dtype() != out.dtype() || dims <= 0 ||
       (dims % 2) != 0 || dims > x.shape(-1) || x.offset() != 0) {
     return false;
   }
@@ -242,7 +247,7 @@ bool try_eval_rope_vulkan(
         freqs,
         out_kernel,
         offsets,
-        shader_name,
+        *shader_id,
         command_buffer,
         s,
         pc,

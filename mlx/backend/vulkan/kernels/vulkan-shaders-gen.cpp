@@ -2676,11 +2676,11 @@ void write_output_files() {
   std::stringstream hdr = make_generic_stringstream();
   std::stringstream src = make_generic_stringstream();
 
+  hdr << "#pragma once\n\n";
+  hdr << "#include <array>\n";
+  hdr << "#include <cstddef>\n";
   hdr << "#include <cstdint>\n\n";
   src << "#include \"" << basename(target_hpp) << "\"\n";
-  if (target_cpp != "") {
-    src << "#include \"mlx/backend/vulkan/kernels.h\"\n";
-  }
   src << "\n";
 
   std::sort(shader_fnames.begin(), shader_fnames.end());
@@ -2713,10 +2713,51 @@ void write_output_files() {
           src << "\n";
       }
       src << std::dec << "\n};\n\n";
-      src << "MLX_VULKAN_REGISTER_SHADER(" << name << ", " << name << "_data, "
-          << name << "_len);\n\n";
     }
   }
+
+  hdr << "namespace mlx::core::vulkan {\n\n";
+  hdr << "enum class StaticShaderId : uint32_t {\n";
+  for (const auto& pair : shader_fnames) {
+    hdr << "  " << pair.first << ",\n";
+  }
+  hdr << "  Count,\n";
+  hdr << "};\n\n";
+
+  hdr << "struct StaticShaderRecord {\n";
+  hdr << "  StaticShaderId id;\n";
+  hdr << "  const char* name;\n";
+  hdr << "  const unsigned char* data;\n";
+  hdr << "  uint64_t len;\n";
+  hdr << "};\n\n";
+
+  hdr << "inline constexpr std::size_t kStaticShaderCount = "
+      << shader_fnames.size() << ";\n\n";
+
+  hdr << "inline std::array<StaticShaderRecord, kStaticShaderCount> make_static_shader_registry() {\n";
+  hdr << "  return {{\n";
+  for (const auto& pair : shader_fnames) {
+    const auto& name = pair.first;
+    hdr << "      {StaticShaderId::" << name << ", \"" << name << "\", " << name
+        << "_data, " << name << "_len},\n";
+  }
+  hdr << "  }};\n";
+  hdr << "}\n\n";
+
+  hdr << "inline const char* static_shader_name(StaticShaderId id) {\n";
+  hdr << "  switch (id) {\n";
+  for (const auto& pair : shader_fnames) {
+    const auto& name = pair.first;
+    hdr << "    case StaticShaderId::" << name << ":\n";
+    hdr << "      return \"" << name << "\";\n";
+  }
+  hdr << "    case StaticShaderId::Count:\n";
+  hdr << "      break;\n";
+  hdr << "  }\n";
+  hdr << "  return \"<invalid static shader>\";\n";
+  hdr << "}\n\n";
+
+  hdr << "} // namespace mlx::core::vulkan\n\n";
 
   std::string suffixes[2] = {"_f32", "_f16"};
   for (std::string op : {"add", "sub", "mul", "div", "add_rms"}) {

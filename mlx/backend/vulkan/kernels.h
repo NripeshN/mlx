@@ -9,9 +9,11 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "mlx/array.h"
 #include "mlx/backend/vulkan/allocator.h"
+#include "vulkan_shaders.hpp"
 
 namespace mlx::core::vulkan {
 
@@ -27,6 +29,7 @@ struct ShaderModule {
   std::vector<uint32_t> spirv_code;
   VkShaderModule module{VK_NULL_HANDLE};
   bool compiled{false};
+  std::string debug_name;
 
   ~ShaderModule();
 };
@@ -46,7 +49,14 @@ class KernelManager {
  public:
   static KernelManager& get();
 
+  void initialize_static_registry();
+
   // Get or create a compute pipeline for a shader
+  ComputePipeline* get_pipeline(
+      StaticShaderId shader_id,
+      const std::vector<VkDescriptorSetLayoutBinding>& bindings,
+      uint32_t push_constant_size = 0,
+      const std::vector<uint32_t>& specialization_constants = {});
   ComputePipeline* get_pipeline(
       const std::string& shader_name,
       const std::vector<VkDescriptorSetLayoutBinding>& bindings,
@@ -54,11 +64,10 @@ class KernelManager {
       const std::vector<uint32_t>& specialization_constants = {});
 
   // Get or load a shader module
+  ShaderModule* get_shader(StaticShaderId id);
   ShaderModule* get_shader(const std::string& name);
 
-  // Register a shader from SPIR-V data (called by generated shader code)
-  // data: pointer to SPIR-V bytecode (can be uint8_t or uint32_t)
-  // size_bytes: size of the data in bytes
+  // Register a dynamic shader from SPIR-V data.
   void
   register_shader(const std::string& name, const void* data, size_t size_bytes);
 
@@ -81,13 +90,56 @@ class KernelManager {
   void cleanup();
 
  private:
-  KernelManager() = default;
+  struct DescriptorBindingKey {
+    uint32_t binding{0};
+    uint32_t descriptor_type{0};
+    uint32_t descriptor_count{0};
+    uint32_t stage_flags{0};
+    bool has_immutable_samplers{false};
+
+    bool operator==(const DescriptorBindingKey& other) const = default;
+  };
+
+  struct PipelineKey {
+    bool is_dynamic{false};
+    StaticShaderId static_shader_id{StaticShaderId::Count};
+    std::string dynamic_shader_name;
+    std::vector<DescriptorBindingKey> bindings;
+    uint32_t push_constant_size{0};
+    std::vector<uint32_t> specialization_constants;
+
+    bool operator==(const PipelineKey& other) const = default;
+  };
+
+  struct PipelineKeyHash {
+    size_t operator()(const PipelineKey& key) const;
+  };
+
+  KernelManager();
   ~KernelManager();
 
+  void ensure_static_registry_initialized();
+  void register_static_shader(
+      StaticShaderId id,
+      const void* data,
+      size_t size_bytes);
   VkShaderModule compile_shader(const std::vector<uint32_t>& spirv);
+  static DescriptorBindingKey make_descriptor_binding_key(
+      const VkDescriptorSetLayoutBinding& binding);
+  void purge_descriptor_sets_for_layouts(
+      const std::unordered_set<VkDescriptorSetLayout, VulkanHandleHash>&
+          layouts);
 
-  std::unordered_map<std::string, std::unique_ptr<ShaderModule>> shaders_;
-  std::unordered_map<std::string, std::unique_ptr<ComputePipeline>> pipelines_;
+  std::vector<std::unique_ptr<ShaderModule>> static_shaders_;
+  std::unordered_map<std::string, std::unique_ptr<ShaderModule>>
+      dynamic_shaders_;
+  std::unordered_map<
+      PipelineKey,
+      std::unique_ptr<ComputePipeline>,
+      PipelineKeyHash>
+      pipelines_;
+  bool static_registry_initialized_{false};
+  std::mutex static_registry_mutex_;
 
   struct DescriptorSetRecord {
     VkDescriptorSet set{VK_NULL_HANDLE};
@@ -393,7 +445,7 @@ void dispatch_binary_op(
     const array& a,
     const array& b,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     BinaryDispatchVariant variant = BinaryDispatchVariant::Standard,
@@ -404,7 +456,7 @@ void dispatch_binary_op(
     const array& a,
     const array& b,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     BinaryDispatchVariant variant,
@@ -417,7 +469,7 @@ void dispatch_binary_op(
 void dispatch_unary_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     float param1 = 0.0f,
@@ -426,7 +478,7 @@ void dispatch_unary_op(
 void dispatch_generic_unary_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     float param1 = 0.0f,
@@ -436,7 +488,7 @@ void dispatch_generic_unary_op(
 
 void dispatch_arange_op(
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     float start,
@@ -445,7 +497,7 @@ void dispatch_arange_op(
 void dispatch_sum_rows_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     float weight = 1.0f);
@@ -453,30 +505,30 @@ void dispatch_sum_rows_op(
 void dispatch_argmax_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s);
 
 void dispatch_softmax_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s);
 
 void dispatch_softmax_large_op(
     const array& in,
     array& out,
-    const std::string& shader_name_pass1,
-    const std::string& shader_name_pass2,
-    const std::string& shader_name_pass3,
+    StaticShaderId shader_id_pass1,
+    StaticShaderId shader_id_pass2,
+    StaticShaderId shader_id_pass3,
     VkCommandBuffer cmd_buffer,
     const Stream& s);
 
 void dispatch_diag_mask_inf_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t rows_per_channel,
@@ -490,7 +542,7 @@ void dispatch_flash_attention_op(
     const array& sinks,
     array& out,
     const array& mask_opt,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     const FlashAttentionPushConstants& push_constants,
@@ -501,7 +553,7 @@ void dispatch_flash_attention_split_k_reduce_op(
     const array& in,
     const array& sinks,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     const FlashAttentionSplitKReducePushConstants& push_constants,
@@ -511,7 +563,7 @@ void dispatch_flash_attention_split_k_reduce_op(
 void dispatch_flash_attention_mask_opt_op(
     const array& mask,
     array& mask_opt,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     const FlashAttentionMaskOptPushConstants& push_constants,
@@ -521,7 +573,7 @@ void dispatch_flash_attention_mask_opt_op(
 void dispatch_cumsum_op(
     const array& in,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s);
 
@@ -529,7 +581,7 @@ void dispatch_mul_mm_op(
     const array& a,
     const array& b,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     const MatmulPushConstants& push_constants,
@@ -539,14 +591,14 @@ void dispatch_mul_mat_vec_op(
     const array& matrix,
     const array& vec,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s);
 
 void dispatch_random_bits_op(
     const array& keys,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     const RandomBitsPushConstants& push_constants,
@@ -556,7 +608,7 @@ void dispatch_gather_op(
     const array& src,
     const array& indices,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t slice_size,
@@ -567,7 +619,7 @@ void dispatch_gather_axis_op(
     const array& src,
     const array& indices,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t size_pre,
@@ -579,7 +631,7 @@ void dispatch_scatter_axis_op(
     const array& updates,
     const array& indices,
     array& out,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t size_pre,
@@ -593,7 +645,7 @@ void dispatch_rope_op(
     const array& freqs,
     array& out,
     const array& indices,
-    const std::string& shader_name,
+    StaticShaderId shader_id,
     VkCommandBuffer cmd_buffer,
     const Stream& s,
     const RopePushConstants& push_constants,
@@ -610,14 +662,3 @@ std::tuple<uint32_t, uint32_t, uint32_t> get_element_wise_grid_dims(
 constexpr uint32_t VULKAN_INDEX_TILE_SIZE = 512;
 
 } // namespace mlx::core::vulkan
-
-// Registration macro for shader data
-#define MLX_VULKAN_REGISTER_SHADER(name, data, size)           \
-  namespace {                                                  \
-  struct ShaderRegistrar_##name {                              \
-    ShaderRegistrar_##name() {                                 \
-      mlx::core::vulkan::KernelManager::get().register_shader( \
-          #name, data, size);                                  \
-    }                                                          \
-  } shader_registrar_##name;                                   \
-  }

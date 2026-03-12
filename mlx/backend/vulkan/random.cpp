@@ -55,7 +55,7 @@ void RandomBits::eval_gpu(const std::vector<array>& inputs, array& out) {
     vulkan::dispatch_random_bits_op(
         keys,
         out,
-        "random_bits_f32",
+        vulkan::StaticShaderId::random_bits_f32,
         cmd_buffer,
         stream(),
         push_constants,

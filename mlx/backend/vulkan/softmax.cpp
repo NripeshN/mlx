@@ -78,16 +78,20 @@ bool try_eval_softmax_vulkan(
       vulkan::dispatch_softmax_large_op(
           in,
           out_work,
-          use_f16_variant ? "soft_max_large1_f32_f16" : "soft_max_large1_f32",
-          use_f16_variant ? "soft_max_large2_f32_f16" : "soft_max_large2_f32",
-          use_f16_variant ? "soft_max_large3_f32_f16" : "soft_max_large3_f32",
+          use_f16_variant ? vulkan::StaticShaderId::soft_max_large1_f32_f16
+                          : vulkan::StaticShaderId::soft_max_large1_f32,
+          use_f16_variant ? vulkan::StaticShaderId::soft_max_large2_f32_f16
+                          : vulkan::StaticShaderId::soft_max_large2_f32,
+          use_f16_variant ? vulkan::StaticShaderId::soft_max_large3_f32_f16
+                          : vulkan::StaticShaderId::soft_max_large3_f32,
           command_buffer,
           s);
     } else {
       vulkan::dispatch_softmax_op(
           in,
           out_work,
-          use_f16_variant ? "soft_max_f32_f16" : "soft_max_f32",
+          use_f16_variant ? vulkan::StaticShaderId::soft_max_f32_f16
+                          : vulkan::StaticShaderId::soft_max_f32,
           command_buffer,
           s);
     }
@@ -143,11 +147,12 @@ bool try_eval_logsumexp_vulkan(
   }
 
   try {
-    const std::string shader_name = out.dtype() == bfloat16
-        ? "logsumexp_bf16"
-        : "logsumexp_" + dtype_suffix(out.dtype());
+    const auto shader_id = out.dtype() == bfloat16
+        ? vulkan::StaticShaderId::logsumexp_bf16
+        : (out.dtype() == float16 ? vulkan::StaticShaderId::logsumexp_f16
+                                  : vulkan::StaticShaderId::logsumexp_f32);
     auto command_buffer = vulkan::begin_command_recording(s.index);
-    vulkan::dispatch_sum_rows_op(in, out_work, shader_name, command_buffer, s);
+    vulkan::dispatch_sum_rows_op(in, out_work, shader_id, command_buffer, s);
     vulkan::end_command_recording(s.index);
     if (staged_output) {
       copy_gpu(out_work, out, CopyType::GeneralGeneral, s);

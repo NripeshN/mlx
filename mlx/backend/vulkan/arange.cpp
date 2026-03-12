@@ -109,7 +109,7 @@ bool try_eval_arange_vulkan(
     auto command_buffer = vulkan::begin_command_recording(s.index);
     vulkan::dispatch_arange_op(
         out,
-        "arange_f32",
+        vulkan::StaticShaderId::arange_f32,
         command_buffer,
         s,
         static_cast<float>(start),
