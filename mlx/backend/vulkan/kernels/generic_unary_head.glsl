@@ -7,6 +7,8 @@ layout (push_constant) uniform parameter
     uint ne00; uint ne01; uint ne02; uint ne03; uint nb00; uint nb01; uint nb02; uint nb03;
     uint ne10; uint ne11; uint ne12; uint ne13; uint nb10; uint nb11; uint nb12; uint nb13;
     uint misalign_offsets;
+    uint src_offset;
+    uint dst_offset;
     float param1; float param2;
 
     uint ne0_012mp; uint ne0_012L;
@@ -31,8 +33,8 @@ uint get_idx() {
     return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
 }
 
-uint get_aoffset() { return p.misalign_offsets >> 16; }
-uint get_doffset() { return p.misalign_offsets & 0xFFFF; }
+uint get_aoffset() { return p.src_offset; }
+uint get_doffset() { return p.dst_offset; }
 
 // see init_fastdiv_values in ggml-vulkan.cpp
 uint fastdiv(uint n, uint mp, uint L) {

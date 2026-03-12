@@ -343,7 +343,8 @@ bool is_supported_copy_layout(const mlx::core::array& arr) {
     return false;
   }
   const auto elem_offset = arr.offset() / item_size;
-  if (elem_offset > 0xFFFF) {
+  if (elem_offset >
+      static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
     return false;
   }
   for (auto dim : arr.shape()) {
@@ -669,12 +670,10 @@ void copy_gpu_inplace(
         }
       }
     } else {
-      const bool scalar_is_zero =
-          std::all_of(scalar_ptr, scalar_ptr + scalar_size, [](char c) {
-            return c == 0;
-          });
-      const bool can_use_fill_buffer = scalar_is_zero && (out.offset() % 4 == 0) &&
-          (out.nbytes() % 4 == 0);
+      const bool scalar_is_zero = std::all_of(
+          scalar_ptr, scalar_ptr + scalar_size, [](char c) { return c == 0; });
+      const bool can_use_fill_buffer =
+          scalar_is_zero && (out.offset() % 4 == 0) && (out.nbytes() % 4 == 0);
       if (can_use_fill_buffer) {
         auto cmd_buffer = vulkan::begin_command_recording(s.index);
         vkCmdFillBuffer(
@@ -692,7 +691,11 @@ void copy_gpu_inplace(
           std::memcpy(host_fill.data() + offset, scalar_ptr, scalar_size);
         }
         vulkan::enqueue_owned_staging_upload(
-            s, host_fill.data(), host_fill.size(), out_buf->buffer, out.offset());
+            s,
+            host_fill.data(),
+            host_fill.size(),
+            out_buf->buffer,
+            out.offset());
         vulkan::retain_array_for_stream(s, in);
         vulkan::retain_array_for_stream(s, out);
       }
