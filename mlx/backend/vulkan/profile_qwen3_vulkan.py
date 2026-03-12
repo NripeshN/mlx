@@ -24,6 +24,15 @@ from contextlib import contextmanager
 from typing import Dict, List, Tuple, Any, Optional
 
 
+QWEN3_06B_BF16_GOAL = {
+    "model": "mlx-community/qwen3-0.6b-bf16",
+    "prefill_tokens_per_sec": 523.32,
+    "decode_tokens_per_sec": 123.41,
+    "source": "user-supplied benchmark update",
+    "reference": "llama.cpp unsloth/Qwen3-0.6B-GGUF:BF16 on Radeon 8060S (Vulkan)",
+}
+
+
 def env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -572,7 +581,7 @@ def trace_model_inference(
     verbose: bool = True,
     sync_checkpoints: bool = False,
     sync_analyzer: Optional[SyncTraceAnalyzer] = None,
-) -> Tuple[Any, Any, OpTracer]:
+) -> Tuple[Any, Any, OpTracer, Dict[str, Any]]:
     """
     Load model and trace inference with separate prefill/decode phases.
 
@@ -677,6 +686,8 @@ def trace_model_inference(
             print(f"First token: {tokenizer.decode([next_token.item()])}")
             print()
 
+        decode_times = []
+
         # === DECODE PHASE ===
         if verbose and max_tokens > 1:
             print("=" * 100)
@@ -686,7 +697,6 @@ def trace_model_inference(
         tracer.set_phase("decode")
         if sync_analyzer is not None:
             sync_analyzer.set_phase("decode")
-        decode_times = []
         generated_tokens = [next_token.item()]
 
         for i in range(max_tokens - 1):
@@ -748,7 +758,12 @@ def trace_model_inference(
         wrapped_model.uninstall()
         tracer.uninstall()
 
-    return model, tokenizer, tracer
+    stats = {
+        "input_len": input_len,
+        "prefill_time_ms": prefill_time,
+        "decode_times_ms": decode_times,
+    }
+    return model, tokenizer, tracer, stats
 
 
 def main():
@@ -847,7 +862,7 @@ def main():
     # Run profiling
     if capture_sync_trace:
         with capture_stderr_lines(handle_stderr_line, echo_sync_trace):
-            model, tokenizer, tracer = trace_model_inference(
+            model, tokenizer, tracer, stats = trace_model_inference(
                 model_name=model_name,
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -856,7 +871,7 @@ def main():
                 sync_analyzer=sync_analyzer,
             )
     else:
-        model, tokenizer, tracer = trace_model_inference(
+        model, tokenizer, tracer, stats = trace_model_inference(
             model_name=model_name,
             prompt=prompt,
             max_tokens=max_tokens,
@@ -885,6 +900,29 @@ def main():
     print(f"\nPhase Timing:")
     for phase, total_time in sorted(tracer.phase_times.items()):
         print(f"  {phase.capitalize()}: {total_time * 1000:.2f} ms")
+
+    if model_name == QWEN3_06B_BF16_GOAL["model"]:
+        prefill_tps = 0.0
+        if stats["prefill_time_ms"] > 0:
+            prefill_tps = stats["input_len"] * 1000.0 / stats["prefill_time_ms"]
+        decode_tps = 0.0
+        if stats["decode_times_ms"]:
+            decode_tps = 1000.0 / (sum(stats["decode_times_ms"]) / len(stats["decode_times_ms"]))
+
+        print("\nQwen3 0.6B BF16 Goal:")
+        print(f"  Source: {QWEN3_06B_BF16_GOAL['source']}")
+        print(f"  Reference: {QWEN3_06B_BF16_GOAL['reference']}")
+        print(
+            f"  Prefill: {prefill_tps:.2f} t/s vs goal {QWEN3_06B_BF16_GOAL['prefill_tokens_per_sec']:.2f} t/s"
+        )
+        if stats["decode_times_ms"]:
+            print(
+                f"  Decode: {decode_tps:.2f} t/s vs goal {QWEN3_06B_BF16_GOAL['decode_tokens_per_sec']:.2f} t/s"
+            )
+        else:
+            print(
+                f"  Decode: n/a (goal {QWEN3_06B_BF16_GOAL['decode_tokens_per_sec']:.2f} t/s)"
+            )
 
     print("\n" + "=" * 100)
     print("NOTES")

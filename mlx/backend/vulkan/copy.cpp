@@ -11,6 +11,7 @@
 #include "mlx/primitives.h"
 #include "mlx/stream.h"
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -654,21 +655,47 @@ void copy_gpu_inplace(
     const char* scalar_ptr = static_cast<const char*>(in.data<void>());
     const size_t scalar_size = size_of(in.dtype());
     auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
-    if (vulkan::VulkanContext::get().is_unified_memory()) {
+    if (out_buf->mapped_ptr != nullptr) {
       char* dst = static_cast<char*>(out_buf->mapped_ptr) + out.offset();
-      for (size_t offset = 0; offset < out.nbytes(); offset += scalar_size) {
-        std::memcpy(dst + offset, scalar_ptr, scalar_size);
+      const bool repeated_byte =
+          std::all_of(scalar_ptr + 1, scalar_ptr + scalar_size, [&](char c) {
+            return c == scalar_ptr[0];
+          });
+      if (repeated_byte) {
+        std::memset(dst, scalar_ptr[0], out.nbytes());
+      } else {
+        for (size_t offset = 0; offset < out.nbytes(); offset += scalar_size) {
+          std::memcpy(dst + offset, scalar_ptr, scalar_size);
+        }
       }
     } else {
-      std::vector<char> host_fill(out.nbytes());
-      for (size_t offset = 0; offset < host_fill.size();
-           offset += scalar_size) {
-        std::memcpy(host_fill.data() + offset, scalar_ptr, scalar_size);
+      const bool scalar_is_zero =
+          std::all_of(scalar_ptr, scalar_ptr + scalar_size, [](char c) {
+            return c == 0;
+          });
+      const bool can_use_fill_buffer = scalar_is_zero && (out.offset() % 4 == 0) &&
+          (out.nbytes() % 4 == 0);
+      if (can_use_fill_buffer) {
+        auto cmd_buffer = vulkan::begin_command_recording(s.index);
+        vkCmdFillBuffer(
+            cmd_buffer,
+            out_buf->buffer,
+            static_cast<VkDeviceSize>(out.offset()),
+            static_cast<VkDeviceSize>(out.nbytes()),
+            0u);
+        vulkan::retain_array_for_stream(s, out);
+        vulkan::end_command_recording(s.index);
+      } else {
+        std::vector<char> host_fill(out.nbytes());
+        for (size_t offset = 0; offset < host_fill.size();
+             offset += scalar_size) {
+          std::memcpy(host_fill.data() + offset, scalar_ptr, scalar_size);
+        }
+        vulkan::enqueue_owned_staging_upload(
+            s, host_fill.data(), host_fill.size(), out_buf->buffer, out.offset());
+        vulkan::retain_array_for_stream(s, in);
+        vulkan::retain_array_for_stream(s, out);
       }
-      vulkan::enqueue_owned_staging_upload(
-          s, host_fill.data(), host_fill.size(), out_buf->buffer, out.offset());
-      vulkan::retain_array_for_stream(s, in);
-      vulkan::retain_array_for_stream(s, out);
     }
     return;
   }
