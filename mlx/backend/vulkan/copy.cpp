@@ -397,8 +397,16 @@ std::optional<vulkan::StaticShaderId> get_copy_shader_id(
       return vulkan::StaticShaderId::contig_cpy_bf16_f32;
     }
     if (in.dtype() == mlx::core::bfloat16 &&
+        out.dtype() == mlx::core::float16) {
+      return vulkan::StaticShaderId::contig_cpy_bf16_f16;
+    }
+    if (in.dtype() == mlx::core::bfloat16 &&
         out.dtype() == mlx::core::bfloat16) {
       return vulkan::StaticShaderId::contig_cpy_bf16_bf16;
+    }
+    if (in.dtype() == mlx::core::float16 &&
+        out.dtype() == mlx::core::bfloat16) {
+      return vulkan::StaticShaderId::contig_cpy_f16_bf16;
     }
   }
 
@@ -410,6 +418,10 @@ std::optional<vulkan::StaticShaderId> get_copy_shader_id(
       (in.dtype() == mlx::core::bfloat16 &&
        out.dtype() == mlx::core::float32) ||
       (in.dtype() == mlx::core::bfloat16 &&
+       out.dtype() == mlx::core::float16) ||
+      (in.dtype() == mlx::core::bfloat16 &&
+       out.dtype() == mlx::core::bfloat16) ||
+      (in.dtype() == mlx::core::float16 &&
        out.dtype() == mlx::core::bfloat16) ||
       (in.dtype() == mlx::core::float32 &&
        out.dtype() == mlx::core::bfloat16) ||
@@ -455,8 +467,14 @@ std::optional<vulkan::StaticShaderId> get_copy_shader_id(
   if (in.dtype() == mlx::core::bfloat16 && out.dtype() == mlx::core::float32) {
     return vulkan::StaticShaderId::cpy_bf16_f32;
   }
+  if (in.dtype() == mlx::core::bfloat16 && out.dtype() == mlx::core::float16) {
+    return vulkan::StaticShaderId::cpy_bf16_f16;
+  }
   if (in.dtype() == mlx::core::bfloat16 && out.dtype() == mlx::core::bfloat16) {
     return vulkan::StaticShaderId::cpy_bf16_bf16;
+  }
+  if (in.dtype() == mlx::core::float16 && out.dtype() == mlx::core::bfloat16) {
+    return vulkan::StaticShaderId::cpy_f16_bf16;
   }
   if (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::bfloat16) {
     return vulkan::StaticShaderId::cpy_f32_bf16;

@@ -56,8 +56,33 @@ const std::vector<uint32_t>& matmul_specialization_constants() {
   // constant_id mapping in mul_mm.comp:
   //   0: BLOCK_SIZE, 1: BM, 2: BN, 3: BK, 4: WM, 5: WN,
   //   6: WMITER, 7: TM, 8: TN, 9: TK, 10: WARP
-  static const std::vector<uint32_t> kSpec = {
+  static const std::vector<uint32_t> kDefaultSpec = {
       32, 32, 32, 16, 32, 32, 2, 2, 2, 1, 32};
+  static const std::vector<uint32_t> kSpec = []() {
+    const char* env = std::getenv("MLX_VULKAN_MATMUL_SPEC");
+    if (env == nullptr || std::strlen(env) == 0) {
+      return kDefaultSpec;
+    }
+
+    std::vector<uint32_t> parsed;
+    parsed.reserve(kDefaultSpec.size());
+    std::stringstream ss(env);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+      if (item.empty()) {
+        return kDefaultSpec;
+      }
+      try {
+        parsed.push_back(static_cast<uint32_t>(std::stoul(item)));
+      } catch (...) {
+        return kDefaultSpec;
+      }
+    }
+    if (parsed.size() != kDefaultSpec.size()) {
+      return kDefaultSpec;
+    }
+    return parsed;
+  }();
   return kSpec;
 }
 

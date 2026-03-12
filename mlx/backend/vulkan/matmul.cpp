@@ -400,16 +400,16 @@ bool try_eval_mul_mm_vulkan(
     return false;
   }
 
-  auto shader_candidates = mul_mm_shader_candidates(a.dtype());
-  if (shader_candidates.empty()) {
-    return false;
-  }
-
   Shape out_t_shape = out.shape();
   std::swap(
       out_t_shape[out_t_shape.size() - 1], out_t_shape[out_t_shape.size() - 2]);
   array out_t = vulkan::acquire_scratch_array(
       s, kMulMmOutScratchLane, out_t_shape, float32);
+
+  auto shader_candidates = mul_mm_shader_candidates(a.dtype());
+  if (shader_candidates.empty()) {
+    return false;
+  }
 
   const uint32_t m = static_cast<uint32_t>(out.shape(-2));
   const uint32_t n = static_cast<uint32_t>(out.shape(-1));
