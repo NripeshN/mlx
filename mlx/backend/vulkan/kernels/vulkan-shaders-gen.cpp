@@ -799,10 +799,7 @@ void process_shaders() {
       }
 
       for (const auto& tname : type_names) {
-        if (tname == "bf16")
-          continue;
-
-        if (fp16) {
+        if (fp16 && tname != "bf16") {
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
           if (tname == "f16") {
             string_to_spv(
@@ -879,6 +876,21 @@ void process_shaders() {
               merge_maps(
                   fa_base_dict,
                   {{"Q_TYPE", "float"},
+                   {"D_TYPE", "float"},
+                   {"D_TYPEV4", "vec4"}}),
+              fp16,
+              false,
+              false,
+              f16acc);
+        } else if (tname == "bf16") {
+          std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+          string_to_spv(
+              "flash_attn_f32_f16_" + tname,
+              "flash_attn.comp",
+              merge_maps(
+                  fa_base_dict,
+                  {{data_a_key, "1"},
+                   {"Q_TYPE", "float"},
                    {"D_TYPE", "float"},
                    {"D_TYPEV4", "vec4"}}),
               fp16,

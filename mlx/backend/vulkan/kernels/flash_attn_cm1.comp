@@ -144,9 +144,18 @@ void main() {
     uint32_t mask_opt_idx = ~0;
     uint32_t mask_opt_bits = 0;
     f16vec4 mask_cache[Bc * Br / 4 / WorkGroupSize];
+    const uint32_t n_past = KV - N;
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
+
+        if (CAUSAL_ONLY) {
+            const uint32_t block_first_col = j * Bc;
+            const uint32_t block_last_row = min(i * Br + Br - 1, N - 1);
+            if (block_first_col > n_past + block_last_row) {
+                continue;
+            }
+        }
 
         [[unroll]] for (uint32_t idx = 0; idx < mask_cache.length(); ++idx) {
             mask_cache[idx] = f16vec4(0);
@@ -333,6 +342,30 @@ void main() {
                         ACC_TYPEV4 slopes = ACC_TYPEV4(slope[r * 4], slope[r * 4 + 1], slope[r * 4 + 2], slope[r * 4 + 3]);
                         sfsh[c * sfshstride + r] += slopes * masks;
                     }
+                }
+            }
+            barrier();
+        } else if (CAUSAL_ONLY) {
+            [[unroll]] for (uint32_t idx = 0; idx < Bc * Br / 4; idx += gl_WorkGroupSize.x) {
+                uint32_t c = (idx + tid) / (Br / 4);
+                uint32_t r = (idx + tid) % (Br / 4);
+                if (idx + tid < Bc * Br / 4 || idx + gl_WorkGroupSize.x <= Bc * Br / 4) {
+                    const uint32_t global_col = j * Bc + c;
+                    const uint32_t row0 = r * 4;
+                    ACC_TYPEV4 causal = sfsh[c * sfshstride + r];
+                    if (global_col > n_past + row0) {
+                        causal[0] = ACC_TYPE(NEG_FLT_MAX_OVER_2);
+                    }
+                    if (global_col > n_past + row0 + 1) {
+                        causal[1] = ACC_TYPE(NEG_FLT_MAX_OVER_2);
+                    }
+                    if (global_col > n_past + row0 + 2) {
+                        causal[2] = ACC_TYPE(NEG_FLT_MAX_OVER_2);
+                    }
+                    if (global_col > n_past + row0 + 3) {
+                        causal[3] = ACC_TYPE(NEG_FLT_MAX_OVER_2);
+                    }
+                    sfsh[c * sfshstride + r] = causal;
                 }
             }
             barrier();

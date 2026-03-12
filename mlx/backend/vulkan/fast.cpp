@@ -4,8 +4,12 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <sstream>
+#include <unordered_map>
 
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/vulkan/device.h"
@@ -25,8 +29,20 @@ namespace {
 constexpr char kFlashAttnMaskOptScratchLane[] = "flash_attn.mask_opt";
 constexpr char kFlashAttnSplitKScratchLane[] = "flash_attn.split_k";
 constexpr char kFlashAttnOutScratchLane[] = "flash_attn.out_storage";
+constexpr char kFlashAttnCausalMaskScratchLane[] = "flash_attn.causal_mask";
+constexpr char kFlashAttnKCastScratchLane[] = "flash_attn.k_cast";
+constexpr char kFlashAttnVCastScratchLane[] = "flash_attn.v_cast";
 
 array apply_diag_mask_inf_vulkan(const array& scores, int n_past, Stream s);
+
+struct FlashAttentionCausalMaskCacheEntry {
+  Shape shape;
+  bool valid{false};
+};
+
+std::mutex flash_attention_causal_mask_cache_mutex;
+std::unordered_map<int, FlashAttentionCausalMaskCacheEntry>
+    flash_attention_causal_mask_cache;
 
 bool experimental_flash_attention_enabled() {
   static const bool enabled = []() {
@@ -39,7 +55,57 @@ bool experimental_flash_attention_enabled() {
   return enabled;
 }
 
+bool trace_flash_attention_debug_enabled() {
+  static const bool enabled = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_TRACE_FLASH_ATTN");
+        env != nullptr) {
+      return std::string(env) != "0";
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+void trace_flash_attention_debug(const std::string& msg) {
+  if (!trace_flash_attention_debug_enabled()) {
+    return;
+  }
+  std::cerr << "[vulkan-fa-debug] " << msg << std::endl;
+}
+
+void trace_flash_attention_array(const char* label, const array& arr) {
+  if (!trace_flash_attention_debug_enabled()) {
+    return;
+  }
+  std::ostringstream oss;
+  oss << label << " shape=" << arr.shape() << " dtype=" << arr.dtype()
+      << " status=" << arr.status() << " has_primitive=" << arr.has_primitive()
+      << " row_contig=" << arr.flags().row_contiguous
+      << " offset=" << arr.offset();
+  trace_flash_attention_debug(oss.str());
+}
+
+array cast_flash_attention_kv_to_f16(
+    const array& x,
+    const char* scratch_lane,
+    Stream s) {
+  if (x.dtype() == float16) {
+    return x;
+  }
+  array out =
+      vulkan::acquire_scratch_array(s, scratch_lane, x.shape(), float16);
+  copy_gpu(x, out, CopyType::General, s);
+  vulkan::mark_scratch_array_written(s, scratch_lane);
+  return out;
+}
+
 struct FlashAttentionTuningParams {
+  enum class Path {
+    Scalar,
+    CoopMat1,
+  };
+
+  Path path;
   uint32_t workgroup_size;
   uint32_t block_rows;
   uint32_t block_cols;
@@ -49,6 +115,32 @@ struct FlashAttentionTuningParams {
   uint32_t shmem_staging;
   uint32_t limit_occupancy_shmem;
 };
+
+vulkan::StaticShaderId flash_attention_main_shader(
+    FlashAttentionTuningParams::Path path) {
+  if (const char* env = std::getenv("MLX_VULKAN_FLASH_ATTN_SHADER");
+      env != nullptr) {
+    const std::string value(env);
+    if (value == "cm1") {
+      return vulkan::StaticShaderId::flash_attn_f32_f16_f16_cm1;
+    }
+    if (value == "fp32") {
+      return vulkan::StaticShaderId::flash_attn_f32_f16_f16_fp32;
+    }
+    if (value == "f16acc") {
+      return path == FlashAttentionTuningParams::Path::CoopMat1
+          ? vulkan::StaticShaderId::flash_attn_f32_f16_f16_f16acc_cm1
+          : vulkan::StaticShaderId::flash_attn_f32_f16_f16_f16acc;
+    }
+  }
+  if (path == FlashAttentionTuningParams::Path::CoopMat1) {
+    return vulkan::StaticShaderId::flash_attn_f32_f16_f16_cm1;
+  }
+  if (vulkan::VulkanContext::get().shader_float16_supported()) {
+    return vulkan::StaticShaderId::flash_attn_f32_f16_f16;
+  }
+  return vulkan::StaticShaderId::flash_attn_f32_f16_f16_fp32;
+}
 
 struct FlashAttentionExecutionPlan {
   FlashAttentionTuningParams tuning;
@@ -82,7 +174,71 @@ std::pair<uint32_t, uint32_t> vulkan_device_vendor_and_subgroup_size() {
   return {props.vendorID, subgroup_props.subgroupSize};
 }
 
-FlashAttentionTuningParams get_flash_attention_tuning_params(
+uint32_t max_compute_shared_memory_size() {
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(
+      vulkan::VulkanContext::get().physical_device(), &props);
+  return props.limits.maxComputeSharedMemorySize;
+}
+
+bool flash_attention_scalar_shmem_supported(
+    const FlashAttentionTuningParams& params,
+    uint32_t hsk,
+    uint32_t hsv) {
+  const uint32_t float_type_size =
+      vulkan::VulkanContext::get().shader_float16_supported() ? 2u : 4u;
+  const uint32_t tmpsh = params.workgroup_size * sizeof(float);
+  const uint32_t tmpshv4 = params.workgroup_size * 4u * float_type_size;
+  const uint32_t masksh =
+      params.block_cols * (params.block_rows + 1u) * float_type_size;
+  const uint32_t qf =
+      params.block_rows * (hsk / 4u + 1u) * 4u * float_type_size;
+  const uint32_t d = std::max(hsk, hsv);
+  const uint32_t kvsh = params.shmem_staging
+      ? params.block_cols * (d / 4u + 1u) * 4u * float_type_size
+      : 4u * float_type_size;
+  return tmpsh + tmpshv4 + masksh + qf + kvsh <=
+      max_compute_shared_memory_size();
+}
+
+bool flash_attention_coopmat_shmem_supported(
+    const FlashAttentionTuningParams& params,
+    uint32_t hsk,
+    uint32_t hsv,
+    bool f32acc) {
+  const uint32_t block_rows = params.block_rows;
+  const uint32_t block_cols = params.block_cols;
+  const uint32_t mat_block_rows = 16u;
+  const uint32_t mat_block_cols = 16u;
+  const uint32_t row_split = block_cols / mat_block_cols;
+  const uint32_t hsk_pad = ((hsk + 15u) / 16u) * 16u;
+  const uint32_t hsv_pad = ((hsv + 15u) / 16u) * 16u;
+  const uint32_t acc_type_size = f32acc ? 4u : 2u;
+  const uint32_t f16vec4_size = 8u;
+  const uint32_t tmpsh = (block_cols / mat_block_cols) * sizeof(float);
+  const uint32_t qstride = hsk_pad / 4u + 2u;
+  const uint32_t qf = block_rows * qstride * f16vec4_size;
+  const uint32_t psh_stride = block_rows / 4u + 2u;
+  const uint32_t psh = block_cols * psh_stride * f16vec4_size;
+  const uint32_t sfshstride = (hsk <= 128u) ? (block_rows + 8u) : block_rows;
+  const uint32_t sfsh = block_cols * sfshstride * acc_type_size;
+  const uint32_t kvshstride =
+      (params.shmem_staging ? std::max(hsk_pad, hsv_pad) : mat_block_rows) /
+          4u +
+      2u;
+  const uint32_t vsh_stride = mat_block_cols / 4u * row_split;
+  const uint32_t ksh =
+      ((kvshstride >= vsh_stride) ? (block_cols * kvshstride)
+                                  : (block_cols * vsh_stride)) *
+      f16vec4_size;
+  const uint32_t osh_stride = params.row_split * mat_block_rows / 4u;
+  const uint32_t pvsh = mat_block_cols * osh_stride * f16vec4_size;
+  const uint32_t slope = block_rows * acc_type_size;
+  return tmpsh + qf + psh + sfsh + ksh + pvsh + slope <=
+      max_compute_shared_memory_size();
+}
+
+FlashAttentionTuningParams get_flash_attention_tuning_params_scalar(
     uint32_t hsk,
     uint32_t hsv,
     uint32_t n_rows,
@@ -94,6 +250,7 @@ FlashAttentionTuningParams get_flash_attention_tuning_params(
   const uint32_t d = hsk | hsv;
 
   FlashAttentionTuningParams result{};
+  result.path = FlashAttentionTuningParams::Path::Scalar;
   result.subgroup_size = subgroup_size;
 
   uint32_t row_split_max_hsk = 64u;
@@ -129,9 +286,73 @@ FlashAttentionTuningParams get_flash_attention_tuning_params(
   result.d_split = std::min(std::min(subgroup_size, 8u), d_lsb / 4u);
   result.shmem_staging =
       (vendor_id == kVendorIdNvidia && hsk < 256u && hsv < 256u) ? 1u : 0u;
-  result.limit_occupancy_shmem = 0u;
+
+  if (const char* env = std::getenv("MLX_VULKAN_FLASH_ATTN_OCCUPANCY_LIMIT");
+      env != nullptr) {
+    result.limit_occupancy_shmem = std::stoul(env);
+  } else {
+    result.limit_occupancy_shmem = 0u;
+    if (vendor_id == kVendorIdAmd && n_rows >= 64u && hsk <= 128u) {
+      // Subgroups per WG
+      const uint32_t num_subgroups =
+          result.workgroup_size / result.subgroup_size;
+      // Approx. maximum limit 4 subgroups per SIMD via dummy shmem allocation
+      const uint32_t target_subgroups_per_simd = 4;
+      result.limit_occupancy_shmem =
+          30 * 1024 / target_subgroups_per_simd / num_subgroups;
+    }
+  }
+
+  if (!reduce_block_rows &&
+      !flash_attention_scalar_shmem_supported(result, hsk, hsv)) {
+    result.block_rows = std::max(result.block_rows / 2u, 1u);
+  }
 
   return result;
+}
+
+FlashAttentionTuningParams get_flash_attention_tuning_params_coopmat1(
+    uint32_t hsk,
+    uint32_t hsv) {
+  auto [vendor_id, device_subgroup_size] =
+      vulkan_device_vendor_and_subgroup_size();
+  const uint32_t subgroup_size = std::max(device_subgroup_size, 1u);
+  const uint32_t d = hsk | hsv;
+
+  FlashAttentionTuningParams result{};
+  result.path = FlashAttentionTuningParams::Path::CoopMat1;
+  result.block_rows = 16u;
+  result.block_cols = 64u;
+  result.row_split = 4u;
+  result.subgroup_size = subgroup_size;
+  result.workgroup_size = 4u * subgroup_size;
+  result.d_split =
+      std::min(std::min(subgroup_size, 8u), lowest_set_bit(d) / 4u);
+  result.shmem_staging =
+      (vendor_id == kVendorIdNvidia && hsk < 256u && hsv < 256u) ? 1u : 0u;
+
+  if (const char* env = std::getenv("MLX_VULKAN_FLASH_ATTN_OCCUPANCY_LIMIT");
+      env != nullptr) {
+    result.limit_occupancy_shmem = std::stoul(env);
+  } else {
+    result.limit_occupancy_shmem = 0u;
+  }
+  return result;
+}
+
+FlashAttentionTuningParams get_flash_attention_tuning_params(
+    uint32_t hsk,
+    uint32_t hsv,
+    uint32_t n_rows,
+    uint32_t n_kv) {
+  if (n_rows > 1 &&
+      vulkan::VulkanContext::get().coopmat_flash_attention_f32acc_supported()) {
+    auto coopmat = get_flash_attention_tuning_params_coopmat1(hsk, hsv);
+    if (flash_attention_coopmat_shmem_supported(coopmat, hsk, hsv, true)) {
+      return coopmat;
+    }
+  }
+  return get_flash_attention_tuning_params_scalar(hsk, hsv, n_rows, n_kv);
 }
 
 uint32_t round_up_multiple(uint32_t value, uint32_t multiple) {
@@ -149,6 +370,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
     uint32_t kv_len,
     uint32_t batch,
     bool has_mask,
+    bool do_causal,
     uint32_t q_stride,
     uint32_t k_stride,
     uint32_t v_stride) {
@@ -164,7 +386,7 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
       1u,
   };
 
-  if (has_mask) {
+  if (has_mask && !do_causal) {
     plan.use_mask_opt = q_len >= 32u && kv_len >= 128u &&
         static_cast<uint64_t>(q_len) * static_cast<uint64_t>(kv_len) >= 32768u;
   }
@@ -215,13 +437,36 @@ array make_flash_attention_causal_mask(
     const array& q,
     const array& k,
     Stream s) {
-  array mask = zeros({q.shape(0), 1, q.shape(2), k.shape(2)}, float32, s);
-  if (mask.dtype() != float32) {
+  Shape shape = {q.shape(0), 1, q.shape(2), k.shape(2)};
+  array mask = vulkan::acquire_scratch_array(
+      s, kFlashAttnCausalMaskScratchLane, shape, float16);
+
+  bool needs_refresh = true;
+  {
+    std::lock_guard<std::mutex> lock(flash_attention_causal_mask_cache_mutex);
+    auto& entry = flash_attention_causal_mask_cache[s.index];
+    needs_refresh = !entry.valid || entry.shape != shape;
+    entry.shape = shape;
+    entry.valid = true;
+  }
+
+  if (!needs_refresh) {
+    mask.set_status(array::Status::available);
+    return mask;
+  }
+
+  array mask_f32 = zeros(shape, float32, s);
+  if (mask_f32.dtype() != float32) {
     throw std::runtime_error("Unexpected causal mask dtype.");
   }
   const int n_past = k.shape(2) - q.shape(2);
-  mask = apply_diag_mask_inf_vulkan(mask, n_past, s);
-  return astype(mask, float16, s);
+  mask_f32 = apply_diag_mask_inf_vulkan(mask_f32, n_past, s);
+  array mask_f16 = astype(mask_f32, float16, s);
+  eval(mask_f16);
+  copy_gpu_inplace(mask_f16, mask, CopyType::General, s);
+  mask.set_status(array::Status::evaluated);
+  vulkan::mark_scratch_array_written(s, kFlashAttnCausalMaskScratchLane);
+  return mask;
 }
 
 bool try_dispatch_flash_attention_native_vulkan(
@@ -229,6 +474,7 @@ bool try_dispatch_flash_attention_native_vulkan(
     const array& k,
     const array& v,
     const array* mask,
+    bool do_causal,
     array& out_storage,
     Stream s) {
   const uint32_t batch = checked_u32_size(q.shape(0), "flash_attn batch");
@@ -254,10 +500,12 @@ bool try_dispatch_flash_attention_native_vulkan(
       kv_len,
       batch,
       has_mask,
+      do_causal,
       q_stride,
       k_stride,
       v_stride);
   const auto& tuning = plan.tuning;
+  const auto shader_id = flash_attention_main_shader(tuning.path);
   if (tuning.d_split == 0 || tuning.block_rows == 0 || tuning.block_cols == 0 ||
       tuning.row_split == 0 || hsk % tuning.d_split != 0 ||
       hsv % tuning.d_split != 0 ||
@@ -360,7 +608,8 @@ bool try_dispatch_flash_attention_native_vulkan(
       tuning.row_split,
       tuning.subgroup_size,
       tuning.shmem_staging,
-      (plan.use_mask_opt ? 1u : 0u) | (has_mask ? 2u : 0u),
+      (plan.use_mask_opt ? 1u : 0u) | (has_mask ? 2u : 0u) |
+          (do_causal ? 8u : 0u),
       tuning.limit_occupancy_shmem,
   };
 
@@ -417,7 +666,7 @@ bool try_dispatch_flash_attention_native_vulkan(
         q,
         flash_output,
         plan.use_mask_opt ? *mask_opt : q,
-        vulkan::StaticShaderId::flash_attn_f32_f16_f16_fp32,
+        shader_id,
         command_buffer,
         s,
         push_constants,
@@ -480,8 +729,11 @@ bool try_eval_flash_attention_vulkan(
   array k = inputs[1];
   array v = inputs[2];
 
-  if (k.dtype() != float16 || v.dtype() != float16 || out.ndim() != 4 ||
-      q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
+  const bool supported_kv_dtype =
+      (k.dtype() == float16 || k.dtype() == bfloat16) &&
+      (v.dtype() == float16 || v.dtype() == bfloat16);
+  if (!supported_kv_dtype || out.ndim() != 4 || q.ndim() != 4 ||
+      k.ndim() != 4 || v.ndim() != 4) {
     return false;
   }
 
@@ -512,12 +764,20 @@ bool try_eval_flash_attention_vulkan(
     return x;
   };
 
+  auto debug_eval = [&](array& x, const char* label) {
+    trace_flash_attention_array(label, x);
+    eval(x);
+    trace_flash_attention_array(label, x);
+  };
+
   q = make_contiguous_zero_offset(q);
   k = make_contiguous_zero_offset(k);
   v = make_contiguous_zero_offset(v);
-  eval(q);
-  eval(k);
-  eval(v);
+  k = cast_flash_attention_kv_to_f16(k, kFlashAttnKCastScratchLane, s);
+  v = cast_flash_attention_kv_to_f16(v, kFlashAttnVCastScratchLane, s);
+  debug_eval(q, "q_ready");
+  debug_eval(k, "k_ready");
+  debug_eval(v, "v_ready");
 
   if (q.dtype() != float32 || k.dtype() != float16 || v.dtype() != float16) {
     return false;
@@ -530,31 +790,31 @@ bool try_eval_flash_attention_vulkan(
       float32);
 
   try {
-    std::optional<array> causal_mask;
-    if (do_causal && q_len > 1) {
-      causal_mask = make_flash_attention_causal_mask(q, k, s);
-      *causal_mask = make_contiguous_zero_offset(*causal_mask);
-      eval(*causal_mask);
-      if (causal_mask->dtype() != float16) {
-        return false;
-      }
-    }
+    const bool use_causal_shader = do_causal && q_len > 1;
 
     if (!try_dispatch_flash_attention_native_vulkan(
-            q, k, v, causal_mask ? &(*causal_mask) : nullptr, out_storage, s)) {
+            q, k, v, nullptr, use_causal_shader, out_storage, s)) {
       return false;
     }
     vulkan::mark_scratch_array_written(s, kFlashAttnOutScratchLane);
 
     array out_transposed = swapaxes_in_eval(out_storage, 1, 2);
+    trace_flash_attention_array("out_storage", out_storage);
+    trace_flash_attention_array("out_transposed", out_transposed);
     if (out.dtype() == float32) {
       copy_gpu(out_transposed, out, CopyType::General, s);
+      out.set_status(array::Status::evaluated);
       return true;
     }
 
     array out_final = astype(out_transposed, out.dtype(), s);
-    eval(out_final);
-    copy_gpu(out_final, out, CopyType::General, s);
+    debug_eval(out_final, "out_final");
+    if (out.shape() == out_final.shape()) {
+      out.copy_shared_buffer(out_final);
+    } else {
+      copy_gpu(out_final, out, CopyType::General, s);
+      out.set_status(array::Status::evaluated);
+    }
     return true;
   } catch (const std::runtime_error& e) {
     if (trace_fallback_enabled()) {

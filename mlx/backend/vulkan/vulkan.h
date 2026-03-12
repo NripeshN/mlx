@@ -42,6 +42,27 @@ class VulkanContext {
   VkPhysicalDeviceMemoryProperties memory_properties() const {
     return mem_properties_;
   }
+  bool shader_float16_supported() const {
+    return shader_float16_supported_;
+  }
+  bool subgroup_size_control_supported() const {
+    return subgroup_size_control_supported_;
+  }
+  bool subgroup_require_full_support() const {
+    return subgroup_require_full_support_;
+  }
+  uint32_t subgroup_min_size() const {
+    return subgroup_min_size_;
+  }
+  uint32_t subgroup_max_size() const {
+    return subgroup_max_size_;
+  }
+  bool pipeline_robustness_supported() const {
+    return pipeline_robustness_supported_;
+  }
+  bool coopmat_flash_attention_f32acc_supported() const {
+    return coopmat_flash_attention_f32acc_supported_;
+  }
 
   // Find memory type that supports the given properties
   uint32_t find_memory_type(
@@ -66,6 +87,13 @@ class VulkanContext {
 
   bool initialized_{false};
   bool is_unified_memory_{false};
+  bool shader_float16_supported_{false};
+  bool subgroup_size_control_supported_{false};
+  bool subgroup_require_full_support_{false};
+  uint32_t subgroup_min_size_{0};
+  uint32_t subgroup_max_size_{0};
+  bool pipeline_robustness_supported_{false};
+  bool coopmat_flash_attention_f32acc_supported_{false};
   VkPhysicalDeviceMemoryProperties mem_properties_{};
 };
 

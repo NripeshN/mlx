@@ -27,10 +27,17 @@ const uint32_t num_subgroups = SubGroupSize == 0 ? 0 : WorkGroupSize / SubGroupS
 
 layout (binding = 0) readonly buffer Q {float data_q[];};
 layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
+#if defined(DATA_A_BF16)
+layout (binding = 1) readonly buffer K {uint16_t data_k[];};
+layout (binding = 1) readonly buffer KV4 {u16vec4 data_kv4[];};
+layout (binding = 2) readonly buffer V {uint16_t data_v[];};
+layout (binding = 2) readonly buffer VV4 {u16vec4 data_vv4[];};
+#else
 layout (binding = 1) readonly buffer K {float16_t data_k[];};
 layout (binding = 1) readonly buffer KV4 {f16vec4 data_kv4[];};
 layout (binding = 2) readonly buffer V {float16_t data_v[];};
 layout (binding = 2) readonly buffer VV4 {f16vec4 data_vv4[];};
+#endif
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
 
 // If SubGroupSize is set to 0 then only use shmem reductions
@@ -76,6 +83,12 @@ void main() {
     }
 
 #define tile_row(r) (row_tid * rows_per_thread + (r))
+
+#if defined(DATA_A_BF16)
+#define LOAD_KV4(ptr) FLOAT_TYPEV4(bf16_to_fp32(uvec4(ptr)))
+#else
+#define LOAD_KV4(ptr) FLOAT_TYPEV4(ptr)
+#endif
 
     uint32_t q_offset = gqa_iq1*p.nb01 + (iq2*p.nb02 + iq3*p.nb03) / 4;
 
@@ -138,9 +151,17 @@ void main() {
     uint32_t mask_opt = 0;
     uint32_t mask_opt_idx = ~0;
     uint32_t mask_opt_bits = 0;
+    const uint32_t n_past = KV - N;
 
     [[dont_unroll]]
     for (uint32_t j = start_j; j < end_j; ++j) {
+        if (CAUSAL_ONLY) {
+            const uint32_t block_first_col = j * Bc;
+            const uint32_t block_last_row = min(i * Br + Br - 1, N - 1);
+            if (block_first_col > n_past + block_last_row) {
+                continue;
+            }
+        }
         if (MASK_ENABLE) {
             if (USE_MASK_OPT && mask_opt_idx != j / 16) {
                 mask_opt_idx = j / 16;
@@ -207,7 +228,7 @@ void main() {
                         uint iqs = (coord % BLOCK_SIZE);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
 #else
-                        K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
+                        K_Tf = LOAD_KV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
 #endif
                     }
 
@@ -241,7 +262,7 @@ void main() {
                         uint iqs = (coord % BLOCK_SIZE);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
 #else
-                        K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
+                        K_Tf = LOAD_KV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
 #endif
                     }
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
@@ -266,7 +287,7 @@ void main() {
                         uint iqs = (coord % BLOCK_SIZE);
                         K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
 #else
-                        K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
+                        K_Tf = LOAD_KV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
 #endif
                     }
                     [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
@@ -299,6 +320,16 @@ void main() {
                     FLOAT_TYPE mvf = masksh[(c * cols_per_iter + col_tid) * masksh_stride + tile_row(r)];
 
                     Sf[r][c] += slope[r]*mvf;
+                }
+            }
+        } else if (CAUSAL_ONLY) {
+            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                const uint32_t global_col = j * Bc + c * cols_per_iter + col_tid;
+                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                    const uint32_t global_row = tile_row(r);
+                    if (global_col > n_past + global_row) {
+                        Sf[r][c] = ACC_TYPE(NEG_FLT_MAX_OVER_2);
+                    }
                 }
             }
         }
@@ -342,7 +373,7 @@ void main() {
                         uint iqs = (coord % BLOCK_SIZE);
                         V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
 #else
-                        V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
+                        V_Tf = LOAD_KV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
 #endif
                     }
 
@@ -374,7 +405,7 @@ void main() {
                     uint iqs = (coord % BLOCK_SIZE);
                     Vf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
 #else
-                    Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
+                    Vf = LOAD_KV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
 #endif
                 }
                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {

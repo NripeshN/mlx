@@ -137,6 +137,60 @@ struct TensorLayout4D {
   uint32_t nb03{0};
 };
 
+struct PipelineCreationOptions {
+  bool disable_robustness{false};
+  bool require_full_subgroups{false};
+  uint32_t required_subgroup_size{0};
+};
+
+bool starts_with(const std::string& str, const char* prefix) {
+  return str.rfind(prefix, 0) == 0;
+}
+
+bool ends_with(const std::string& str, const char* suffix) {
+  const size_t suffix_len = std::strlen(suffix);
+  return str.size() >= suffix_len &&
+      str.compare(str.size() - suffix_len, suffix_len, suffix) == 0;
+}
+
+PipelineCreationOptions pipeline_creation_options(
+    StaticShaderId shader_id,
+    const std::vector<uint32_t>& specialization_constants) {
+  PipelineCreationOptions options;
+  const std::string shader_name = static_shader_name(shader_id);
+
+  if (shader_name == "fa_mask_opt") {
+    options.disable_robustness = true;
+    if (specialization_constants.size() >= 2 &&
+        specialization_constants[1] != 0) {
+      options.require_full_subgroups = true;
+      options.required_subgroup_size =
+          specialization_constants[0] / specialization_constants[1];
+    }
+    return options;
+  }
+
+  if (shader_name == "fa_split_k_reduce") {
+    options.disable_robustness = true;
+    if (!specialization_constants.empty()) {
+      options.required_subgroup_size = specialization_constants[0];
+    }
+    return options;
+  }
+
+  if (starts_with(shader_name, "flash_attn_")) {
+    options.disable_robustness = true;
+    if (!ends_with(shader_name, "_cm2") &&
+        specialization_constants.size() > 8 &&
+        specialization_constants[8] != 0) {
+      options.require_full_subgroups = true;
+      options.required_subgroup_size = specialization_constants[8];
+    }
+  }
+
+  return options;
+}
+
 TensorLayout4D make_tensor_layout_4d(
     const array& arr,
     const char* tensor_name) {
@@ -918,6 +972,8 @@ ComputePipeline* KernelManager::get_pipeline(
   }
 
   VkDevice device = VulkanContext::get().device();
+  const auto pipeline_options =
+      pipeline_creation_options(shader_id, specialization_constants);
   ShaderModule* shader = get_shader(shader_id);
   if (!shader) {
     throw std::runtime_error(
@@ -970,6 +1026,11 @@ ComputePipeline* KernelManager::get_pipeline(
   pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
   pipelineInfo.stage.sType =
       VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  if (VulkanContext::get().subgroup_require_full_support() &&
+      pipeline_options.require_full_subgroups) {
+    pipelineInfo.stage.flags =
+        VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+  }
   pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
   pipelineInfo.stage.module = shader->module;
   pipelineInfo.stage.pName = "main";
@@ -994,7 +1055,33 @@ ComputePipeline* KernelManager::get_pipeline(
     pipelineInfo.stage.pSpecializationInfo = &specialization_info;
   }
 
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info{};
+  if (VulkanContext::get().subgroup_size_control_supported() &&
+      pipeline_options.required_subgroup_size >=
+          VulkanContext::get().subgroup_min_size() &&
+      pipeline_options.required_subgroup_size <=
+          VulkanContext::get().subgroup_max_size() &&
+      pipeline_options.required_subgroup_size > 0) {
+    subgroup_size_info.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+    subgroup_size_info.requiredSubgroupSize =
+        pipeline_options.required_subgroup_size;
+    pipelineInfo.stage.pNext = &subgroup_size_info;
+  }
+
   pipelineInfo.layout = pipeline_layout;
+
+  VkPipelineRobustnessCreateInfoEXT pipeline_robustness_info{};
+  if (VulkanContext::get().pipeline_robustness_supported() &&
+      pipeline_options.disable_robustness) {
+    pipeline_robustness_info.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT;
+    pipeline_robustness_info.storageBuffers =
+        VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+    pipeline_robustness_info.uniformBuffers =
+        VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+    pipelineInfo.pNext = &pipeline_robustness_info;
+  }
 
   VkPipeline pipeline;
   if (vkCreateComputePipelines(
