@@ -308,6 +308,23 @@ void throw_if_vk_error(VkResult result, const std::string& context) {
   }
 }
 
+VkResult wait_for_queue_idle_with_retry(VkQueue queue) {
+  constexpr int kQueueIdleRetryCount = 64;
+  VkResult result = VK_SUCCESS;
+  for (int retry = 0; retry < kQueueIdleRetryCount; ++retry) {
+    result = vkQueueWaitIdle(queue);
+    if (result == VK_SUCCESS) {
+      return result;
+    }
+    if (result != VK_NOT_READY && result != VK_TIMEOUT) {
+      return result;
+    }
+    const auto backoff_ms = std::min(8, 1 << std::min(retry, 3));
+    std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+  }
+  return result;
+}
+
 thread_local std::vector<std::string> sync_label_stack;
 
 std::string current_sync_label() {
@@ -523,7 +540,7 @@ class VulkanDevice {
     {
       std::lock_guard<std::mutex> queue_lock(queue_mutex_);
       throw_if_vk_error(
-          vkQueueWaitIdle(VulkanContext::get().compute_queue()),
+          wait_for_queue_idle_with_retry(VulkanContext::get().compute_queue()),
           "[vulkan::synchronize] Failed waiting for compute queue idle");
     }
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1246,7 +1263,7 @@ class VulkanDevice {
 
     if (queue != VK_NULL_HANDLE) {
       std::lock_guard<std::mutex> queue_lock(queue_mutex_);
-      vkQueueWaitIdle(queue);
+      wait_for_queue_idle_with_retry(queue);
     }
 
     std::lock_guard<std::mutex> lock(mutex_);

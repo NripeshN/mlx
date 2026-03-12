@@ -559,11 +559,9 @@ UnaryPushConstants make_unary_push_constants(
   push_constants.nb11 = out_layout.nb01;
   push_constants.nb12 = out_layout.nb02;
   push_constants.nb13 = out_layout.nb03;
-  const uint32_t a_offset = checked_offset(in, "src0", 0xFFFFFFFFu);
-  const uint32_t d_offset = checked_offset(out, "dst", 0xFFFFFFFFu);
-  push_constants.misalign_offsets = (a_offset << 16) | (d_offset & 0xFFFF);
-  push_constants.src_offset = a_offset;
-  push_constants.dst_offset = d_offset;
+  const uint32_t a_offset = checked_offset(in, "src0", 0xFFFFu);
+  const uint32_t d_offset = checked_offset(out, "dst", 0xFFFFu);
+  push_constants.misalign_offsets = (a_offset << 16) | d_offset;
   push_constants.param1 = param1;
   push_constants.param2 = param2;
   init_unary_fastdiv(push_constants);
@@ -604,11 +602,9 @@ make_sum_rows_push_constants(const array& in, const array& out, float weight) {
   push_constants.nb13 = out_layout.nb03;
   push_constants.weight = weight;
 
-  const uint32_t a_offset = checked_offset(in, "src0", 0xFFFFFFFFu);
-  const uint32_t d_offset = checked_offset(out, "dst", 0xFFFFFFFFu);
-  push_constants.misalign_offsets = (a_offset << 16) | (d_offset & 0xFFFF);
-  push_constants.src_offset = a_offset;
-  push_constants.dst_offset = d_offset;
+  const uint32_t a_offset = checked_offset(in, "src0", 0xFFFFu);
+  const uint32_t d_offset = checked_offset(out, "dst", 0xFFFFu);
+  push_constants.misalign_offsets = (a_offset << 16) | d_offset;
 
   const uint32_t ne0_12 = checked_mul_u32(
       push_constants.ne01, push_constants.ne02, "sum_rows ne01*ne02");

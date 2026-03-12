@@ -218,8 +218,6 @@ struct UnaryPushConstants {
   uint32_t nb12;
   uint32_t nb13;
   uint32_t misalign_offsets;
-  uint32_t src_offset;
-  uint32_t dst_offset;
   float param1;
   float param2;
   uint32_t ne0_012mp;
@@ -257,8 +255,6 @@ struct SumRowsPushConstants {
   uint32_t nb13;
   float weight;
   uint32_t misalign_offsets;
-  uint32_t src_offset;
-  uint32_t dst_offset;
   uint32_t ne0_12mp;
   uint32_t ne0_12L;
   uint32_t ne0_1mp;

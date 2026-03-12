@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -41,6 +42,80 @@ bool has_row_contiguous_strides(const mlx::core::array& arr) {
     expected *= arr.shape(i);
   }
   return true;
+}
+
+int64_t element_offset(const mlx::core::array& arr) {
+  const auto item_size = static_cast<int64_t>(mlx::core::size_of(arr.dtype()));
+  return item_size == 0 ? 0 : arr.offset() / item_size;
+}
+
+bool has_large_element_offset(const mlx::core::array& arr) {
+  return element_offset(arr) > static_cast<int64_t>(0xFFFFu);
+}
+
+std::vector<VkBufferCopy> make_strided_copy_regions(
+    const mlx::core::array& in,
+    const mlx::core::array& out) {
+  if (in.shape() != out.shape() || in.dtype() != out.dtype()) {
+    return {};
+  }
+
+  const auto& shape = in.shape();
+  const auto& in_strides = in.strides();
+  const auto& out_strides = out.strides();
+  if (shape.empty()) {
+    return {
+        {static_cast<VkDeviceSize>(in.offset()),
+         static_cast<VkDeviceSize>(out.offset()),
+         static_cast<VkDeviceSize>(mlx::core::size_of(in.dtype()))}};
+  }
+
+  size_t block_elems = 1;
+  size_t suffix_begin = shape.size();
+  for (size_t dim = shape.size(); dim-- > 0;) {
+    if (shape[dim] == 1) {
+      suffix_begin = dim;
+      continue;
+    }
+    if (in_strides[dim] != static_cast<int64_t>(block_elems) ||
+        out_strides[dim] != static_cast<int64_t>(block_elems)) {
+      break;
+    }
+    block_elems *= static_cast<size_t>(shape[dim]);
+    suffix_begin = dim;
+  }
+
+  if (block_elems == 0) {
+    return {};
+  }
+
+  const auto item_size =
+      static_cast<VkDeviceSize>(mlx::core::size_of(in.dtype()));
+  std::vector<VkBufferCopy> regions;
+
+  std::function<void(size_t, int64_t, int64_t)> emit_regions =
+      [&](size_t dim, int64_t in_elem_offset, int64_t out_elem_offset) {
+        if (dim == suffix_begin) {
+          VkBufferCopy region{};
+          region.srcOffset = static_cast<VkDeviceSize>(in.offset()) +
+              static_cast<VkDeviceSize>(in_elem_offset) * item_size;
+          region.dstOffset = static_cast<VkDeviceSize>(out.offset()) +
+              static_cast<VkDeviceSize>(out_elem_offset) * item_size;
+          region.size = static_cast<VkDeviceSize>(block_elems) * item_size;
+          regions.push_back(region);
+          return;
+        }
+
+        for (int64_t i = 0; i < shape[dim]; ++i) {
+          emit_regions(
+              dim + 1,
+              in_elem_offset + i * in_strides[dim],
+              out_elem_offset + i * out_strides[dim]);
+        }
+      };
+
+  emit_regions(0, 0, 0);
+  return regions;
 }
 
 size_t num_elements(const Shape& shape) {
@@ -706,6 +781,10 @@ void copy_gpu_inplace(
   const bool is_slice_copy =
       shader_copy_type && shader_id.has_value() && in.size() != out.size();
 
+  const bool segmented_buffer_copy = same_dtype &&
+      (shader_copy || is_slice_copy) &&
+      (has_large_element_offset(in_view) || has_large_element_offset(out_view));
+
   const bool contiguous_large_rank_copy = same_dtype &&
       dispatch_shape.size() > 4 && in_view.flags().contiguous &&
       out_view.flags().contiguous && in_view.size() == out_view.size() &&
@@ -747,6 +826,25 @@ void copy_gpu_inplace(
     throw std::runtime_error(oss.str());
   }
 
+  const bool same_buffer = in.buffer().ptr() == out.buffer().ptr();
+  if (segmented_buffer_copy && same_buffer) {
+    array staged(out_view.shape(), out_view.dtype(), nullptr, {});
+    staged.set_data(mlx::core::allocator::malloc(staged.nbytes()));
+
+    const auto stage_in_type =
+        has_row_contiguous_strides(in_view) && staged.flags().row_contiguous
+        ? CopyType::Vector
+        : CopyType::GeneralGeneral;
+    copy_gpu_inplace(in_view, staged, stage_in_type, s);
+
+    const auto stage_out_type = has_row_contiguous_strides(staged) &&
+            has_row_contiguous_strides(out_view)
+        ? CopyType::Vector
+        : CopyType::GeneralGeneral;
+    copy_gpu_inplace(staged, out_view, stage_out_type, s);
+    return;
+  }
+
   VkCommandBuffer cmd_buffer = vulkan::begin_command_recording(s.index);
 
   // Get buffer handles
@@ -778,6 +876,23 @@ void copy_gpu_inplace(
 
     vkCmdCopyBuffer(
         cmd_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
+
+    vulkan::retain_array_for_stream(s, in_view);
+    vulkan::retain_array_for_stream(s, out_view);
+  } else if (segmented_buffer_copy) {
+    const auto copy_regions = make_strided_copy_regions(in_view, out_view);
+    if (copy_regions.empty()) {
+      vulkan::end_command_recording(s.index);
+      throw std::runtime_error(
+          "Copy operation failed on Vulkan: unsupported large-offset strided copy.");
+    }
+
+    vkCmdCopyBuffer(
+        cmd_buffer,
+        in_buf->buffer,
+        out_buf->buffer,
+        static_cast<uint32_t>(copy_regions.size()),
+        copy_regions.data());
 
     vulkan::retain_array_for_stream(s, in_view);
     vulkan::retain_array_for_stream(s, out_view);
