@@ -23,6 +23,7 @@ namespace {
 using mlx::core::Dtype;
 using mlx::core::Shape;
 using mlx::core::Strides;
+namespace vulkan = mlx::core::vulkan;
 
 bool has_row_contiguous_strides(const mlx::core::array& arr) {
   if (arr.ndim() == 0) {
@@ -336,7 +337,12 @@ bool is_supported_copy_layout(const mlx::core::array& arr) {
   if (arr.size() > std::numeric_limits<uint32_t>::max()) {
     return false;
   }
-  if (arr.offset() < 0 || arr.offset() > 0xFFFF) {
+  const auto item_size = static_cast<int64_t>(size_of(arr.dtype()));
+  if (item_size <= 0 || arr.offset() < 0 || (arr.offset() % item_size) != 0) {
+    return false;
+  }
+  const auto elem_offset = arr.offset() / item_size;
+  if (elem_offset > 0xFFFF) {
     return false;
   }
   for (auto dim : arr.shape()) {
@@ -360,7 +366,7 @@ bool trace_copy_dispatch_enabled() {
   return enabled;
 }
 
-std::string get_copy_shader_name(
+std::optional<vulkan::StaticShaderId> get_copy_shader_id(
     const mlx::core::array& in,
     mlx::core::array& out) {
   // Fast transpose path: source is column-contiguous and destination is
@@ -371,10 +377,10 @@ std::string get_copy_shader_name(
       out.flags().row_contiguous) {
     const size_t item_size = size_of(in.dtype());
     if (item_size == 2) {
-      return "cpy_transpose_16";
+      return vulkan::StaticShaderId::cpy_transpose_16;
     }
     if (item_size == 4) {
-      return "cpy_transpose_32";
+      return vulkan::StaticShaderId::cpy_transpose_32;
     }
   }
 
@@ -384,22 +390,16 @@ std::string get_copy_shader_name(
       out.flags().row_contiguous && in.size() == out.size()) {
     if (in.dtype() == mlx::core::float32 &&
         out.dtype() == mlx::core::bfloat16) {
-      return "contig_cpy_f32_bf16";
+      return vulkan::StaticShaderId::contig_cpy_f32_bf16;
     }
     if (in.dtype() == mlx::core::bfloat16 &&
         out.dtype() == mlx::core::float32) {
-      return "contig_cpy_bf16_f32";
+      return vulkan::StaticShaderId::contig_cpy_bf16_f32;
     }
     if (in.dtype() == mlx::core::bfloat16 &&
         out.dtype() == mlx::core::bfloat16) {
-      return "contig_cpy_bf16_bf16";
+      return vulkan::StaticShaderId::contig_cpy_bf16_bf16;
     }
-  }
-
-  auto src_suffix = copy_dtype_suffix(in.dtype());
-  auto dst_suffix = copy_dtype_suffix(out.dtype());
-  if (src_suffix.empty() || dst_suffix.empty()) {
-    return {};
   }
 
   const bool supported_pair =
@@ -437,10 +437,98 @@ std::string get_copy_shader_name(
       (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::complex64);
 
   if (!supported_pair) {
-    return {};
+    return std::nullopt;
   }
 
-  return "cpy_" + src_suffix + "_" + dst_suffix;
+  if (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::float32) {
+    return vulkan::StaticShaderId::cpy_f32_f32;
+  }
+  if (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::float16) {
+    return vulkan::StaticShaderId::cpy_f32_f16;
+  }
+  if (in.dtype() == mlx::core::float16 && out.dtype() == mlx::core::float16) {
+    return vulkan::StaticShaderId::cpy_f16_f16;
+  }
+  if (in.dtype() == mlx::core::float16 && out.dtype() == mlx::core::float32) {
+    return vulkan::StaticShaderId::cpy_f16_f32;
+  }
+  if (in.dtype() == mlx::core::bfloat16 && out.dtype() == mlx::core::float32) {
+    return vulkan::StaticShaderId::cpy_bf16_f32;
+  }
+  if (in.dtype() == mlx::core::bfloat16 && out.dtype() == mlx::core::bfloat16) {
+    return vulkan::StaticShaderId::cpy_bf16_bf16;
+  }
+  if (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::bfloat16) {
+    return vulkan::StaticShaderId::cpy_f32_bf16;
+  }
+  if (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::int32) {
+    return vulkan::StaticShaderId::cpy_f32_i32;
+  }
+  if (in.dtype() == mlx::core::int8 && out.dtype() == mlx::core::int32) {
+    return vulkan::StaticShaderId::cpy_i8_i32;
+  }
+  if (in.dtype() == mlx::core::int16 && out.dtype() == mlx::core::int32) {
+    return vulkan::StaticShaderId::cpy_i16_i32;
+  }
+  if (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int8) {
+    return vulkan::StaticShaderId::cpy_i32_i8;
+  }
+  if (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int16) {
+    return vulkan::StaticShaderId::cpy_i32_i16;
+  }
+  if (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::float32) {
+    return vulkan::StaticShaderId::cpy_i32_f32;
+  }
+  if (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int32) {
+    return vulkan::StaticShaderId::cpy_i32_i32;
+  }
+  if (in.dtype() == mlx::core::int8 && out.dtype() == mlx::core::int8) {
+    return vulkan::StaticShaderId::cpy_i8_i8;
+  }
+  if (in.dtype() == mlx::core::int16 && out.dtype() == mlx::core::int16) {
+    return vulkan::StaticShaderId::cpy_i16_i16;
+  }
+  if (in.dtype() == mlx::core::uint16 && out.dtype() == mlx::core::uint16) {
+    return vulkan::StaticShaderId::cpy_u16_u16;
+  }
+  if (in.dtype() == mlx::core::uint8 && out.dtype() == mlx::core::uint8) {
+    return vulkan::StaticShaderId::cpy_u8_u8;
+  }
+  if (in.dtype() == mlx::core::uint8 && out.dtype() == mlx::core::uint32) {
+    return vulkan::StaticShaderId::cpy_u8_u32;
+  }
+  if (in.dtype() == mlx::core::uint16 && out.dtype() == mlx::core::uint32) {
+    return vulkan::StaticShaderId::cpy_u16_u32;
+  }
+  if (in.dtype() == mlx::core::bool_ && out.dtype() == mlx::core::bool_) {
+    return vulkan::StaticShaderId::cpy_bool_bool;
+  }
+  if (in.dtype() == mlx::core::int64 && out.dtype() == mlx::core::int64) {
+    return vulkan::StaticShaderId::cpy_i64_i64;
+  }
+  if (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::uint32) {
+    return vulkan::StaticShaderId::cpy_u32_u32;
+  }
+  if (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::uint8) {
+    return vulkan::StaticShaderId::cpy_u32_u8;
+  }
+  if (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::uint16) {
+    return vulkan::StaticShaderId::cpy_u32_u16;
+  }
+  if (in.dtype() == mlx::core::uint64 && out.dtype() == mlx::core::uint64) {
+    return vulkan::StaticShaderId::cpy_u64_u64;
+  }
+  if (in.dtype() == mlx::core::uint32 && out.dtype() == mlx::core::float32) {
+    return vulkan::StaticShaderId::cpy_u32_f32;
+  }
+  if (in.dtype() == mlx::core::int32 && out.dtype() == mlx::core::int64) {
+    return vulkan::StaticShaderId::cpy_i32_i64;
+  }
+  if (in.dtype() == mlx::core::float32 && out.dtype() == mlx::core::complex64) {
+    return vulkan::StaticShaderId::cpy_f32_c64;
+  }
+
+  return std::nullopt;
 }
 
 int64_t read_dynamic_index(const mlx::core::array& indices, size_t i) {
@@ -529,7 +617,7 @@ void copy_gpu_inplace(
       o_strides == out.strides() && resolved_i_offset == 0 &&
       resolved_o_offset == 0;
 
-  const auto shader_name = get_copy_shader_name(in_view, out_view);
+  const auto shader_id = get_copy_shader_id(in_view, out_view);
 
   const bool shader_copy_type = ctype == CopyType::General ||
       ctype == CopyType::GeneralGeneral ||
@@ -537,7 +625,7 @@ void copy_gpu_inplace(
 
   const bool shader_copy = shader_copy_type &&
       is_supported_copy_layout(in_view) && is_supported_copy_layout(out_view) &&
-      !shader_name.empty();
+      shader_id.has_value();
 
   const bool staging_scalar_fill = ctype == CopyType::Scalar &&
       resolved_i_offset == 0 && resolved_o_offset == 0 && full_tensor_copy &&
@@ -568,7 +656,7 @@ void copy_gpu_inplace(
   }
 
   const bool is_slice_copy =
-      shader_copy_type && !shader_name.empty() && in.size() != out.size();
+      shader_copy_type && shader_id.has_value() && in.size() != out.size();
 
   const bool contiguous_large_rank_copy = same_dtype &&
       dispatch_shape.size() > 4 && in_view.flags().contiguous &&
@@ -605,7 +693,9 @@ void copy_gpu_inplace(
         << "out_strides=" << seq_to_string(out_view.strides()) << " "
         << "in_offset=" << in_view.offset() << " "
         << "out_offset=" << out_view.offset() << " "
-        << "shader_name=" << (shader_name.empty() ? "<none>" : shader_name);
+        << "shader_name="
+        << (shader_id.has_value() ? vulkan::static_shader_name(*shader_id)
+                                  : "<none>");
     throw std::runtime_error(oss.str());
   }
 
@@ -645,8 +735,10 @@ void copy_gpu_inplace(
     vulkan::retain_array_for_stream(s, out_view);
   } else if (shader_copy || is_slice_copy) {
     if (trace_copy_dispatch_enabled() &&
-        (shader_name == "cpy_bf16_f32" || shader_name == "cpy_bf16_bf16")) {
-      std::cerr << "[vulkan-copy] shader=" << shader_name
+        (*shader_id == vulkan::StaticShaderId::cpy_bf16_f32 ||
+         *shader_id == vulkan::StaticShaderId::cpy_bf16_bf16)) {
+      std::cerr << "[vulkan-copy] shader="
+                << vulkan::static_shader_name(*shader_id)
                 << " ctype=" << copy_type_name(ctype)
                 << " in_shape=" << seq_to_string(in_view.shape())
                 << " out_shape=" << seq_to_string(out_view.shape())
@@ -661,7 +753,7 @@ void copy_gpu_inplace(
             "Copy operation failed on Vulkan: >4D non-contiguous arrays not supported");
       }
 
-      vulkan::dispatch_unary_op(in_view, out_view, shader_name, cmd_buffer, s);
+      vulkan::dispatch_unary_op(in_view, out_view, *shader_id, cmd_buffer, s);
     } catch (const std::runtime_error& e) {
       vulkan::end_command_recording(s.index);
       throw std::runtime_error(

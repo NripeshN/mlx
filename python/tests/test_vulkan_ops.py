@@ -995,6 +995,31 @@ def test_fast_rope_bf16_vulkan_gpu(self):
 setattr(TestVulkanOpsParity, "test_fast_rope_bf16_vulkan_gpu", test_fast_rope_bf16_vulkan_gpu)
 
 
+def test_bf16_copy_with_large_destination_offset_vulkan_gpu(self):
+    """Regression test: bf16 general copy should accept large byte offsets."""
+
+    def run_copy():
+        src = (
+            mx.arange(1, 1 + 8 * 256 * 128, dtype=mx.float32)
+            .reshape(1, 8, 256, 128)
+            .astype(mx.bfloat16)
+        )
+        dst = mx.zeros((2, 8, 256, 128), dtype=mx.bfloat16)
+        updated = mx.concatenate([dst[:1], src], axis=0)
+        return updated[1]
+
+    cpu_out = self._run_on_device(mx.cpu, run_copy).astype(mx.float32)
+    gpu_out = self._run_on_device(mx.gpu, run_copy).astype(mx.float32)
+    self._assert_outputs_close(gpu_out, cpu_out, atol=1e-2, rtol=1e-2)
+
+
+setattr(
+    TestVulkanOpsParity,
+    "test_bf16_copy_with_large_destination_offset_vulkan_gpu",
+    test_bf16_copy_with_large_destination_offset_vulkan_gpu,
+)
+
+
 TestVulkanOpsParity = unittest.skipIf(
     not mx.is_available(mx.gpu), "GPU is not available"
 )(TestVulkanOpsParity)
