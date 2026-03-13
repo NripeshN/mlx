@@ -106,6 +106,7 @@ cmake-format -i CMakeLists.txt
 - Location: `tests/` directory
 - Naming: `*_tests.cpp`
 - Macros: `TEST_CASE("name")`, `CHECK()`, `CHECK_EQ()`, `CHECK_THROWS_AS()`
+- Running with fail-fast: `./build/tests/tests --abort-after=1`
 
 ### Python Tests (unittest)
 - Location: `python/tests/`
@@ -121,8 +122,8 @@ mlx/               # C++ core library
   backend/         # cpu, metal, cuda, vulkan backends
     vulkan/        # Vulkan backend (this branch)
       *.cpp/*.hpp  # C++ implementation
-      vulkan-shaders/  # Additional shader resources
-        *.comp       # Vulkan compute shaders (GLSL)
+      kernels/     # Additional shader resources
+        *.comp     # Vulkan compute shaders (GLSL)
   io/              # safetensors, gguf I/O
 python/src/        # nanobind bindings
 python/tests/      # Python unit tests
@@ -175,9 +176,3 @@ tests/             # C++ unit tests
 - For Vulkan Reference implementation read ./llama.cpp/ggml/src/ggml-vulkan/
 - ALWAYS check for existing shaders in ./mlx/backend/vulkan/kernels/ before introducing new onces
 - Shaders should be compiled automatically by CMake; check build output if shaders fail
-- When you complete a task, send me a push notification:
-```shell
-curl -s -X POST https://api.getmoshi.app/api/webhook \
-  -H "Content-Type: application/json" \
-  -d '{"token": "Xjqyek7li0vXgBnIlvXEn3VJgdhWf8qW", "title": "Done", "message": "Brief summary"}'
-```
