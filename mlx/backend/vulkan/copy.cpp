@@ -800,8 +800,8 @@ void copy_gpu_inplace(
             in_view,
             out_view,
             dispatch_elements,
-            in_view.offset(),
-            out_view.offset(),
+            element_offset(in_view),
+            element_offset(out_view),
             s)) {
       return;
     }
@@ -855,10 +855,8 @@ void copy_gpu_inplace(
   if (raw_buffer_copy) {
     // Simple contiguous memory copy using Vulkan command buffer
     VkBufferCopy copy_region{};
-    copy_region.srcOffset =
-        static_cast<VkDeviceSize>(resolved_i_offset * size_of(in.dtype()));
-    copy_region.dstOffset =
-        static_cast<VkDeviceSize>(resolved_o_offset * size_of(out.dtype()));
+    copy_region.srcOffset = static_cast<VkDeviceSize>(in_view.offset());
+    copy_region.dstOffset = static_cast<VkDeviceSize>(out_view.offset());
     copy_region.size =
         static_cast<VkDeviceSize>(dispatch_elements * size_of(out.dtype()));
 

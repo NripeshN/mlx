@@ -1042,6 +1042,27 @@ setattr(
 )
 
 
+def test_host_source_slice_cast_copy_vulkan_gpu(self):
+    host_src = self._run_on_device(
+        mx.cpu,
+        lambda: mx.arange(0, 10, dtype=mx.float32),
+    )
+
+    def run_copy():
+        return host_src[2:8].astype(mx.float16)
+
+    cpu_out = self._run_on_device(mx.cpu, run_copy).astype(mx.float32)
+    gpu_out = self._run_on_device(mx.gpu, run_copy).astype(mx.float32)
+    self._assert_outputs_close(gpu_out, cpu_out, atol=0.0, rtol=0.0)
+
+
+setattr(
+    TestVulkanOpsParity,
+    "test_host_source_slice_cast_copy_vulkan_gpu",
+    test_host_source_slice_cast_copy_vulkan_gpu,
+)
+
+
 TestVulkanOpsParity = unittest.skipIf(
     not mx.is_available(mx.gpu), "GPU is not available"
 )(TestVulkanOpsParity)
