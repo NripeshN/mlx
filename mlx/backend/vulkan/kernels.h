@@ -199,6 +199,10 @@ struct BinaryPushConstants {
   int32_t param3;
 };
 
+struct TernaryPushConstants {
+  uint32_t ne;
+};
+
 struct UnaryPushConstants {
   uint32_t ne;
   uint32_t ne00;
@@ -465,6 +469,15 @@ void dispatch_binary_op(
     float param1,
     float param2 = 0.0f,
     int32_t param3 = 0);
+
+void dispatch_ternary_op(
+    const array& cond,
+    const array& x,
+    const array& y,
+    array& out,
+    StaticShaderId shader_id,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s);
 
 void dispatch_unary_op(
     const array& in,

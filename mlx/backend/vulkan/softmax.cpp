@@ -1,17 +1,57 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/dtype_utils.h"
 
 namespace mlx::core {
 
 namespace {
+
+bool is_supported_softmax_layout(const array& arr) {
+  return arr.flags().contiguous && arr.offset() == 0 && arr.ndim() > 0 &&
+      arr.strides().back() == 1;
+}
+
+array collapse_softmax_leading_dims(const array& arr, Stream s) {
+  if (arr.ndim() <= 4) {
+    return arr;
+  }
+  return flatten_in_eval(arr, 0, arr.ndim() - 4, s);
+}
 
 bool try_eval_softmax_vulkan(
     const std::vector<array>& inputs,
     array& out,
     bool /*precise*/,
     Stream s) {
+  auto trace_softmax_failure = [&](std::string_view reason) {
+    if (!trace_fallback_enabled()) {
+      return;
+    }
+    std::ostringstream oss;
+    oss << "softmax_vulkan_unsupported reason=" << reason
+        << " inputs=" << inputs.size() << " out_shape=" << out.shape()
+        << " out_dtype=" << dtype_to_string(out.dtype());
+    if (!inputs.empty()) {
+      oss << " in_shape=" << inputs[0].shape()
+          << " in_dtype=" << dtype_to_string(inputs[0].dtype())
+          << " in_ndim=" << inputs[0].ndim()
+          << " in_offset=" << inputs[0].offset();
+      if (inputs[0].ndim() > 0) {
+        oss << " in_last_stride=" << inputs[0].strides().back()
+            << " in_last_dim=" << inputs[0].shape(inputs[0].ndim() - 1);
+      }
+    }
+    oss << " out_ndim=" << out.ndim() << " out_offset=" << out.offset();
+    if (out.ndim() > 0) {
+      oss << " out_last_stride=" << out.strides().back()
+          << " out_last_dim=" << out.shape(out.ndim() - 1);
+    }
+    trace_fallback(oss.str());
+  };
+
   if (inputs.size() != 1) {
+    trace_softmax_failure("expected_single_input");
     return false;
   }
 
@@ -20,6 +60,7 @@ bool try_eval_softmax_vulkan(
   const bool f16_io = in.dtype() == float16 && out.dtype() == float16;
   const bool bf16_io = in.dtype() == bfloat16 && out.dtype() == bfloat16;
   if (in.ndim() == 0 || (!f32_io && !f16_io && !bf16_io)) {
+    trace_softmax_failure("unsupported_dtype_or_scalar_input");
     return false;
   }
 
@@ -34,28 +75,30 @@ bool try_eval_softmax_vulkan(
   array softmax_out_target =
       use_f32_staging_io ? array(out.shape(), float32, nullptr, {}) : out;
 
-  if (!in.flags().contiguous || in.offset() != 0 || in.strides().back() != 1 ||
-      !is_supported_unary_layout(in)) {
+  if (!is_supported_softmax_layout(in)) {
     in = contiguous_copy_gpu(in, s);
   }
 
-  const bool staged_output = !softmax_out_target.flags().contiguous ||
-      softmax_out_target.offset() != 0 ||
-      softmax_out_target.strides().back() != 1 ||
-      !is_supported_unary_layout(softmax_out_target);
-  array out_work = staged_output
-      ? array(
-            softmax_out_target.shape(), softmax_out_target.dtype(), nullptr, {})
-      : softmax_out_target;
+  array softmax_out_storage = softmax_out_target;
+  const bool staged_output = !is_supported_softmax_layout(softmax_out_target);
+  if (staged_output) {
+    softmax_out_storage = array(
+        softmax_out_target.shape(), softmax_out_target.dtype(), nullptr, {});
+  }
 
-  set_unary_output_data(in, out_work);
+  set_unary_output_data(in, softmax_out_storage);
+
+  array out_work = softmax_out_storage;
+
   if (in.shape() != out_work.shape()) {
+    trace_softmax_failure("input_output_shape_mismatch");
     return false;
   }
 
   if (in.size() > std::numeric_limits<uint32_t>::max() ||
       out_work.size() > std::numeric_limits<uint32_t>::max() ||
       in.shape(in.ndim() - 1) > std::numeric_limits<uint32_t>::max()) {
+    trace_softmax_failure("shape_exceeds_uint32_limits");
     return false;
   }
 
@@ -64,10 +107,14 @@ bool try_eval_softmax_vulkan(
 
   if (out_work.size() == 0) {
     if (staged_output) {
-      copy_gpu(out_work, softmax_out_target, CopyType::GeneralGeneral, s);
+      copy_gpu(
+          softmax_out_storage, softmax_out_target, CopyType::GeneralGeneral, s);
     }
     if (use_f32_staging_io) {
-      copy_gpu(softmax_out_target, out, CopyType::General, s);
+      array target_kernel =
+          collapse_softmax_leading_dims(softmax_out_target, s);
+      array out_kernel = collapse_softmax_leading_dims(out, s);
+      copy_gpu(target_kernel, out_kernel, CopyType::General, s);
     }
     return true;
   }
@@ -97,13 +144,26 @@ bool try_eval_softmax_vulkan(
     }
     vulkan::end_command_recording(s.index);
     if (staged_output) {
-      copy_gpu(out_work, softmax_out_target, CopyType::GeneralGeneral, s);
+      copy_gpu(
+          softmax_out_storage, softmax_out_target, CopyType::GeneralGeneral, s);
     }
     if (use_f32_staging_io) {
-      copy_gpu(softmax_out_target, out, CopyType::General, s);
+      array target_kernel =
+          collapse_softmax_leading_dims(softmax_out_target, s);
+      array out_kernel = collapse_softmax_leading_dims(out, s);
+      copy_gpu(target_kernel, out_kernel, CopyType::General, s);
     }
     return true;
-  } catch (const std::runtime_error&) {
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "softmax_dispatch_failed reason=" << e.what()
+          << " row_width=" << row_width
+          << " use_large_softmax=" << use_large_softmax
+          << " staged_output=" << staged_output
+          << " use_f32_staging_io=" << use_f32_staging_io;
+      trace_fallback(oss.str());
+    }
     return false;
   }
 }

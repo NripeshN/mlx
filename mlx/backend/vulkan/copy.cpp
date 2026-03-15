@@ -698,6 +698,28 @@ void copy_gpu_inplace(
             dispatch_shape, dispatch_i_strides, dispatch_o_strides);
   }
 
+  if (dispatch_shape.size() > 4) {
+    Shape sub_shape(dispatch_shape.begin() + 1, dispatch_shape.end());
+    Strides sub_i_strides(
+        dispatch_i_strides.begin() + 1, dispatch_i_strides.end());
+    Strides sub_o_strides(
+        dispatch_o_strides.begin() + 1, dispatch_o_strides.end());
+
+    for (int64_t i = 0; i < dispatch_shape[0]; ++i) {
+      copy_gpu_inplace(
+          in,
+          out,
+          sub_shape,
+          sub_i_strides,
+          sub_o_strides,
+          resolved_i_offset + i * dispatch_i_strides[0],
+          resolved_o_offset + i * dispatch_o_strides[0],
+          ctype,
+          s);
+    }
+    return;
+  }
+
   const auto dispatch_elements = num_elements(dispatch_shape);
   auto in_view =
       make_copy_view(in, dispatch_shape, dispatch_i_strides, resolved_i_offset);

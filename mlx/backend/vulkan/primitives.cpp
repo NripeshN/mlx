@@ -58,6 +58,119 @@ namespace mlx::core {
     throw std::runtime_error(#func " has no Vulkan implementation."); \
   }
 
+namespace {
+
+bool is_supported_select_layout(const array& arr) {
+  return arr.flags().contiguous && arr.offset() == 0 && arr.ndim() > 0 &&
+      arr.strides().back() == 1;
+}
+
+array collapse_select_leading_dims(const array& arr, Stream s) {
+  if (arr.ndim() <= 4) {
+    return arr;
+  }
+  return flatten_in_eval(arr, 0, arr.ndim() - 4, s);
+}
+
+std::optional<vulkan::StaticShaderId> select_shader_id(Dtype dtype) {
+  switch (dtype) {
+    case bool_:
+      return vulkan::StaticShaderId::select_bool;
+    case float16:
+      return vulkan::StaticShaderId::select_f16;
+    case float32:
+      return vulkan::StaticShaderId::select_f32;
+    case bfloat16:
+      return vulkan::StaticShaderId::select_bf16;
+    default:
+      return std::nullopt;
+  }
+}
+
+bool try_eval_select_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
+  if (inputs.size() != 3) {
+    return false;
+  }
+
+  array condition = inputs[0];
+  array x = inputs[1];
+  array y = inputs[2];
+  if (condition.dtype() != bool_ || x.dtype() != out.dtype() ||
+      y.dtype() != out.dtype() || condition.shape() != out.shape() ||
+      x.shape() != out.shape() || y.shape() != out.shape()) {
+    return false;
+  }
+
+  auto shader_id = select_shader_id(out.dtype());
+  if (!shader_id.has_value()) {
+    return false;
+  }
+
+  auto materialize = [&](array arr) {
+    if (!is_supported_select_layout(arr)) {
+      arr = contiguous_copy_gpu(arr, s);
+    }
+    return arr;
+  };
+
+  condition = materialize(condition);
+  x = materialize(x);
+  y = materialize(y);
+
+  const bool staged_output = !is_supported_select_layout(out);
+  array out_storage =
+      staged_output ? array(out.shape(), out.dtype(), nullptr, {}) : out;
+  out_storage.set_data(allocator::malloc(out_storage.nbytes()));
+
+  array cond_kernel = collapse_select_leading_dims(condition, s);
+  array x_kernel = collapse_select_leading_dims(x, s);
+  array y_kernel = collapse_select_leading_dims(y, s);
+  array out_kernel = collapse_select_leading_dims(out_storage, s);
+
+  if (!is_supported_elementwise_layout(cond_kernel) ||
+      !is_supported_elementwise_layout(x_kernel) ||
+      !is_supported_elementwise_layout(y_kernel) ||
+      !is_supported_elementwise_layout(out_kernel)) {
+    return false;
+  }
+
+  if (out_kernel.size() == 0) {
+    if (staged_output) {
+      copy_gpu(out_storage, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  }
+
+  try {
+    auto command_buffer = vulkan::begin_command_recording(s.index);
+    vulkan::dispatch_ternary_op(
+        cond_kernel,
+        x_kernel,
+        y_kernel,
+        out_kernel,
+        *shader_id,
+        command_buffer,
+        s);
+    vulkan::end_command_recording(s.index);
+    if (staged_output) {
+      copy_gpu(out_storage, out, CopyType::GeneralGeneral, s);
+    }
+    return true;
+  } catch (const std::runtime_error& e) {
+    if (trace_fallback_enabled()) {
+      std::ostringstream oss;
+      oss << "select_dispatch_failed reason=" << e.what();
+      trace_fallback(oss.str());
+    }
+    return false;
+  }
+}
+
+} // namespace
+
 // Primitives with state that have CPU fallbacks
 CPU_FALLBACK_STATE(Equal)
 
@@ -132,8 +245,13 @@ NO_GPU(MaskedScatter)
 
 // SliceUpdate uses the generic GPU implementation in
 // mlx/backend/gpu/primitives.cpp
-CPU_FALLBACK(Select)
 CPU_FALLBACK(SegmentedMM)
+
+void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (!try_eval_select_vulkan(inputs, out, stream())) {
+    eval_cpu_fallback_on_stream<Select>(inputs, out, stream());
+  }
+}
 
 namespace distributed {
 NO_GPU_MULTI(AllReduce)

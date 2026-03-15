@@ -296,6 +296,7 @@ enum class DispatchGridKind {
 enum class KernelSpecId {
   Binary,
   BinaryAddWithPartials,
+  Ternary,
   Unary,
   GenericUnary,
   Arange,
@@ -339,7 +340,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 20> kKernelSpecs = {
+const std::array<KernelSpec, 21> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -347,6 +348,10 @@ const std::array<KernelSpec, 20> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 3},
         sizeof(BinaryPushConstants),
+        DispatchGridKind::ElementWise),
+    make_kernel_spec(
+        {0, 1, 2, 3},
+        sizeof(TernaryPushConstants),
         DispatchGridKind::ElementWise),
     make_kernel_spec(
         {0, 1},
@@ -616,7 +621,7 @@ make_sum_rows_push_constants(const array& in, const array& out, float weight) {
 }
 
 SoftmaxPushConstants make_softmax_push_constants(
-    const array& in,
+    const array& /*in*/,
     uint32_t row_width,
     uint32_t row_count) {
   SoftmaxPushConstants push_constants{};
@@ -638,10 +643,9 @@ SoftmaxPushConstants make_softmax_push_constants(
   push_constants.nrows_x = row_count;
   push_constants.has_sinks = 0;
 
-  if (in.ndim() > 4) {
-    throw std::runtime_error(
-        "[vulkan::kernels] Softmax supports rank <= 4 for Vulkan kernels.");
-  }
+  // Plain Vulkan softmax indexes rows linearly from row_count and only uses the
+  // last dimension width. When the logical tensor rank is greater than 4 we can
+  // safely treat the leading dimensions as already collapsed into row_count.
 
   return push_constants;
 }
@@ -1766,6 +1770,39 @@ void dispatch_binary_op(
       s,
       explicit_grid,
       specialization_constants);
+}
+
+void dispatch_ternary_op(
+    const array& cond,
+    const array& x,
+    const array& y,
+    array& out,
+    StaticShaderId shader_id,
+    VkCommandBuffer cmd_buffer,
+    const Stream& s) {
+  if (cond.shape() != out.shape() || x.shape() != out.shape() ||
+      y.shape() != out.shape()) {
+    throw std::runtime_error(
+        "[vulkan::kernels] Ternary dispatch received incompatible shapes.");
+  }
+
+  TernaryPushConstants push_constants{};
+  push_constants.ne = checked_u32(out.size(), "ternary elements");
+
+  const std::array<BoundArray, 4> bound_arrays = {{
+      {&cond, "src0"},
+      {&x, "src1"},
+      {&y, "src2"},
+      {&out, "dst"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::Ternary,
+      bound_arrays,
+      push_constants,
+      push_constants.ne,
+      cmd_buffer,
+      s);
 }
 
 void dispatch_unary_op(

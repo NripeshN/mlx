@@ -2334,6 +2334,25 @@ void process_shaders() {
           {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 
   string_to_spv(
+      "select_bool",
+      "select.comp",
+      {{"B_TYPE", "uint8_t"}, {"C_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}});
+  string_to_spv(
+      "select_f16",
+      "select.comp",
+      {{"B_TYPE", "float16_t"},
+       {"C_TYPE", "float16_t"},
+       {"D_TYPE", "float16_t"}});
+  string_to_spv(
+      "select_f32",
+      "select.comp",
+      {{"B_TYPE", "float"}, {"C_TYPE", "float"}, {"D_TYPE", "float"}});
+  string_to_spv(
+      "select_bf16",
+      "select.comp",
+      {{"B_TYPE", "uint16_t"}, {"C_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
+
+  string_to_spv(
       "soft_max_large1_f32",
       "soft_max_large1.comp",
       merge_maps(

@@ -1170,10 +1170,24 @@ void ScaledDotProductAttention::eval_gpu(
     v_work = astype(v_work, scores.dtype(), s);
   }
 
-  auto result = matmul(scores, v_work, s);
+  array scores_work = scores;
   if (n_repeats > 1) {
-    result = flatten(result, 1, 2, s);
+    Shape v_shape = scores.shape();
+    v_shape.back() = v_work.shape(-1);
+    v_work = broadcast_to(v_work, v_shape, s);
+    scores_work = flatten(scores_work, 1, 2, s);
+    v_work = flatten(v_work, 1, 2, s);
+    if (!scores_work.flags().row_contiguous || scores_work.offset() != 0 ||
+        scores_work.strides().back() != 1) {
+      scores_work = contiguous_copy_gpu(scores_work, s);
+    }
+    if (!v_work.flags().row_contiguous || v_work.offset() != 0 ||
+        v_work.strides().back() != 1) {
+      v_work = contiguous_copy_gpu(v_work, s);
+    }
   }
+
+  auto result = matmul(scores_work, v_work, s);
   if (result.dtype() != outputs[0].dtype()) {
     result = astype(result, outputs[0].dtype(), s);
   }

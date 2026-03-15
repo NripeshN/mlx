@@ -209,6 +209,10 @@ bool is_row_contiguous_zero_offset(const array& arr) {
       arr.strides(-1) == 1;
 }
 
+bool has_vulkan_buffer(const array& arr) {
+  return arr.buffer().ptr() != nullptr;
+}
+
 void zero_initialize_output(array& out, Stream s) {
   out.set_data(allocator::malloc(out.nbytes()));
   if (out.nbytes() == 0) {
@@ -406,6 +410,17 @@ bool try_eval_mul_mm_vulkan(
   array out_t = vulkan::acquire_scratch_array(
       s, kMulMmOutScratchLane, out_t_shape, float32);
 
+  if (!has_vulkan_buffer(a) || !has_vulkan_buffer(b_t) ||
+      !has_vulkan_buffer(out_t)) {
+    if (matmul_debug_enabled()) {
+      std::cerr << "[vulkan::mul_mm] missing buffer"
+                << " a=" << has_vulkan_buffer(a)
+                << " b_t=" << has_vulkan_buffer(b_t)
+                << " out_t=" << has_vulkan_buffer(out_t) << "\n";
+    }
+    return false;
+  }
+
   auto shader_candidates = mul_mm_shader_candidates(a.dtype());
   if (shader_candidates.empty()) {
     return false;
@@ -435,7 +450,7 @@ bool try_eval_mul_mm_vulkan(
   }
   const uint32_t num_batches = static_cast<uint32_t>(num_batches_u64);
 
-  if (num_batches > 1 && mul_mm_batch_sync_enabled()) {
+  if (num_batches > 1) {
     ::mlx::core::gpu::synchronize(s);
   }
 
@@ -510,7 +525,19 @@ bool try_eval_mul_mm_vulkan(
       }
       vulkan::mark_scratch_array_written(s, kMulMmOutScratchLane);
       try {
+        if (matmul_debug_enabled()) {
+          std::cerr << "[vulkan::mul_mm] begin output copy\n";
+        }
         copy_gpu(swapaxes_in_eval(out_t, -1, -2), out, CopyType::General, s);
+        if (matmul_debug_enabled()) {
+          std::cerr << "[vulkan::mul_mm] end output copy\n";
+        }
+        if (num_batches > 1) {
+          ::mlx::core::gpu::synchronize(s);
+          if (matmul_debug_enabled()) {
+            std::cerr << "[vulkan::mul_mm] post-copy synchronize done\n";
+          }
+        }
         return true;
       } catch (const std::runtime_error& e) {
         if (matmul_debug_enabled()) {

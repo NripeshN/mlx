@@ -9,6 +9,13 @@ namespace mlx::core {
 
 namespace {
 
+array collapse_binary_leading_dims(const array& arr, Stream s) {
+  if (arr.ndim() <= 4) {
+    return arr;
+  }
+  return flatten_in_eval(arr, 0, arr.ndim() - 4, s);
+}
+
 bool is_vulkan_integer_dtype(Dtype dtype) {
   switch (dtype) {
     case int8:
@@ -170,6 +177,8 @@ bool try_eval_binary_op_vulkan(
   if (!is_supported_elementwise_layout(b)) {
     b = contiguous_copy_gpu(b, s);
   }
+  a = collapse_binary_leading_dims(a, s);
+  b = collapse_binary_leading_dims(b, s);
 
   const bool staged_output = use_f32_staging_io || small_signed_integer_case ||
       small_unsigned_integer_case || !is_supported_elementwise_layout(out);
@@ -191,11 +200,14 @@ bool try_eval_binary_op_vulkan(
   } else {
     set_binary_op_output_data(a, b, out_work, bopt);
   }
-  if (!is_supported_elementwise_layout(out_work)) {
+  array out_kernel = collapse_binary_leading_dims(out_work, s);
+  if (!is_supported_elementwise_layout(a) ||
+      !is_supported_elementwise_layout(b) ||
+      !is_supported_elementwise_layout(out_kernel)) {
     return false;
   }
 
-  if (out_work.size() == 0) {
+  if (out_kernel.size() == 0) {
     if (staged_output) {
       copy_gpu(out_work, out, CopyType::GeneralGeneral, s);
     }
@@ -209,8 +221,8 @@ bool try_eval_binary_op_vulkan(
             binary_shader_op<Primitive>(),
             a.dtype(),
             b.dtype(),
-            out_work.dtype(),
-            out_work.dtype() == float16);
+            out_kernel.dtype(),
+            out_kernel.dtype() == float16);
   if (!shader_id.has_value()) {
     return false;
   }
@@ -224,7 +236,7 @@ bool try_eval_binary_op_vulkan(
       }
     }
     vulkan::dispatch_binary_op(
-        a, b, out_work, *shader_id, command_buffer, s, dispatch_variant);
+        a, b, out_kernel, *shader_id, command_buffer, s, dispatch_variant);
     vulkan::end_command_recording(s.index);
     if (staged_output || use_f32_staging_io) {
       copy_gpu(out_work, out, CopyType::General, s);
