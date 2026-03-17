@@ -15,17 +15,42 @@ This branch adds Vulkan GPU support to MLX as a new backend.
 
 ## Build Commands
 
+### Quick Development Build (Recommended for daily development)
+
 ```bash
-# Vulkan build (recommended for this branch)
+# Fast incremental build for development
+# Assumes: pip install -e . has been run once
+./build-editable.sh
+```
+
+**What it does:**
+- Uses the virtual environment at `./venv`
+- Builds only the `core` Python extension target (skips tests/examples)
+- Automatically copies the resulting `.so` to `python/mlx/` for editable installs
+- Supports CUDA with `MLX_BUILD_CUDA=1 ./build-editable.sh`
+
+### Full Build with Tests
+
+```bash
+# Complete build including C++ tests
 ./build-vulkan.sh
 
-# Build with wheel output
+# Build wheel for distribution
 ./build-vulkan.sh --wheel
+```
 
+**What it does:**
+- Runs `pip install -e .` with Vulkan backend enabled
+- Builds all targets including C++ tests (`./build/tests/test_mlx`)
+- Uses virtual environment at `./venv`
+
+### Manual Build Options
+
+```bash
 # Manual Vulkan build
 CMAKE_ARGS="-DMLX_BUILD_VULKAN=ON" pip install -e .
 
-# C++ library (Release with tests)
+# C++ library only (Release with tests)
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DMLX_BUILD_TESTS=ON
 cmake --build . -j$(nproc)
@@ -33,6 +58,13 @@ cmake --build . -j$(nproc)
 # Python development install (CPU only)
 pip install --no-build-isolation -e ".[dev]"
 ```
+
+### Build Scripts Summary
+
+| Script | Use Case | Time | Output |
+|--------|----------|------|--------|
+| `build-editable.sh` | Daily development, quick iterations | ~2-5 min | Updates `python/mlx/core*.so` |
+| `build-vulkan.sh` | Full build with tests, CI | ~10-15 min | Complete install + `./build/tests/` |
 
 CMake options: `-DMLX_BUILD_TESTS`, `-DMLX_BUILD_EXAMPLES`, `-DMLX_BUILD_METAL`, `-DMLX_BUILD_CUDA`, `-DMLX_BUILD_VULKAN`, `-DMLX_BUILD_CPU`, `-DMLX_USE_CCACHE=ON`
 

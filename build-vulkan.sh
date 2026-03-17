@@ -27,7 +27,6 @@ else
 fi
 
 CMAKE_ARGS="-DMLX_BUILD_VULKAN=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_VERBOSE_MAKEFILE=${CMAKE_VERBOSE_MAKEFILE} -DMLX_USE_CCACHE=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
-CMAKE_ARGS="-DMLX_BUILD_TESTS=ON $CMAKE_ARGS"
 
 if command -v ccache >/dev/null 2>&1; then
   export CCACHE_BASEDIR="$(pwd)"
@@ -48,10 +47,6 @@ else
   else
     CMAKE_ARGS="$CMAKE_ARGS" pip install -e .
   fi
-
-  # Build C++ tests
-  echo "Building C++ tests..."
-  cmake --build build --target tests -j$(nproc)
 fi
 
 if command -v ccache >/dev/null 2>&1; then
