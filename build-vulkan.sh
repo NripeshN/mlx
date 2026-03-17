@@ -44,14 +44,11 @@ if [ "$BUILD_WHEEL" = "1" ]; then
   ln -sf wheelhouse/*.whl mlx-0.31.1-cp313-cp313-linux_x86_64.whl
 else
   if [ -n "${PIP_VERBOSE_FLAG}" ]; then
-    CMAKE_ARGS="$CMAKE_ARGS" pip install "$PIP_VERBOSE_FLAG" -e . \
-      --config-settings=build_ext.build-temp=$PWD/build \
-      --config-settings=build_ext.build-lib=$PWD/build/lib
+    CMAKE_ARGS="$CMAKE_ARGS" pip install "$PIP_VERBOSE_FLAG" -e .
   else
-    CMAKE_ARGS="$CMAKE_ARGS" pip install -e . \
-      --config-settings=build_ext.build-temp=$PWD/build \
-      --config-settings=build_ext.build-lib=$PWD/build/lib
+    CMAKE_ARGS="$CMAKE_ARGS" pip install -e .
   fi
+
   # Build C++ tests
   echo "Building C++ tests..."
   cmake --build build --target tests -j$(nproc)

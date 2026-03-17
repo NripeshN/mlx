@@ -1180,10 +1180,10 @@ class VulkanDevice {
               << submission.submit_reason << "'";
           trace_sync(oss.str());
         }
-        VkResult status = static_cast<VkResult>(vk_device.waitForFences(
+        status = static_cast<VkResult>(vk_device.waitForFences(
             {submission.resources->fence}, VK_TRUE, UINT64_MAX));
       } else {
-        VkResult status = static_cast<VkResult>(
+        status = static_cast<VkResult>(
             vk_device.getFenceStatus(submission.resources->fence));
         if (status == VK_NOT_READY) {
           break;
@@ -1362,7 +1362,13 @@ class VulkanDevice {
           details.str() + ").");
     };
 
-    VkResult result = vkEndCommandBuffer(resources->command_buffer);
+    VkResult result;
+    try {
+      resources->command_buffer.end();
+      result = VK_SUCCESS;
+    } catch (const vk::SystemError& e) {
+      result = static_cast<VkResult>(e.code().value());
+    }
     end_cmd_result = result;
     if (result != VK_SUCCESS) {
       fail_submit(
@@ -1374,9 +1380,17 @@ class VulkanDevice {
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &resources->command_buffer;
 
-    vk_device.resetFences({resources->fence});
-    reset_fence_result = VK_SUCCESS;
-    result = VK_SUCCESS;
+    try {
+      vk_device.resetFences({resources->fence});
+      result = VK_SUCCESS;
+    } catch (const vk::SystemError& e) {
+      result = static_cast<VkResult>(e.code().value());
+    }
+    reset_fence_result = result;
+    if (result != VK_SUCCESS) {
+      fail_submit(
+          result, "[vulkan::submit_commands] Failed resetting stream fence");
+    }
     trace_sync("submit reset_fence success");
 
     constexpr int kSubmitRetryCount = 32;
@@ -1384,8 +1398,12 @@ class VulkanDevice {
       std::lock_guard<std::mutex> queue_lock(queue_mutex_);
       for (int retry = 0; retry < kSubmitRetryCount; ++retry) {
         last_queue_submit_retry = retry;
-        queue.submit({submitInfo}, resources->fence);
-        result = VK_SUCCESS;
+        try {
+          queue.submit({submitInfo}, resources->fence);
+          result = VK_SUCCESS;
+        } catch (const vk::SystemError& e) {
+          result = static_cast<VkResult>(e.code().value());
+        }
         last_queue_submit_result = result;
         if (result == VK_SUCCESS) {
           if (trace_sync_enabled()) {

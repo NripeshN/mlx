@@ -18,7 +18,7 @@ bool find_compute_queue_family(
   auto queue_families = physical_device.getQueueFamilyProperties();
 
   for (uint32_t i = 0; i < queue_families.size(); ++i) {
-    if ((queue_families[i].queueFlags & vk::QueueFlagBits::eCompute) != 
+    if ((queue_families[i].queueFlags & vk::QueueFlagBits::eCompute) !=
         vk::QueueFlagBits{}) {
       queue_family_index = i;
       return true;
@@ -68,8 +68,7 @@ VulkanContext& VulkanContext::get() {
 VulkanContext::VulkanContext() = default;
 
 VulkanContext::~VulkanContext() {
-  // C++ Vulkan API uses RAII - resources are automatically destroyed
-  // No manual cleanup needed!
+  cleanup();
 }
 
 void VulkanContext::init() {
@@ -100,8 +99,7 @@ void VulkanContext::init() {
         vk::makeVersion(1, 0, 0),
         "MLX",
         vk::makeVersion(1, 0, 0),
-        VK_API_VERSION_1_2
-    );
+        VK_API_VERSION_1_2);
 
     vk::InstanceCreateInfo create_info({}, &app_info);
 
@@ -164,8 +162,7 @@ void VulkanContext::init() {
         vk::DeviceQueueCreateFlags(),
         compute_queue_family_index,
         1,
-        &queue_priority
-    );
+        &queue_priority);
 
     // Build feature chain
     vk::PhysicalDeviceFeatures2 supported_features;
@@ -178,8 +175,9 @@ void VulkanContext::init() {
         supported_subgroup_size_control{};
     vk::PhysicalDevicePipelineRobustnessFeaturesEXT
         supported_pipeline_robustness{};
-    vk::PhysicalDeviceCooperativeMatrixFeaturesKHR supported_cooperative_matrix{};
-    
+    vk::PhysicalDeviceCooperativeMatrixFeaturesKHR
+        supported_cooperative_matrix{};
+
     if (has_subgroup_size_control_ext) {
       supported_shader_float16_int8.pNext = &supported_subgroup_size_control;
       if (has_pipeline_robustness_ext) {
@@ -199,7 +197,7 @@ void VulkanContext::init() {
       supported_shader_float16_int8.pNext = &supported_cooperative_matrix;
     }
 
-    supported_features = physical_device.getFeatures2();
+    physical_device.getFeatures2(&supported_features);
 
     // Query subgroup size control properties
     vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control_props;
@@ -213,11 +211,31 @@ void VulkanContext::init() {
     vk::PhysicalDeviceShaderFloat16Int8Features enabled_shader_float16_int8;
     enabled_features.pNext = &enabled_vulkan11_features;
     enabled_vulkan11_features.pNext = &enabled_shader_float16_int8;
-    
+
     vk::PhysicalDeviceSubgroupSizeControlFeatures enabled_subgroup_size_control;
     vk::PhysicalDevicePipelineRobustnessFeaturesEXT enabled_pipeline_robustness;
     vk::PhysicalDeviceCooperativeMatrixFeaturesKHR enabled_cooperative_matrix;
-    
+
+    // Link enabled feature chain (same pattern as supported features)
+    if (has_subgroup_size_control_ext) {
+      enabled_shader_float16_int8.pNext = &enabled_subgroup_size_control;
+      if (has_pipeline_robustness_ext) {
+        enabled_subgroup_size_control.pNext = &enabled_pipeline_robustness;
+        if (has_cooperative_matrix_ext) {
+          enabled_pipeline_robustness.pNext = &enabled_cooperative_matrix;
+        }
+      } else if (has_cooperative_matrix_ext) {
+        enabled_subgroup_size_control.pNext = &enabled_cooperative_matrix;
+      }
+    } else if (has_pipeline_robustness_ext) {
+      enabled_shader_float16_int8.pNext = &enabled_pipeline_robustness;
+      if (has_cooperative_matrix_ext) {
+        enabled_pipeline_robustness.pNext = &enabled_cooperative_matrix;
+      }
+    } else if (has_cooperative_matrix_ext) {
+      enabled_shader_float16_int8.pNext = &enabled_cooperative_matrix;
+    }
+
     if (supported_vulkan11_features.storageBuffer16BitAccess) {
       enabled_vulkan11_features.storageBuffer16BitAccess = VK_TRUE;
     }
@@ -251,7 +269,7 @@ void VulkanContext::init() {
         supported_cooperative_matrix.cooperativeMatrix) {
       enabled_cooperative_matrix.cooperativeMatrix = VK_TRUE;
       coopmat_flash_attention_f32acc_supported = false;
-      
+
       // Check for flash attention support
       auto get_coopmat_props = reinterpret_cast<
           PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
@@ -303,10 +321,11 @@ void VulkanContext::init() {
     device_create_info.pQueueCreateInfos = &queue_create_info;
     device_create_info.enabledLayerCount = 0;
     device_create_info.ppEnabledLayerNames = nullptr;
-    device_create_info.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
+    device_create_info.enabledExtensionCount =
+        static_cast<uint32_t>(device_extensions.size());
     device_create_info.ppEnabledExtensionNames = device_extensions.data();
     device_create_info.pEnabledFeatures = nullptr;
-    
+
     // Set the feature chain using pNext
     device_create_info.pNext = &enabled_features;
 
@@ -334,19 +353,37 @@ void VulkanContext::init() {
         subgroup_require_full_support;
     initialized_ = true;
   } catch (...) {
-    // C++ API - no manual cleanup needed, exceptions propagate
+    // Clean up partially initialized resources on failure
+    // Note: We don't call waitIdle() here to avoid hangs during failed init
+    if (device_) {
+      device_.destroy();
+      device_ = nullptr;
+    }
+    if (instance_) {
+      instance_.destroy();
+      instance_ = nullptr;
+    }
     throw;
   }
 }
 
 void VulkanContext::cleanup() {
-  // C++ Vulkan API uses RAII - no manual cleanup required!
-  // Resources are automatically destroyed when they go out of scope
-  
-  // Reset to null-like state for safety
-  instance_ = nullptr;
+  // Note: vk::Instance and vk::Device are non-owning handles.
+  // We must manually destroy them to avoid resource leaks.
+  if (device_) {
+    // Only wait for idle if we were fully initialized
+    // to avoid hanging on partially initialized devices
+    if (initialized_) {
+      device_.waitIdle();
+    }
+    device_.destroy();
+    device_ = nullptr;
+  }
+  if (instance_) {
+    instance_.destroy();
+    instance_ = nullptr;
+  }
   physical_device_ = nullptr;
-  device_ = nullptr;
   compute_queue_ = nullptr;
   compute_queue_family_index_ = 0;
   is_unified_memory_ = false;
@@ -357,11 +394,11 @@ void VulkanContext::cleanup() {
   subgroup_max_size_ = 0;
   pipeline_robustness_supported_ = false;
   coopmat_flash_attention_f32acc_supported_ = false;
-  
+
   // Clear memory properties by creating a default-constructed one
   vk::PhysicalDeviceMemoryProperties empty_props;
   mem_properties_ = empty_props;
-  
+
   initialized_ = false;
 }
 
@@ -370,10 +407,11 @@ uint32_t VulkanContext::find_memory_type(
     VkMemoryPropertyFlags properties) const {
   // Convert VkMemoryPropertyFlags to vk::MemoryPropertyFlags for comparison
   auto vk_properties = static_cast<vk::MemoryPropertyFlags>(properties);
-  
+
   for (uint32_t i = 0; i < mem_properties_.memoryTypeCount; i++) {
     if ((typeFilter & (1 << i)) &&
-        (mem_properties_.memoryTypes[i].propertyFlags & vk_properties) == vk_properties) {
+        (mem_properties_.memoryTypes[i].propertyFlags & vk_properties) ==
+            vk_properties) {
       return i;
     }
   }
