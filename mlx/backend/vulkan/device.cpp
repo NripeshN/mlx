@@ -2,7 +2,7 @@
 
 #include "mlx/device.h"
 
-#include <vulkan/vulkan.h>
+#include <vulkan/vulkan.hpp>
 
 #include <chrono>
 #include <cstdlib>
@@ -301,13 +301,6 @@ std::string format_vk_result(VkResult result) {
       std::to_string(static_cast<int>(result)) + ")";
 }
 
-void throw_if_vk_error(VkResult result, const std::string& context) {
-  if (result != VK_SUCCESS) {
-    throw std::runtime_error(
-        context + " (VkResult=" + format_vk_result(result) + ").");
-  }
-}
-
 VkResult wait_for_queue_idle_with_retry(VkQueue queue) {
   constexpr int kQueueIdleRetryCount = 64;
   VkResult result = VK_SUCCESS;
@@ -352,9 +345,9 @@ struct BufferAccessRange {
 };
 
 struct SubmissionResources {
-  VkCommandPool command_pool{VK_NULL_HANDLE};
-  VkCommandBuffer command_buffer{VK_NULL_HANDLE};
-  VkFence fence{VK_NULL_HANDLE};
+  vk::CommandPool command_pool;
+  vk::CommandBuffer command_buffer;
+  vk::Fence fence;
 };
 
 struct SubmissionRecord {
@@ -883,12 +876,11 @@ class VulkanDevice {
       retire_submissions(stream, false);
 
       auto resources = acquire_submission_resources(stream);
-      VkDevice device = VulkanContext::get().device();
+      auto vk_device = VulkanContext::get().device();
 
       // Reset command pool to allow reuse
-      throw_if_vk_error(
-          vkResetCommandPool(device, resources->command_pool, 0),
-          "[vulkan::begin_recording] Failed resetting command pool");
+      vk_device.resetCommandPool(
+          resources->command_pool, vk::CommandPoolResetFlags());
 
       // Begin recording
       VkCommandBufferBeginInfo beginInfo{};
@@ -1102,92 +1094,64 @@ class VulkanDevice {
     return false;
   }
 
-  static void insert_memory_barrier(VkCommandBuffer command_buffer) {
-    VkMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT |
-        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-        VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
-        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-        VK_ACCESS_TRANSFER_WRITE_BIT;
+  static void insert_memory_barrier(vk::CommandBuffer command_buffer) {
+    vk::MemoryBarrier barrier;
+    barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead |
+        vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead |
+        vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead |
+        vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead |
+        vk::AccessFlagBits::eTransferWrite;
 
-    vkCmdPipelineBarrier(
-        command_buffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0,
-        1,
-        &barrier,
-        0,
-        nullptr,
-        0,
-        nullptr);
+    command_buffer.pipelineBarrier(
+        vk::PipelineStageFlagBits::eComputeShader |
+            vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eComputeShader |
+            vk::PipelineStageFlagBits::eTransfer,
+        {},
+        {barrier},
+        {},
+        {});
   }
 
   std::unique_ptr<SubmissionResources> create_submission_resources() {
-    VkDevice device = VulkanContext::get().device();
+    auto vk_device = VulkanContext::get().device();
     uint32_t queue_family = VulkanContext::get().compute_queue_family_index();
 
     auto resources = std::make_unique<SubmissionResources>();
 
-    VkCommandPoolCreateInfo pool_info{};
-    pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    pool_info.queueFamilyIndex = queue_family;
-    pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    vk::CommandPoolCreateInfo pool_info(
+        vk::CommandPoolCreateFlagBits::eResetCommandBuffer, queue_family);
 
-    if (vkCreateCommandPool(
-            device, &pool_info, nullptr, &resources->command_pool) !=
-        VK_SUCCESS) {
-      throw std::runtime_error("failed to create command pool");
-    }
+    resources->command_pool = vk_device.createCommandPool(pool_info);
 
-    VkCommandBufferAllocateInfo alloc_info{};
-    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc_info.commandPool = resources->command_pool;
-    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc_info.commandBufferCount = 1;
+    vk::CommandBufferAllocateInfo alloc_info(
+        resources->command_pool, vk::CommandBufferLevel::ePrimary, 1);
 
-    if (vkAllocateCommandBuffers(
-            device, &alloc_info, &resources->command_buffer) != VK_SUCCESS) {
-      vkDestroyCommandPool(device, resources->command_pool, nullptr);
-      throw std::runtime_error("failed to allocate command buffer");
-    }
+    resources->command_buffer = vk_device.allocateCommandBuffers(alloc_info)[0];
 
-    VkFenceCreateInfo fence_info{};
-    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-
-    if (vkCreateFence(device, &fence_info, nullptr, &resources->fence) !=
-        VK_SUCCESS) {
-      vkFreeCommandBuffers(
-          device, resources->command_pool, 1, &resources->command_buffer);
-      vkDestroyCommandPool(device, resources->command_pool, nullptr);
-      throw std::runtime_error("failed to create fence");
-    }
+    vk::FenceCreateInfo fence_info;
+    resources->fence = vk_device.createFence(fence_info);
 
     return resources;
   }
 
   static void destroy_submission_resources(
-      VkDevice device,
+      vk::Device device,
       std::unique_ptr<SubmissionResources>& resources) {
     if (!resources) {
       return;
     }
 
-    if (resources->command_buffer != VK_NULL_HANDLE &&
-        resources->command_pool != VK_NULL_HANDLE) {
-      vkFreeCommandBuffers(
-          device, resources->command_pool, 1, &resources->command_buffer);
-      resources->command_buffer = VK_NULL_HANDLE;
+    if (resources->command_buffer && resources->command_pool) {
+      device.freeCommandBuffers(
+          resources->command_pool, {resources->command_buffer});
     }
-    if (resources->fence != VK_NULL_HANDLE) {
-      vkDestroyFence(device, resources->fence, nullptr);
-      resources->fence = VK_NULL_HANDLE;
+    if (resources->fence) {
+      device.destroyFence(resources->fence);
     }
-    if (resources->command_pool != VK_NULL_HANDLE) {
-      vkDestroyCommandPool(device, resources->command_pool, nullptr);
-      resources->command_pool = VK_NULL_HANDLE;
+    if (resources->command_pool) {
+      device.destroyCommandPool(resources->command_pool);
     }
     resources.reset();
   }
@@ -1203,7 +1167,7 @@ class VulkanDevice {
   }
 
   void retire_submissions(StreamData* stream, bool wait_all) {
-    VkDevice device = VulkanContext::get().device();
+    auto vk_device = VulkanContext::get().device();
 
     while (!stream->in_flight_submissions.empty()) {
       auto& submission = stream->in_flight_submissions.front();
@@ -1216,10 +1180,11 @@ class VulkanDevice {
               << submission.submit_reason << "'";
           trace_sync(oss.str());
         }
-        status = vkWaitForFences(
-            device, 1, &submission.resources->fence, VK_TRUE, UINT64_MAX);
+        VkResult status = static_cast<VkResult>(vk_device.waitForFences(
+            {submission.resources->fence}, VK_TRUE, UINT64_MAX));
       } else {
-        status = vkGetFenceStatus(device, submission.resources->fence);
+        VkResult status = static_cast<VkResult>(
+            vk_device.getFenceStatus(submission.resources->fence));
         if (status == VK_NOT_READY) {
           break;
         }
@@ -1323,13 +1288,12 @@ class VulkanDevice {
       trace_sync(oss.str());
     }
 
-    VkDevice device = VulkanContext::get().device();
-    VkQueue queue = VulkanContext::get().compute_queue();
+    auto vk_device = VulkanContext::get().device();
+    vk::Queue queue = VulkanContext::get().compute_queue();
 
     auto fail_submit = [&](VkResult result, const std::string& context) {
-      const VkResult fence_status =
-          resources && resources->fence != VK_NULL_HANDLE
-          ? vkGetFenceStatus(device, resources->fence)
+      const VkResult fence_status = resources && resources->fence
+          ? static_cast<VkResult>(vk_device.getFenceStatus(resources->fence))
           : VK_SUCCESS;
       VkPhysicalDeviceProperties props{};
       vkGetPhysicalDeviceProperties(
@@ -1355,9 +1319,10 @@ class VulkanDevice {
           stream->stream_index, submit_rec_epoch);
 
       VkResult reset_pool_result = VK_SUCCESS;
-      if (resources && resources->command_pool != VK_NULL_HANDLE) {
-        reset_pool_result =
-            vkResetCommandPool(device, resources->command_pool, 0);
+      if (resources && resources->command_pool) {
+        vk_device.resetCommandPool(
+            resources->command_pool, vk::CommandPoolResetFlags());
+        reset_pool_result = VK_SUCCESS;
       }
       if (resources) {
         stream->available_resources.push_back(std::move(resources));
@@ -1405,17 +1370,13 @@ class VulkanDevice {
     }
     trace_sync("submit end_command_buffer success");
 
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    vk::SubmitInfo submitInfo;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &resources->command_buffer;
 
-    result = vkResetFences(device, 1, &resources->fence);
-    reset_fence_result = result;
-    if (result != VK_SUCCESS) {
-      fail_submit(
-          result, "[vulkan::submit_commands] Failed resetting stream fence");
-    }
+    vk_device.resetFences({resources->fence});
+    reset_fence_result = VK_SUCCESS;
+    result = VK_SUCCESS;
     trace_sync("submit reset_fence success");
 
     constexpr int kSubmitRetryCount = 32;
@@ -1423,7 +1384,8 @@ class VulkanDevice {
       std::lock_guard<std::mutex> queue_lock(queue_mutex_);
       for (int retry = 0; retry < kSubmitRetryCount; ++retry) {
         last_queue_submit_retry = retry;
-        result = vkQueueSubmit(queue, 1, &submitInfo, resources->fence);
+        queue.submit({submitInfo}, resources->fence);
+        result = VK_SUCCESS;
         last_queue_submit_result = result;
         if (result == VK_SUCCESS) {
           if (trace_sync_enabled()) {
@@ -1532,7 +1494,7 @@ ScopedSyncLabel::~ScopedSyncLabel() {
 }
 
 // Expose VulkanDevice methods to other files
-VkCommandBuffer begin_command_recording(int stream_index) {
+vk::CommandBuffer begin_command_recording(int stream_index) {
   return VulkanDevice::get().begin_recording(stream_index);
 }
 
@@ -1562,7 +1524,7 @@ void enqueue_owned_staging_upload(
     const Stream& s,
     const void* src,
     size_t size,
-    VkBuffer dst_buffer,
+    vk::Buffer dst_buffer,
     uint64_t dst_offset) {
   if (size == 0) {
     return;
@@ -1583,13 +1545,12 @@ void enqueue_owned_staging_upload(
       src,
       static_cast<size_t>(size));
 
-  VkCommandBuffer command_buffer = begin_command_recording(s.index);
-  VkBufferCopy copy_region{};
+  vk::CommandBuffer command_buffer = begin_command_recording(s.index);
+  vk::BufferCopy copy_region;
   copy_region.srcOffset = 0;
   copy_region.dstOffset = static_cast<VkDeviceSize>(dst_offset);
   copy_region.size = static_cast<VkDeviceSize>(size);
-  vkCmdCopyBuffer(
-      command_buffer, staging_buffer->buffer, dst_buffer, 1, &copy_region);
+  command_buffer.copyBuffer(staging_buffer->buffer, dst_buffer, {copy_region});
 
   retain_shared_for_stream(s, std::static_pointer_cast<void>(staging));
   end_command_recording(s.index);
@@ -1597,7 +1558,7 @@ void enqueue_owned_staging_upload(
 
 void enqueue_owned_staging_readback(
     const Stream& s,
-    VkBuffer src_buffer,
+    vk::Buffer src_buffer,
     uint64_t src_offset,
     size_t size,
     std::function<void(const void*, size_t)> completion) {
@@ -1617,13 +1578,12 @@ void enqueue_owned_staging_readback(
   auto staging = make_owned_staging_allocation(size);
   auto* staging_buffer = get_vulkan_buffer(staging);
 
-  VkCommandBuffer command_buffer = begin_command_recording(s.index);
-  VkBufferCopy copy_region{};
+  vk::CommandBuffer command_buffer = begin_command_recording(s.index);
+  vk::BufferCopy copy_region;
   copy_region.srcOffset = static_cast<VkDeviceSize>(src_offset);
   copy_region.dstOffset = 0;
   copy_region.size = static_cast<VkDeviceSize>(size);
-  vkCmdCopyBuffer(
-      command_buffer, src_buffer, staging_buffer->buffer, 1, &copy_region);
+  command_buffer.copyBuffer(src_buffer, staging_buffer->buffer, {copy_region});
 
   retain_shared_for_stream(s, std::static_pointer_cast<void>(staging));
   add_completion_callback_for_stream(

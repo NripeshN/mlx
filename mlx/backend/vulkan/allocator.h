@@ -5,7 +5,8 @@
 #include <mutex>
 #include <unordered_set>
 
-#include <vulkan/vulkan.h>
+// Use C++ Vulkan API instead of C API
+#include <vulkan/vulkan.hpp>
 
 #include "mlx/allocator.h"
 
@@ -15,11 +16,16 @@ using allocator::Buffer;
 
 struct VulkanBuffer {
   void* mapped_ptr{nullptr};
-  VkBuffer buffer{VK_NULL_HANDLE};
-  VkDeviceMemory memory{VK_NULL_HANDLE};
+  // Use C++ Vulkan API types
+  vk::Buffer buffer;
+  vk::DeviceMemory memory;
   size_t size{0};
   size_t allocation_size{0};
-  VkMemoryPropertyFlags memory_flags{0};
+  vk::MemoryPropertyFlags memory_flags{};
+
+  // Keep vk::Buffer and vk::DeviceMemory accessible
+  operator vk::Buffer() const { return buffer; }
+  operator vk::DeviceMemory() const { return memory; }
 };
 
 class VulkanAllocator : public allocator::Allocator {

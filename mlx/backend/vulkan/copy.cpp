@@ -773,8 +773,7 @@ void copy_gpu_inplace(
           scalar_is_zero && (out.offset() % 4 == 0) && (out.nbytes() % 4 == 0);
       if (can_use_fill_buffer) {
         auto cmd_buffer = vulkan::begin_command_recording(s.index);
-        vkCmdFillBuffer(
-            cmd_buffer,
+        cmd_buffer.fillBuffer(
             out_buf->buffer,
             static_cast<VkDeviceSize>(out.offset()),
             static_cast<VkDeviceSize>(out.nbytes()),
@@ -867,7 +866,7 @@ void copy_gpu_inplace(
     return;
   }
 
-  VkCommandBuffer cmd_buffer = vulkan::begin_command_recording(s.index);
+  vk::CommandBuffer cmd_buffer = vulkan::begin_command_recording(s.index);
 
   // Get buffer handles
   auto* in_buf = static_cast<vulkan::VulkanBuffer*>(
@@ -882,8 +881,8 @@ void copy_gpu_inplace(
     copy_region.size =
         static_cast<VkDeviceSize>(dispatch_elements * size_of(out.dtype()));
 
-    vkCmdCopyBuffer(
-        cmd_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
+    cmd_buffer.copyBuffer(
+        in_buf->buffer, out_buf->buffer, {copy_region});
 
     vulkan::retain_array_for_stream(s, in);
     vulkan::retain_array_for_stream(s, out);
@@ -894,8 +893,8 @@ void copy_gpu_inplace(
     copy_region.dstOffset = static_cast<VkDeviceSize>(out_view.offset());
     copy_region.size = static_cast<VkDeviceSize>(in_view.nbytes());
 
-    vkCmdCopyBuffer(
-        cmd_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
+    cmd_buffer.copyBuffer(
+        in_buf->buffer, out_buf->buffer, {copy_region});
 
     vulkan::retain_array_for_stream(s, in_view);
     vulkan::retain_array_for_stream(s, out_view);
@@ -907,12 +906,11 @@ void copy_gpu_inplace(
           "Copy operation failed on Vulkan: unsupported large-offset strided copy.");
     }
 
-    vkCmdCopyBuffer(
-        cmd_buffer,
+    std::vector<vk::BufferCopy> cpp_copy_regions(copy_regions.begin(), copy_regions.end());
+    cmd_buffer.copyBuffer(
         in_buf->buffer,
         out_buf->buffer,
-        static_cast<uint32_t>(copy_regions.size()),
-        copy_regions.data());
+        cpp_copy_regions);
 
     vulkan::retain_array_for_stream(s, in_view);
     vulkan::retain_array_for_stream(s, out_view);
@@ -1036,8 +1034,8 @@ void concatenate_gpu(
             static_cast<VkDeviceSize>(in.offset() * size_of(in.dtype()));
         copy_region.dstOffset = static_cast<VkDeviceSize>(dst_offset);
         copy_region.size = static_cast<VkDeviceSize>(in.nbytes());
-        vkCmdCopyBuffer(
-            command_buffer, in_buf->buffer, out_buf->buffer, 1, &copy_region);
+        command_buffer.copyBuffer(
+            in_buf->buffer, out_buf->buffer, {copy_region});
         dst_offset += in.nbytes();
       }
       vulkan::end_command_recording(s.index);

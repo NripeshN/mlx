@@ -5,7 +5,8 @@
 #include <memory>
 #include <vector>
 
-#include <vulkan/vulkan.h>
+// Use C++ Vulkan API instead of C API
+#include <vulkan/vulkan.hpp>
 
 #include "mlx/api.h"
 
@@ -19,55 +20,30 @@ class VulkanContext {
  public:
   static VulkanContext& get();
 
-  VkInstance instance() const {
-    return instance_;
-  }
-  VkPhysicalDevice physical_device() const {
-    return physical_device_;
-  }
-  VkDevice device() const {
-    return device_;
-  }
-  VkQueue compute_queue() const {
-    return compute_queue_;
-  }
-  uint32_t compute_queue_family_index() const {
-    return compute_queue_family_index_;
-  }
+  // C++ Vulkan API accessors
+  const vk::Instance& instance() const { return instance_; }
+  const vk::PhysicalDevice& physical_device() const { return physical_device_; }
+  const vk::Device& device() const { return device_; }
+  const vk::Queue& compute_queue() const { return compute_queue_; }
+  uint32_t compute_queue_family_index() const { return compute_queue_family_index_; }
 
   // Memory properties
-  bool is_unified_memory() const {
-    return is_unified_memory_;
-  }
-  VkPhysicalDeviceMemoryProperties memory_properties() const {
+  bool is_unified_memory() const { return is_unified_memory_; }
+  const vk::PhysicalDeviceMemoryProperties& memory_properties() const {
     return mem_properties_;
   }
-  bool shader_float16_supported() const {
-    return shader_float16_supported_;
-  }
-  bool subgroup_size_control_supported() const {
-    return subgroup_size_control_supported_;
-  }
-  bool subgroup_require_full_support() const {
-    return subgroup_require_full_support_;
-  }
-  uint32_t subgroup_min_size() const {
-    return subgroup_min_size_;
-  }
-  uint32_t subgroup_max_size() const {
-    return subgroup_max_size_;
-  }
-  bool pipeline_robustness_supported() const {
-    return pipeline_robustness_supported_;
-  }
+  bool shader_float16_supported() const { return shader_float16_supported_; }
+  bool subgroup_size_control_supported() const { return subgroup_size_control_supported_; }
+  bool subgroup_require_full_support() const { return subgroup_require_full_support_; }
+  uint32_t subgroup_min_size() const { return subgroup_min_size_; }
+  uint32_t subgroup_max_size() const { return subgroup_max_size_; }
+  bool pipeline_robustness_supported() const { return pipeline_robustness_supported_; }
   bool coopmat_flash_attention_f32acc_supported() const {
     return coopmat_flash_attention_f32acc_supported_;
   }
 
   // Find memory type that supports the given properties
-  uint32_t find_memory_type(
-      uint32_t typeFilter,
-      VkMemoryPropertyFlags properties) const;
+  uint32_t find_memory_type(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
 
  private:
   VulkanContext();
@@ -79,10 +55,11 @@ class VulkanContext {
   void init();
   void cleanup();
 
-  VkInstance instance_{VK_NULL_HANDLE};
-  VkPhysicalDevice physical_device_{VK_NULL_HANDLE};
-  VkDevice device_{VK_NULL_HANDLE};
-  VkQueue compute_queue_{VK_NULL_HANDLE};
+  // C++ Vulkan API objects (RAII)
+  vk::Instance instance_;
+  vk::PhysicalDevice physical_device_;
+  vk::Device device_;
+  vk::Queue compute_queue_;
   uint32_t compute_queue_family_index_{0};
 
   bool initialized_{false};
@@ -94,7 +71,14 @@ class VulkanContext {
   uint32_t subgroup_max_size_{0};
   bool pipeline_robustness_supported_{false};
   bool coopmat_flash_attention_f32acc_supported_{false};
-  VkPhysicalDeviceMemoryProperties mem_properties_{};
+  vk::PhysicalDeviceMemoryProperties mem_properties_{};
 };
+
+// Helper function to check Vulkan result and throw on error
+inline void throw_if_vk_error(VkResult result, const std::string& context) {
+  if (result != VK_SUCCESS) {
+    throw std::runtime_error(context + " (VkResult=" + std::to_string(result) + ").");
+  }
+}
 
 } // namespace mlx::core::vulkan

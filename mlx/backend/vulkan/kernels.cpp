@@ -657,7 +657,7 @@ void dispatch_with_spec(
     const std::array<BoundArray, N>& bound_arrays,
     const PushConstants& push_constants,
     uint32_t num_elements,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     std::optional<std::array<uint32_t, 3>> explicit_grid = std::nullopt,
     const std::vector<uint32_t>& specialization_constants = {}) {
@@ -760,26 +760,25 @@ void dispatch_with_spec(
   }
   vkCmdDispatch(cmd_buffer, grid_x, grid_y, grid_z);
 }
-
 } // namespace
 
 ShaderModule::~ShaderModule() {
   if (module != VK_NULL_HANDLE) {
-    VkDevice device = VulkanContext::get().device();
-    vkDestroyShaderModule(device, module, nullptr);
+    vk::Device device = VulkanContext::get().device();
+    device.destroyShaderModule(module, nullptr);
   }
 }
 
 ComputePipeline::~ComputePipeline() {
-  VkDevice device = VulkanContext::get().device();
+  vk::Device device = VulkanContext::get().device();
   if (pipeline != VK_NULL_HANDLE) {
-    vkDestroyPipeline(device, pipeline, nullptr);
+    device.destroyPipeline(pipeline, nullptr);
   }
   if (layout != VK_NULL_HANDLE) {
-    vkDestroyPipelineLayout(device, layout, nullptr);
+    device.destroyPipelineLayout(layout, nullptr);
   }
   if (descriptor_layout != VK_NULL_HANDLE) {
-    vkDestroyDescriptorSetLayout(device, descriptor_layout, nullptr);
+    device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
   }
 }
 
@@ -819,12 +818,12 @@ size_t KernelManager::PipelineKeyHash::operator()(
 }
 
 KernelManager::DescriptorBindingKey KernelManager::make_descriptor_binding_key(
-    const VkDescriptorSetLayoutBinding& binding) {
+    const vk::DescriptorSetLayoutBinding& binding) {
   return {
       binding.binding,
       static_cast<uint32_t>(binding.descriptorType),
       binding.descriptorCount,
-      binding.stageFlags,
+      static_cast<VkShaderStageFlags>(binding.stageFlags),
       binding.pImmutableSamplers != nullptr,
   };
 }
@@ -859,10 +858,10 @@ void KernelManager::register_shader(
         VulkanContext::get().device(), shader->module, nullptr);
   }
 
-  std::unordered_set<VkDescriptorSetLayout, VulkanHandleHash> evicted_layouts;
+  std::unordered_set<vk::DescriptorSetLayout, VulkanHandleHash> evicted_layouts;
   for (const auto& [key, pipeline] : pipelines_) {
     if (!key.is_dynamic || key.dynamic_shader_name != name ||
-        pipeline == nullptr || pipeline->descriptor_layout == VK_NULL_HANDLE) {
+        pipeline == nullptr || !pipeline->descriptor_layout) {
       continue;
     }
     evicted_layouts.insert(pipeline->descriptor_layout);
@@ -900,22 +899,19 @@ void KernelManager::ensure_static_registry_initialized() {
   static_registry_initialized_ = true;
 }
 
-VkShaderModule KernelManager::compile_shader(
+vk::ShaderModule KernelManager::compile_shader(
     const std::vector<uint32_t>& spirv) {
-  VkDevice device = VulkanContext::get().device();
+  vk::Device device = VulkanContext::get().device();
 
-  VkShaderModuleCreateInfo createInfo{};
-  createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-  createInfo.codeSize = spirv.size() * sizeof(uint32_t);
-  createInfo.pCode = spirv.data();
+  vk::ShaderModuleCreateInfo createInfo;
+  createInfo.setCode(spirv);
 
-  VkShaderModule module;
-  if (vkCreateShaderModule(device, &createInfo, nullptr, &module) !=
-      VK_SUCCESS) {
-    throw std::runtime_error("Failed to create shader module");
+  try {
+    return device.createShaderModule(createInfo);
+  } catch (const vk::SystemError& e) {
+    throw std::runtime_error(
+        "Failed to create shader module: " + std::string(e.what()));
   }
-
-  return module;
 }
 
 ShaderModule* KernelManager::get_shader(StaticShaderId id) {
@@ -938,7 +934,8 @@ ShaderModule* KernelManager::get_shader(StaticShaderId id) {
   return shader;
 }
 
-ShaderModule* KernelManager::get_shader(const std::string& name) {
+mlx::core::vulkan::ShaderModule* mlx::core::vulkan::KernelManager::get_shader(
+    const std::string& name) {
   auto it = dynamic_shaders_.find(name);
   if (it == dynamic_shaders_.end()) {
     return nullptr;
@@ -951,6 +948,30 @@ ShaderModule* KernelManager::get_shader(const std::string& name) {
   }
 
   return shader;
+}
+
+ComputePipeline* KernelManager::get_pipeline(
+    StaticShaderId shader_id,
+    const std::vector<vk::DescriptorSetLayoutBinding>& bindings,
+    uint32_t push_constant_size,
+    const std::vector<uint32_t>& specialization_constants) {
+  // Convert C++ bindings to C bindings for internal use
+  std::vector<VkDescriptorSetLayoutBinding> c_bindings;
+  for (const auto& binding : bindings) {
+    VkDescriptorSetLayoutBinding c_binding{};
+    c_binding.binding = binding.binding;
+    c_binding.descriptorType =
+        static_cast<VkDescriptorType>(binding.descriptorType);
+    c_binding.descriptorCount = binding.descriptorCount;
+    c_binding.stageFlags = static_cast<VkShaderStageFlags>(binding.stageFlags);
+    c_binding.pImmutableSamplers = binding.pImmutableSamplers
+        ? reinterpret_cast<const VkSampler*>(binding.pImmutableSamplers)
+        : nullptr;
+    c_bindings.push_back(c_binding);
+  }
+
+  return get_pipeline(
+      shader_id, c_bindings, push_constant_size, specialization_constants);
 }
 
 ComputePipeline* KernelManager::get_pipeline(
@@ -1112,6 +1133,30 @@ ComputePipeline* KernelManager::get_pipeline(
 
 ComputePipeline* KernelManager::get_pipeline(
     const std::string& shader_name,
+    const std::vector<vk::DescriptorSetLayoutBinding>& bindings,
+    uint32_t push_constant_size,
+    const std::vector<uint32_t>& specialization_constants) {
+  // Convert C++ bindings to C bindings for internal use
+  std::vector<VkDescriptorSetLayoutBinding> c_bindings;
+  for (const auto& binding : bindings) {
+    VkDescriptorSetLayoutBinding c_binding{};
+    c_binding.binding = binding.binding;
+    c_binding.descriptorType =
+        static_cast<VkDescriptorType>(binding.descriptorType);
+    c_binding.descriptorCount = binding.descriptorCount;
+    c_binding.stageFlags = static_cast<VkShaderStageFlags>(binding.stageFlags);
+    c_binding.pImmutableSamplers = binding.pImmutableSamplers
+        ? reinterpret_cast<const VkSampler*>(binding.pImmutableSamplers)
+        : nullptr;
+    c_bindings.push_back(c_binding);
+  }
+
+  return get_pipeline(
+      shader_name, c_bindings, push_constant_size, specialization_constants);
+}
+
+ComputePipeline* KernelManager::get_pipeline(
+    const std::string& shader_name,
     const std::vector<VkDescriptorSetLayoutBinding>& bindings,
     uint32_t push_constant_size,
     const std::vector<uint32_t>& specialization_constants) {
@@ -1254,22 +1299,24 @@ void KernelManager::init_descriptor_pool() {
   poolInfo.maxSets = 16384;
   poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
 
-  if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptor_pool_) !=
+  VkDescriptorPool c_pool;
+  if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &c_pool) !=
       VK_SUCCESS) {
     throw std::runtime_error("Failed to create descriptor pool");
   }
+  descriptor_pool_ = c_pool;
 
   descriptor_pool_initialized_ = true;
 }
 
-VkDescriptorSet KernelManager::allocate_descriptor_set(
-    VkDescriptorSetLayout layout) {
+vk::DescriptorSet KernelManager::allocate_descriptor_set(
+    vk::DescriptorSetLayout layout) {
   {
     std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
     auto reusable_it = reusable_descriptor_sets_.find(layout);
     if (reusable_it != reusable_descriptor_sets_.end() &&
         !reusable_it->second.empty()) {
-      VkDescriptorSet descriptor_set = reusable_it->second.back();
+      vk::DescriptorSet descriptor_set = reusable_it->second.back();
       reusable_it->second.pop_back();
       if (reusable_it->second.empty()) {
         reusable_descriptor_sets_.erase(reusable_it);
@@ -1277,8 +1324,12 @@ VkDescriptorSet KernelManager::allocate_descriptor_set(
       if (trace_descriptor_epochs_enabled()) {
         std::ostringstream oss;
         oss << "reuse layout=0x" << std::hex
-            << reinterpret_cast<uintptr_t>(layout) << " set=0x"
-            << reinterpret_cast<uintptr_t>(descriptor_set) << std::dec;
+            << reinterpret_cast<uintptr_t>(
+                   static_cast<VkDescriptorSetLayout>(layout))
+            << " set=0x"
+            << reinterpret_cast<uintptr_t>(
+                   static_cast<VkDescriptorSet>(descriptor_set))
+            << std::dec;
         trace_descriptor_epochs(oss.str());
       }
       return descriptor_set;
@@ -1289,34 +1340,38 @@ VkDescriptorSet KernelManager::allocate_descriptor_set(
     init_descriptor_pool();
   }
 
-  VkDevice device = VulkanContext::get().device();
+  vk::Device device = VulkanContext::get().device();
 
-  VkDescriptorSetAllocateInfo allocInfo{};
-  allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-  allocInfo.descriptorPool = descriptor_pool_;
-  allocInfo.descriptorSetCount = 1;
-  allocInfo.pSetLayouts = &layout;
+  vk::DescriptorSetAllocateInfo allocInfo;
+  allocInfo.setDescriptorPool(descriptor_pool_);
+  allocInfo.setSetLayouts(layout);
 
-  VkDescriptorSet descriptor_set;
-  if (vkAllocateDescriptorSets(device, &allocInfo, &descriptor_set) !=
-      VK_SUCCESS) {
-    throw std::runtime_error("Failed to allocate descriptor set");
+  try {
+    auto descriptor_sets = device.allocateDescriptorSets(allocInfo);
+    vk::DescriptorSet descriptor_set = descriptor_sets[0];
+
+    {
+      std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
+      descriptor_set_layouts_[descriptor_set] = layout;
+    }
+
+    if (trace_descriptor_epochs_enabled()) {
+      std::ostringstream oss;
+      oss << "allocate layout=0x" << std::hex
+          << reinterpret_cast<uintptr_t>(
+                 static_cast<VkDescriptorSetLayout>(layout))
+          << " set=0x"
+          << reinterpret_cast<uintptr_t>(
+                 static_cast<VkDescriptorSet>(descriptor_set))
+          << std::dec;
+      trace_descriptor_epochs(oss.str());
+    }
+
+    return descriptor_set;
+  } catch (const vk::SystemError& e) {
+    throw std::runtime_error(
+        "Failed to allocate descriptor set: " + std::string(e.what()));
   }
-
-  {
-    std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
-    descriptor_set_layouts_[descriptor_set] = layout;
-  }
-
-  if (trace_descriptor_epochs_enabled()) {
-    std::ostringstream oss;
-    oss << "allocate layout=0x" << std::hex
-        << reinterpret_cast<uintptr_t>(layout) << " set=0x"
-        << reinterpret_cast<uintptr_t>(descriptor_set) << std::dec;
-    trace_descriptor_epochs(oss.str());
-  }
-
-  return descriptor_set;
 }
 
 void KernelManager::free_descriptor_set(VkDescriptorSet set) {
@@ -1332,18 +1387,18 @@ void KernelManager::free_descriptor_set(VkDescriptorSet set) {
 
 void KernelManager::defer_descriptor_set_free(
     int stream_index,
-    VkDescriptorSet set) {
+    vk::DescriptorSet set) {
   defer_descriptor_set_free(stream_index, 0, set);
 }
 
 void KernelManager::defer_descriptor_set_free(
     int stream_index,
     uint64_t submission_epoch,
-    VkDescriptorSet set) {
-  if (set == VK_NULL_HANDLE) {
+    vk::DescriptorSet set) {
+  if (!set) {
     return;
   }
-  VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+  vk::DescriptorSetLayout layout;
   {
     std::lock_guard<std::mutex> lock(descriptor_sets_mutex_);
     auto it = descriptor_set_layouts_.find(set);
@@ -1361,6 +1416,21 @@ void KernelManager::defer_descriptor_set_free(
         << deferred_descriptor_sets_[stream_index][submission_epoch].size();
     trace_descriptor_epochs(oss.str());
   }
+}
+
+// Backward compatibility overloads for C API
+void KernelManager::defer_descriptor_set_free(
+    int stream_index,
+    VkDescriptorSet set) {
+  defer_descriptor_set_free(stream_index, 0, set);
+}
+
+void KernelManager::defer_descriptor_set_free(
+    int stream_index,
+    uint64_t submission_epoch,
+    VkDescriptorSet set) {
+  defer_descriptor_set_free(
+      stream_index, submission_epoch, vk::DescriptorSet(set));
 }
 
 void KernelManager::reclaim_descriptor_sets(int stream_index) {
@@ -1555,7 +1625,7 @@ void KernelManager::reclaim_all_descriptor_sets() {
 }
 
 void KernelManager::purge_descriptor_sets_for_layouts(
-    const std::unordered_set<VkDescriptorSetLayout, VulkanHandleHash>&
+    const std::unordered_set<vk::DescriptorSetLayout, VulkanHandleHash>&
         layouts) {
   if (layouts.empty()) {
     return;
@@ -1673,7 +1743,7 @@ void dispatch_binary_op(
     const array& b,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     BinaryDispatchVariant variant,
     std::optional<std::array<uint32_t, 3>> explicit_grid,
@@ -1723,7 +1793,7 @@ void dispatch_binary_op(
     const array& b,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     BinaryDispatchVariant variant,
     std::optional<std::array<uint32_t, 3>> explicit_grid,
@@ -1778,7 +1848,7 @@ void dispatch_ternary_op(
     const array& y,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s) {
   if (cond.shape() != out.shape() || x.shape() != out.shape() ||
       y.shape() != out.shape()) {
@@ -1809,7 +1879,7 @@ void dispatch_unary_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     float param1,
     float param2) {
@@ -1833,7 +1903,7 @@ void dispatch_generic_unary_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     float param1,
     float param2,
@@ -1861,7 +1931,7 @@ void dispatch_generic_unary_op(
 void dispatch_arange_op(
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     float start,
     float step) {
@@ -1884,7 +1954,7 @@ void dispatch_sum_rows_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     float weight) {
   if (out.size() == 0) {
@@ -1914,7 +1984,7 @@ void dispatch_argmax_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s) {
   if (out.size() == 0) {
     return;
@@ -1952,7 +2022,7 @@ void dispatch_softmax_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s) {
   if (out.size() == 0) {
     return;
@@ -2001,7 +2071,7 @@ void dispatch_softmax_large_op(
     StaticShaderId shader_id_pass1,
     StaticShaderId shader_id_pass2,
     StaticShaderId shader_id_pass3,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s) {
   if (out.size() == 0) {
     return;
@@ -2131,7 +2201,7 @@ void dispatch_diag_mask_inf_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t rows_per_channel,
     uint32_t n_past) {
@@ -2199,7 +2269,7 @@ void dispatch_flash_attention_op(
     array& out,
     const array& mask_opt,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const FlashAttentionPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid,
@@ -2230,7 +2300,7 @@ void dispatch_flash_attention_split_k_reduce_op(
     const array& sinks,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const FlashAttentionSplitKReducePushConstants& push_constants,
     const std::array<uint32_t, 3>& grid,
@@ -2257,7 +2327,7 @@ void dispatch_flash_attention_mask_opt_op(
     const array& mask,
     array& mask_opt,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const FlashAttentionMaskOptPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid,
@@ -2283,7 +2353,7 @@ void dispatch_cumsum_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s) {
   if (out.size() == 0) {
     return;
@@ -2398,7 +2468,7 @@ void dispatch_mul_mm_op(
     const array& b,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const MatmulPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid) {
@@ -2440,7 +2510,7 @@ void dispatch_mul_mat_vec_op(
     const array& vec,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s) {
   if (matrix.ndim() != 2 || vec.ndim() != 2 || out.ndim() != 2) {
     throw std::runtime_error(
@@ -2503,7 +2573,7 @@ void dispatch_random_bits_op(
     const array& keys,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const RandomBitsPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid) {
@@ -2527,7 +2597,7 @@ void dispatch_gather_op(
     const array& indices,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t slice_size,
     uint32_t axis_size,
@@ -2559,7 +2629,7 @@ void dispatch_gather_axis_op(
     const array& indices,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t size_pre,
     uint32_t size_axis,
@@ -2595,7 +2665,7 @@ void dispatch_scatter_axis_op(
     const array& indices,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t size_pre,
     uint32_t size_axis,
@@ -2633,7 +2703,7 @@ void dispatch_rope_op(
     array& out,
     const array& indices,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const RopePushConstants& push_constants,
     const std::array<uint32_t, 3>& grid) {

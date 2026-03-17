@@ -2,7 +2,7 @@
 
 #pragma once
 
-#include <vulkan/vulkan.h>
+#include <vulkan/vulkan.hpp>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -15,19 +15,46 @@
 #include "mlx/backend/vulkan/allocator.h"
 #include "vulkan_shaders.hpp"
 
+// Forward declaration for generated enum (will be overridden by
+// vulkan_shaders.hpp)
+enum class StaticShaderId : uint32_t {
+  Count // Placeholder - actual values defined in generated header
+};
+
 namespace mlx::core::vulkan {
 
+// Hash function for Vulkan handle types
 struct VulkanHandleHash {
-  template <typename T>
-  size_t operator()(T handle) const {
-    return std::hash<uintptr_t>{}(reinterpret_cast<uintptr_t>(handle));
+  size_t operator()(vk::DescriptorSet handle) const {
+    return std::hash<uintptr_t>{}(
+        reinterpret_cast<uintptr_t>(static_cast<VkDescriptorSet>(handle)));
+  }
+
+  size_t operator()(vk::DescriptorSetLayout handle) const {
+    return std::hash<uintptr_t>{}(reinterpret_cast<uintptr_t>(
+        static_cast<VkDescriptorSetLayout>(handle)));
+  }
+
+  size_t operator()(vk::Pipeline handle) const {
+    return std::hash<uintptr_t>{}(
+        reinterpret_cast<uintptr_t>(static_cast<VkPipeline>(handle)));
+  }
+
+  size_t operator()(vk::PipelineLayout handle) const {
+    return std::hash<uintptr_t>{}(
+        reinterpret_cast<uintptr_t>(static_cast<VkPipelineLayout>(handle)));
+  }
+
+  size_t operator()(vk::ShaderModule handle) const {
+    return std::hash<uintptr_t>{}(
+        reinterpret_cast<uintptr_t>(static_cast<VkShaderModule>(handle)));
   }
 };
 
 // Shader SPIR-V data container
 struct ShaderModule {
   std::vector<uint32_t> spirv_code;
-  VkShaderModule module{VK_NULL_HANDLE};
+  vk::ShaderModule module;
   bool compiled{false};
   std::string debug_name;
 
@@ -36,9 +63,9 @@ struct ShaderModule {
 
 // Compute pipeline wrapper
 struct ComputePipeline {
-  VkPipeline pipeline{VK_NULL_HANDLE};
-  VkPipelineLayout layout{VK_NULL_HANDLE};
-  VkDescriptorSetLayout descriptor_layout{VK_NULL_HANDLE};
+  vk::Pipeline pipeline;
+  vk::PipelineLayout layout;
+  vk::DescriptorSetLayout descriptor_layout;
   uint32_t push_constant_size{0};
 
   ~ComputePipeline();
@@ -52,6 +79,18 @@ class KernelManager {
   void initialize_static_registry();
 
   // Get or create a compute pipeline for a shader
+  ComputePipeline* get_pipeline(
+      StaticShaderId shader_id,
+      const std::vector<vk::DescriptorSetLayoutBinding>& bindings,
+      uint32_t push_constant_size = 0,
+      const std::vector<uint32_t>& specialization_constants = {});
+  ComputePipeline* get_pipeline(
+      const std::string& shader_name,
+      const std::vector<vk::DescriptorSetLayoutBinding>& bindings,
+      uint32_t push_constant_size = 0,
+      const std::vector<uint32_t>& specialization_constants = {});
+
+  // Backward compatibility overloads for C API
   ComputePipeline* get_pipeline(
       StaticShaderId shader_id,
       const std::vector<VkDescriptorSetLayoutBinding>& bindings,
@@ -72,7 +111,16 @@ class KernelManager {
   register_shader(const std::string& name, const void* data, size_t size_bytes);
 
   // Descriptor set management
-  VkDescriptorSet allocate_descriptor_set(VkDescriptorSetLayout layout);
+  vk::DescriptorSet allocate_descriptor_set(vk::DescriptorSetLayout layout);
+  void free_descriptor_set(vk::DescriptorSet set);
+  void defer_descriptor_set_free(int stream_index, vk::DescriptorSet set);
+  void defer_descriptor_set_free(
+      int stream_index,
+      uint64_t submission_epoch,
+      vk::DescriptorSet set);
+
+  // Backward compatibility overloads for C API
+  vk::DescriptorSet allocate_descriptor_set(VkDescriptorSetLayout layout);
   void free_descriptor_set(VkDescriptorSet set);
   void defer_descriptor_set_free(int stream_index, VkDescriptorSet set);
   void defer_descriptor_set_free(
@@ -123,11 +171,11 @@ class KernelManager {
       StaticShaderId id,
       const void* data,
       size_t size_bytes);
-  VkShaderModule compile_shader(const std::vector<uint32_t>& spirv);
+  vk::ShaderModule compile_shader(const std::vector<uint32_t>& spirv);
   static DescriptorBindingKey make_descriptor_binding_key(
-      const VkDescriptorSetLayoutBinding& binding);
+      const vk::DescriptorSetLayoutBinding& binding);
   void purge_descriptor_sets_for_layouts(
-      const std::unordered_set<VkDescriptorSetLayout, VulkanHandleHash>&
+      const std::unordered_set<vk::DescriptorSetLayout, VulkanHandleHash>&
           layouts);
 
   std::vector<std::unique_ptr<ShaderModule>> static_shaders_;
@@ -142,12 +190,12 @@ class KernelManager {
   std::mutex static_registry_mutex_;
 
   struct DescriptorSetRecord {
-    VkDescriptorSet set{VK_NULL_HANDLE};
-    VkDescriptorSetLayout layout{VK_NULL_HANDLE};
+    vk::DescriptorSet set;
+    vk::DescriptorSetLayout layout;
   };
 
   // Descriptor pool for allocating descriptor sets
-  VkDescriptorPool descriptor_pool_{VK_NULL_HANDLE};
+  vk::DescriptorPool descriptor_pool_;
   bool descriptor_pool_initialized_{false};
   std::unordered_map<
       int,
@@ -155,11 +203,14 @@ class KernelManager {
       deferred_descriptor_sets_;
   std::mutex deferred_descriptor_sets_mutex_;
   std::unordered_map<
-      VkDescriptorSetLayout,
-      std::vector<VkDescriptorSet>,
+      vk::DescriptorSetLayout,
+      std::vector<vk::DescriptorSet>,
       VulkanHandleHash>
       reusable_descriptor_sets_;
-  std::unordered_map<VkDescriptorSet, VkDescriptorSetLayout, VulkanHandleHash>
+  std::unordered_map<
+      vk::DescriptorSet,
+      vk::DescriptorSetLayout,
+      VulkanHandleHash>
       descriptor_set_layouts_;
   std::mutex descriptor_sets_mutex_;
 
@@ -450,7 +501,7 @@ void dispatch_binary_op(
     const array& b,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     BinaryDispatchVariant variant = BinaryDispatchVariant::Standard,
     std::optional<std::array<uint32_t, 3>> explicit_grid = std::nullopt,
@@ -461,7 +512,7 @@ void dispatch_binary_op(
     const array& b,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     BinaryDispatchVariant variant,
     std::optional<std::array<uint32_t, 3>> explicit_grid,
@@ -476,14 +527,14 @@ void dispatch_ternary_op(
     const array& y,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s);
 
 void dispatch_unary_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     float param1 = 0.0f,
     float param2 = 0.0f);
@@ -492,7 +543,7 @@ void dispatch_generic_unary_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     float param1 = 0.0f,
     float param2 = 0.0f,
@@ -502,7 +553,7 @@ void dispatch_generic_unary_op(
 void dispatch_arange_op(
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     float start,
     float step);
@@ -511,7 +562,7 @@ void dispatch_sum_rows_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     float weight = 1.0f);
 
@@ -519,14 +570,14 @@ void dispatch_argmax_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s);
 
 void dispatch_softmax_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s);
 
 void dispatch_softmax_large_op(
@@ -535,14 +586,14 @@ void dispatch_softmax_large_op(
     StaticShaderId shader_id_pass1,
     StaticShaderId shader_id_pass2,
     StaticShaderId shader_id_pass3,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s);
 
 void dispatch_diag_mask_inf_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t rows_per_channel,
     uint32_t n_past);
@@ -556,7 +607,7 @@ void dispatch_flash_attention_op(
     array& out,
     const array& mask_opt,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const FlashAttentionPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid,
@@ -567,7 +618,7 @@ void dispatch_flash_attention_split_k_reduce_op(
     const array& sinks,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const FlashAttentionSplitKReducePushConstants& push_constants,
     const std::array<uint32_t, 3>& grid,
@@ -577,7 +628,7 @@ void dispatch_flash_attention_mask_opt_op(
     const array& mask,
     array& mask_opt,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const FlashAttentionMaskOptPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid,
@@ -587,7 +638,7 @@ void dispatch_cumsum_op(
     const array& in,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s);
 
 void dispatch_mul_mm_op(
@@ -595,7 +646,7 @@ void dispatch_mul_mm_op(
     const array& b,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const MatmulPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid);
@@ -605,14 +656,14 @@ void dispatch_mul_mat_vec_op(
     const array& vec,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s);
 
 void dispatch_random_bits_op(
     const array& keys,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const RandomBitsPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid);
@@ -622,7 +673,7 @@ void dispatch_gather_op(
     const array& indices,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t slice_size,
     uint32_t axis_size,
@@ -633,7 +684,7 @@ void dispatch_gather_axis_op(
     const array& indices,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t size_pre,
     uint32_t size_axis,
@@ -645,7 +696,7 @@ void dispatch_scatter_axis_op(
     const array& indices,
     array& out,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     uint32_t size_pre,
     uint32_t size_axis,
@@ -659,7 +710,7 @@ void dispatch_rope_op(
     array& out,
     const array& indices,
     StaticShaderId shader_id,
-    VkCommandBuffer cmd_buffer,
+    vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const RopePushConstants& push_constants,
     const std::array<uint32_t, 3>& grid);

@@ -21,6 +21,8 @@ namespace allocator {
 
 namespace {
 
+using namespace vk;
+
 bool trace_cpu_access_enabled() {
   static const bool enabled = []() {
     const char* env = std::getenv("MLX_VULKAN_TRACE_CPU_ACCESS");
@@ -41,10 +43,12 @@ void* Buffer::raw_ptr() {
   }
   auto* buf = static_cast<vulkan::VulkanBuffer*>(ptr_);
   if (trace_cpu_access_enabled()) {
+    // Convert memory flags to uint32_t for printing
+    uint32_t flags = static_cast<uint32_t>(buf->memory_flags);
     std::cerr << "[vulkan-cpu-access] raw_ptr buffer=" << buf->buffer
               << " mapped=" << buf->mapped_ptr << " size=" << buf->size
               << " alloc=" << buf->allocation_size << " flags=0x" << std::hex
-              << buf->memory_flags << std::dec << "\n";
+              << flags << std::dec << "\n";
   }
   vulkan::synchronize_all();
   return buf->mapped_ptr;
@@ -59,10 +63,13 @@ namespace {
 uint32_t find_memory_type_index(
     const VulkanContext& ctx,
     uint32_t type_filter,
-    const std::vector<VkMemoryPropertyFlags>& preferred_flags) {
+    const std::vector<vk::MemoryPropertyFlags>& preferred_flags) {
   for (auto flags : preferred_flags) {
     try {
-      return ctx.find_memory_type(type_filter, flags);
+      // Convert vk::MemoryPropertyFlags to VkMemoryPropertyFlags
+      // This is safe since they're the same underlying type
+      VkMemoryPropertyFlags vk_flags = static_cast<VkMemoryPropertyFlags>(flags);
+      return ctx.find_memory_type(type_filter, vk_flags);
     } catch (const std::runtime_error&) {
     }
   }
@@ -140,28 +147,24 @@ Buffer VulkanAllocator::malloc(size_t size) {
   }
 
   auto& ctx = VulkanContext::get();
-  auto device = ctx.device();
+  auto vk_device = ctx.device();
 
-  VkBufferCreateInfo buffer_info{};
-  buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  buffer_info.size = size;
-  buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-  buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  // Use C++ Vulkan API for buffer creation
+  vk::BufferCreateInfo buffer_info(vk::BufferCreateFlags(), size);
+  buffer_info.usage = vk::BufferUsageFlagBits::eStorageBuffer | 
+                      vk::BufferUsageFlagBits::eTransferSrc | 
+                      vk::BufferUsageFlagBits::eTransferDst;
+  buffer_info.sharingMode = vk::SharingMode::eExclusive;
 
-  VkBuffer vk_buffer = VK_NULL_HANDLE;
-  if (vkCreateBuffer(device, &buffer_info, nullptr, &vk_buffer) != VK_SUCCESS) {
-    throw std::runtime_error("[vulkan::malloc] Failed to create buffer.");
-  }
+  vk::Buffer vk_buffer = vk_device.createBuffer(buffer_info);
 
-  VkMemoryRequirements mem_requirements{};
-  vkGetBufferMemoryRequirements(device, vk_buffer, &mem_requirements);
+  vk::MemoryRequirements mem_requirements = vk_device.getBufferMemoryRequirements(vk_buffer);
   const size_t allocation_size = static_cast<size_t>(mem_requirements.size);
 
   {
     std::unique_lock lk(mutex_);
     if (num_resources_ >= resource_limit_) {
-      vkDestroyBuffer(device, vk_buffer, nullptr);
+      vk_device.destroyBuffer(vk_buffer);
       std::ostringstream msg;
       msg << "[vulkan::malloc] Resource limit (" << resource_limit_
           << ") exceeded.";
@@ -169,24 +172,24 @@ Buffer VulkanAllocator::malloc(size_t size) {
     }
   }
 
-  std::vector<VkMemoryPropertyFlags> preferred_memory_types;
+  std::vector<vk::MemoryPropertyFlags> preferred_memory_types;
   if (ctx.is_unified_memory()) {
     preferred_memory_types = {
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        vk::MemoryPropertyFlagBits::eDeviceLocal |
+            vk::MemoryPropertyFlagBits::eHostVisible |
+            vk::MemoryPropertyFlagBits::eHostCoherent,
+        vk::MemoryPropertyFlagBits::eHostVisible |
+            vk::MemoryPropertyFlagBits::eHostCoherent};
   } else {
     preferred_memory_types = {
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-            VK_MEMORY_PROPERTY_HOST_CACHED_BIT};
+        vk::MemoryPropertyFlagBits::eDeviceLocal |
+            vk::MemoryPropertyFlagBits::eHostVisible |
+            vk::MemoryPropertyFlagBits::eHostCoherent,
+        vk::MemoryPropertyFlagBits::eHostVisible |
+            vk::MemoryPropertyFlagBits::eHostCoherent,
+        vk::MemoryPropertyFlagBits::eHostVisible |
+            vk::MemoryPropertyFlagBits::eHostCoherent |
+            vk::MemoryPropertyFlagBits::eHostCached};
   }
 
   uint32_t memory_type_index = 0;
@@ -194,7 +197,7 @@ Buffer VulkanAllocator::malloc(size_t size) {
     memory_type_index = find_memory_type_index(
         ctx, mem_requirements.memoryTypeBits, preferred_memory_types);
   } catch (...) {
-    vkDestroyBuffer(device, vk_buffer, nullptr);
+    vk_device.destroyBuffer(vk_buffer);
     throw;
   }
 
@@ -202,33 +205,21 @@ Buffer VulkanAllocator::malloc(size_t size) {
   const auto memory_flags =
       mem_props.memoryTypes[memory_type_index].propertyFlags;
 
-  VkMemoryAllocateInfo alloc_info{};
-  alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  alloc_info.allocationSize = mem_requirements.size;
-  alloc_info.memoryTypeIndex = memory_type_index;
+  // Use C++ Vulkan API for memory allocation
+  vk::MemoryAllocateInfo alloc_info(mem_requirements.size, memory_type_index);
+  vk::DeviceMemory vk_memory = vk_device.allocateMemory(alloc_info);
 
-  VkDeviceMemory vk_memory = VK_NULL_HANDLE;
-  if (vkAllocateMemory(device, &alloc_info, nullptr, &vk_memory) !=
-      VK_SUCCESS) {
-    vkDestroyBuffer(device, vk_buffer, nullptr);
-    throw std::runtime_error(
-        "[vulkan::malloc] Failed to allocate device memory.");
-  }
-
-  if (vkBindBufferMemory(device, vk_buffer, vk_memory, 0) != VK_SUCCESS) {
-    vkFreeMemory(device, vk_memory, nullptr);
-    vkDestroyBuffer(device, vk_buffer, nullptr);
+  // Bind memory - C++ API doesn't have this method, so use C function
+  if (vkBindBufferMemory(vk_device, vk_buffer, vk_memory, 0) != VK_SUCCESS) {
+    vk_device.freeMemory(vk_memory);
+    vk_device.destroyBuffer(vk_buffer);
     throw std::runtime_error("[vulkan::malloc] Failed to bind buffer memory.");
   }
 
   void* mapped_ptr = nullptr;
-  if (memory_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
-    if (vkMapMemory(device, vk_memory, 0, VK_WHOLE_SIZE, 0, &mapped_ptr) !=
-        VK_SUCCESS) {
-      vkFreeMemory(device, vk_memory, nullptr);
-      vkDestroyBuffer(device, vk_buffer, nullptr);
-      throw std::runtime_error("[vulkan::malloc] Failed to map memory.");
-    }
+  if (memory_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+    // Use C++ API to map memory
+    mapped_ptr = vk_device.mapMemory(vk_memory, 0, VK_WHOLE_SIZE);
   }
 
   auto* buf = new VulkanBuffer{
@@ -246,6 +237,9 @@ Buffer VulkanAllocator::malloc(size_t size) {
 }
 
 void VulkanAllocator::free(Buffer buffer) {
+  // Use C-style function to get raw device handle
+  auto vk_device = VulkanContext::get().device();
+  
   auto* buf = static_cast<VulkanBuffer*>(buffer.ptr());
   if (buf == nullptr) {
     return;
@@ -253,7 +247,8 @@ void VulkanAllocator::free(Buffer buffer) {
 
   {
     std::unique_lock lk(mutex_);
-    if (!live_buffers_.contains(buf)) {
+    // Convert to unordered_set::find or use contains if C++17
+    if (live_buffers_.find(buf) == live_buffers_.end()) {
       return;
     }
     live_buffers_.erase(buf);
@@ -261,11 +256,9 @@ void VulkanAllocator::free(Buffer buffer) {
     num_resources_ -= std::min<size_t>(1, num_resources_);
   }
 
-  auto device = VulkanContext::get().device();
-
-  // A buffer must be destroyed before freeing its bound memory.
-  vkDestroyBuffer(device, buf->buffer, nullptr);
-  vkFreeMemory(device, buf->memory, nullptr);
+  // Use C++ Vulkan API for cleanup
+  vk_device.destroyBuffer(buf->buffer);
+  vk_device.freeMemory(buf->memory);
 
   delete buf;
 }

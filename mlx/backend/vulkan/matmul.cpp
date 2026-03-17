@@ -219,8 +219,8 @@ void zero_initialize_output(array& out, Stream s) {
     return;
   }
   auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
-  auto command_buffer = vulkan::begin_command_recording(s.index);
-  vkCmdFillBuffer(command_buffer, out_buf->buffer, 0, out.nbytes(), 0);
+  auto cmd_buffer = vulkan::begin_command_recording(s.index);
+  cmd_buffer.fillBuffer(out_buf->buffer, 0, out.nbytes(), 0);
   vulkan::end_command_recording(s.index);
 }
 

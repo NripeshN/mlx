@@ -21,21 +21,19 @@ device_info(int device_index) {
   auto init_device_info = []()
       -> std::unordered_map<std::string, std::variant<std::string, size_t>> {
     const VulkanContext& ctx = VulkanContext::get();
-    VkPhysicalDevice physical_device = ctx.physical_device();
+    vk::PhysicalDevice physical_device = ctx.physical_device();
 
     // Get device properties
-    VkPhysicalDeviceProperties device_props;
-    vkGetPhysicalDeviceProperties(physical_device, &device_props);
+    vk::PhysicalDeviceProperties device_props = physical_device.getProperties();
 
     // Get memory properties
-    VkPhysicalDeviceMemoryProperties mem_props;
-    vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_props);
+    vk::PhysicalDeviceMemoryProperties mem_props = physical_device.getMemoryProperties();
 
     // Calculate total device memory (device-local heaps)
     size_t device_memory = 0;
     size_t host_memory = 0;
     for (uint32_t i = 0; i < mem_props.memoryHeapCount; i++) {
-      if (mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+      if (mem_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
         device_memory += mem_props.memoryHeaps[i].size;
       } else {
         host_memory += mem_props.memoryHeaps[i].size;
@@ -51,16 +49,16 @@ device_info(int device_index) {
     // Get device type as string
     std::string device_type;
     switch (device_props.deviceType) {
-      case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+      case vk::PhysicalDeviceType::eIntegratedGpu:
         device_type = "Integrated GPU";
         break;
-      case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+      case vk::PhysicalDeviceType::eDiscreteGpu:
         device_type = "Discrete GPU";
         break;
-      case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+      case vk::PhysicalDeviceType::eVirtualGpu:
         device_type = "Virtual GPU";
         break;
-      case VK_PHYSICAL_DEVICE_TYPE_CPU:
+      case vk::PhysicalDeviceType::eCpu:
         device_type = "CPU";
         break;
       default:
@@ -99,7 +97,7 @@ device_info(int device_index) {
     uint32_t api_version = device_props.apiVersion;
 
     // Calculate max work group size
-    VkPhysicalDeviceLimits limits = device_props.limits;
+    vk::PhysicalDeviceLimits limits = device_props.limits;
     size_t max_work_group_size = limits.maxComputeWorkGroupSize[0] *
         limits.maxComputeWorkGroupSize[1] * limits.maxComputeWorkGroupSize[2];
 
@@ -126,14 +124,14 @@ device_info(int device_index) {
         {"max_recommended_working_set_size", device_memory},
         {"unified_memory", is_unified},
         {"max_work_group_size", max_work_group_size},
-        {"max_compute_work_group_count_x", limits.maxComputeWorkGroupCount[0]},
-        {"max_compute_work_group_count_y", limits.maxComputeWorkGroupCount[1]},
-        {"max_compute_work_group_count_z", limits.maxComputeWorkGroupCount[2]},
-        {"max_compute_work_group_size_x", limits.maxComputeWorkGroupSize[0]},
-        {"max_compute_work_group_size_y", limits.maxComputeWorkGroupSize[1]},
-        {"max_compute_work_group_size_z", limits.maxComputeWorkGroupSize[2]},
-        {"max_memory_allocation_count", limits.maxMemoryAllocationCount},
-        {"resource_limit", limits.maxMemoryAllocationCount}};
+        {"max_compute_work_group_count_x", static_cast<size_t>(limits.maxComputeWorkGroupCount[0])},
+        {"max_compute_work_group_count_y", static_cast<size_t>(limits.maxComputeWorkGroupCount[1])},
+        {"max_compute_work_group_count_z", static_cast<size_t>(limits.maxComputeWorkGroupCount[2])},
+        {"max_compute_work_group_size_x", static_cast<size_t>(limits.maxComputeWorkGroupSize[0])},
+        {"max_compute_work_group_size_y", static_cast<size_t>(limits.maxComputeWorkGroupSize[1])},
+        {"max_compute_work_group_size_z", static_cast<size_t>(limits.maxComputeWorkGroupSize[2])},
+        {"max_memory_allocation_count", static_cast<size_t>(limits.maxMemoryAllocationCount)},
+        {"resource_limit", static_cast<size_t>(limits.maxMemoryAllocationCount)}};
   };
 
   static auto device_info_ = init_device_info();

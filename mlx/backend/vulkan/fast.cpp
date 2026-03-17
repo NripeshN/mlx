@@ -22,6 +22,8 @@
 
 namespace mlx::core {
 
+using namespace vk;
+
 namespace fast {
 
 namespace {
@@ -159,25 +161,20 @@ uint32_t lowest_set_bit(uint32_t value) {
 }
 
 std::pair<uint32_t, uint32_t> vulkan_device_vendor_and_subgroup_size() {
-  VkPhysicalDeviceProperties props{};
-  vkGetPhysicalDeviceProperties(
-      vulkan::VulkanContext::get().physical_device(), &props);
+  vk::PhysicalDeviceProperties props = vulkan::VulkanContext::get().physical_device().getProperties();
 
   VkPhysicalDeviceSubgroupProperties subgroup_props{};
   subgroup_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
-  VkPhysicalDeviceProperties2 props2{};
-  props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  PhysicalDeviceProperties2 props2{};
   props2.pNext = &subgroup_props;
-  vkGetPhysicalDeviceProperties2(
-      vulkan::VulkanContext::get().physical_device(), &props2);
+  vulkan::VulkanContext::get().physical_device().getProperties2(
+      &props2);
 
   return {props.vendorID, subgroup_props.subgroupSize};
 }
 
 uint32_t max_compute_shared_memory_size() {
-  VkPhysicalDeviceProperties props{};
-  vkGetPhysicalDeviceProperties(
-      vulkan::VulkanContext::get().physical_device(), &props);
+  vk::PhysicalDeviceProperties props = vulkan::VulkanContext::get().physical_device().getProperties();
   return props.limits.maxComputeSharedMemorySize;
 }
 
@@ -417,13 +414,13 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
 void insert_compute_barrier(VkCommandBuffer command_buffer) {
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  barrier.srcAccessMask = static_cast<VkAccessFlags>(vk::AccessFlagBits::eShaderWrite);
   barrier.dstAccessMask =
-      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      static_cast<VkAccessFlags>(vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
   vkCmdPipelineBarrier(
       command_buffer,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      static_cast<VkPipelineStageFlags>(vk::PipelineStageFlagBits::eComputeShader),
+      static_cast<VkPipelineStageFlags>(vk::PipelineStageFlagBits::eComputeShader),
       0,
       1,
       &barrier,

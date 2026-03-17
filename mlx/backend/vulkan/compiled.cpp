@@ -26,6 +26,8 @@ namespace mlx::core {
 
 namespace {
 
+using namespace vk;
+
 bool trace_compiled_glsl_enabled() {
   static const bool enabled = []() {
     const char* env = std::getenv("MLX_VULKAN_TRACE_COMPILED_GLSL");
@@ -1148,13 +1150,15 @@ void Compiled::eval_gpu(
   // Bind pipeline and descriptor set
   vkCmdBindPipeline(
       cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+  VkDescriptorSet vk_descriptor_set =
+      static_cast<VkDescriptorSet>(descriptor_set);
   vkCmdBindDescriptorSets(
       cmd_buffer,
       VK_PIPELINE_BIND_POINT_COMPUTE,
       pipeline->layout,
       0,
       1,
-      &descriptor_set,
+      &vk_descriptor_set,
       0,
       nullptr);
 
