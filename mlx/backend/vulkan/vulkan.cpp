@@ -212,9 +212,11 @@ void VulkanContext::init() {
     enabled_features.pNext = &enabled_vulkan11_features;
     enabled_vulkan11_features.pNext = &enabled_shader_float16_int8;
 
-    vk::PhysicalDeviceSubgroupSizeControlFeatures enabled_subgroup_size_control;
-    vk::PhysicalDevicePipelineRobustnessFeaturesEXT enabled_pipeline_robustness;
-    vk::PhysicalDeviceCooperativeMatrixFeaturesKHR enabled_cooperative_matrix;
+    vk::PhysicalDeviceSubgroupSizeControlFeatures
+        enabled_subgroup_size_control{};
+    vk::PhysicalDevicePipelineRobustnessFeaturesEXT
+        enabled_pipeline_robustness{};
+    vk::PhysicalDeviceCooperativeMatrixFeaturesKHR enabled_cooperative_matrix{};
 
     // Link enabled feature chain (same pattern as supported features)
     if (has_subgroup_size_control_ext) {
