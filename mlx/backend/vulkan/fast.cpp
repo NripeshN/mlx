@@ -1252,16 +1252,50 @@ void RMSNormVJP::eval_gpu(
 void ConvertFP8::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  throw std::runtime_error("[ConvertFP8::eval_gpu] Not implemented.");
+  eval_cpu_fallback_multi_with_state_on_stream<ConvertFP8>(
+      inputs, outputs, stream(), state());
 }
 
 void Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   if (dequantize_) {
-    if (mode_ != QuantizationMode::Affine || inputs.size() != 3) {
+    if (mode_ != QuantizationMode::Affine) {
+      if (mode_ == QuantizationMode::Nvfp4 && inputs.size() == 2 &&
+          outputs.size() == 1) {
+        auto& out = outputs[0];
+        array out_f32(out.shape(), float32, nullptr, {});
+        if (!vulkan::nvfp4_dequantize_to_float32(
+                inputs[0], inputs[1], out_f32, stream())) {
+          throw std::runtime_error(
+              "[Quantize::eval_gpu] Nvfp4 dequantize failed on Vulkan.");
+        }
+
+        out.set_data(allocator::malloc(out.nbytes()));
+        copy_gpu(out_f32, out, CopyType::General, stream());
+        return;
+      }
+
+      auto fallback_inputs = inputs;
+      if (fallback_inputs.size() > 1 &&
+          !fallback_inputs[1].flags().row_contiguous) {
+        fallback_inputs[1] = contiguous_copy_gpu(fallback_inputs[1], stream());
+      }
+      auto fallback_outputs = fallback_(fallback_inputs);
+      for (size_t i = 0; i < outputs.size(); ++i) {
+        array staged(
+            fallback_outputs[i].shape(),
+            fallback_outputs[i].dtype(),
+            nullptr,
+            {});
+        copy_gpu(fallback_outputs[i], staged, CopyType::General, stream());
+        outputs[i].overwrite_descriptor(staged);
+      }
+      return;
+    }
+    if (inputs.size() != 3) {
       throw std::runtime_error(
-          "[Quantize::eval_gpu] Only affine dequantize is implemented on Vulkan.");
+          "[Quantize::eval_gpu] Expected affine dequantize inputs to include biases.");
     }
 
     auto& wq = inputs[0];
@@ -1295,10 +1329,16 @@ void Quantize::eval_gpu(
     out.set_data(allocator::malloc(out.nbytes()));
     copy_gpu(out_f32, out, CopyType::General, s);
   } else {
-    if (mode_ != QuantizationMode::Affine || outputs.size() != 3 ||
-        inputs.size() != 1) {
+    if (mode_ != QuantizationMode::Affine) {
+      auto fallback_outputs = eval_fallback_outputs(fallback_, inputs);
+      for (size_t i = 0; i < outputs.size(); ++i) {
+        outputs[i].copy_shared_buffer(fallback_outputs[i]);
+      }
+      return;
+    }
+    if (outputs.size() != 3 || inputs.size() != 1) {
       throw std::runtime_error(
-          "[Quantize::eval_gpu] Only affine quantize is implemented on Vulkan.");
+          "[Quantize::eval_gpu] Expected affine quantize outputs for weights, scales, and biases.");
     }
 
     auto& s = stream();

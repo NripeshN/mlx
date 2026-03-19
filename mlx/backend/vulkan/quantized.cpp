@@ -11,6 +11,7 @@
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
+#include "mlx/transforms.h"
 
 namespace mlx::core {
 namespace {
@@ -53,6 +54,48 @@ Shape expanded_quantized_shape(const array& w, int bits) {
   auto out_shape = w.shape();
   out_shape.back() = w.shape(-1) * 32 / bits;
   return out_shape;
+}
+
+array nvfp4_quantize_dequantize(
+    const array& in,
+    Stream s,
+    const std::optional<array>& global_scale) {
+  array xhat = reshape(in, {-1, 16}, s);
+  array scales =
+      divide(max(abs(xhat, s), -1, true, s), array(6.0f, in.dtype()), s);
+  array scale_encode = global_scale.has_value()
+      ? divide(array(448.0f * 6.0f, float32), *global_scale, s)
+      : array(1.0f, float32);
+  array scales_enc = to_fp8(multiply(scales, scale_encode, s), s);
+  array scale = divide(from_fp8(scales_enc, in.dtype(), s), scale_encode, s);
+
+  array lut = astype(
+      array(
+          {+0.0f,
+           +0.5f,
+           +1.0f,
+           +1.5f,
+           +2.0f,
+           +3.0f,
+           +4.0f,
+           +6.0f,
+           -0.0f,
+           -0.5f,
+           -1.0f,
+           -1.5f,
+           -2.0f,
+           -3.0f,
+           -4.0f,
+           -6.0f}),
+      in.dtype(),
+      s);
+  array idx = argmin(
+      abs(subtract(expand_dims(divide(xhat, scale, s), -1, s), lut, s), s),
+      -1,
+      false,
+      s);
+  array dequant = multiply(gather(lut, idx, 0, {1}, s), scale, s);
+  return reshape(dequant, in.shape(), s);
 }
 
 } // namespace
@@ -159,6 +202,45 @@ bool affine_dequantize_to_float32(
   return true;
 }
 
+bool nvfp4_dequantize_to_float32(
+    const array& w,
+    const array& scales,
+    array& out,
+    Stream s) {
+  if (w.dtype() != uint32 || scales.dtype() != uint8 ||
+      out.dtype() != float32) {
+    return false;
+  }
+
+  array w_work = ensure_row_contiguous_zero_offset(w, s);
+  array scales_work = ensure_row_contiguous_zero_offset(scales, s);
+  if (!is_row_contiguous_zero_offset(w_work) ||
+      !is_row_contiguous_zero_offset(scales_work)) {
+    return false;
+  }
+
+  out.set_data(allocator::malloc(out.nbytes()));
+  if (out.size() == 0) {
+    return true;
+  }
+
+  Nvfp4DequantPushConstants push_constants{};
+  push_constants.ne = static_cast<uint32_t>(out.size());
+
+  auto command_buffer = vulkan::begin_command_recording(s.index);
+  dispatch_nvfp4_dequant_op(
+      w_work,
+      scales_work,
+      out,
+      StaticShaderId::dequant_nvfp4_f32,
+      command_buffer,
+      s,
+      push_constants,
+      {(push_constants.ne + 255u) / 256u, 1, 1});
+  vulkan::end_command_recording(s.index);
+  return true;
+}
+
 } // namespace vulkan
 
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -186,13 +268,15 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   array scales = ensure_float32_row_contiguous(inputs[2], s);
   array biases = ensure_float32_row_contiguous(inputs[3], s);
 
+  const bool vector_lhs = x.ndim() == 1;
   const bool flatten_lhs_batches = x.ndim() > 2 && w.ndim() == 2;
-  if (inputs[1].ndim() > 2) {
-    throw std::runtime_error(
-        "[QuantizedMatmul::eval_gpu] Batched quantized weights are not implemented on Vulkan.");
-  }
   array x_mat = x;
-  if (flatten_lhs_batches) {
+  if (vector_lhs) {
+    Shape mat_shape = {1, x.shape(0)};
+    x_mat = array(mat_shape, float32, nullptr, {});
+    x_mat.copy_shared_buffer(
+        x, make_contiguous_strides(mat_shape), x.flags(), x.size());
+  } else if (flatten_lhs_batches) {
     Shape flat_shape = {static_cast<int>(x.size() / x.shape(-1)), x.shape(-1)};
     x_mat = array(flat_shape, float32, nullptr, {});
     x_mat.copy_shared_buffer(
@@ -210,7 +294,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   rhs = ensure_row_contiguous_zero_offset(rhs, s);
 
   array out_work(
-      flatten_lhs_batches
+      (vector_lhs || flatten_lhs_batches)
           ? Shape{static_cast<int>(x_mat.shape(0)), out.shape(-1)}
           : out.shape(),
       float32,
@@ -221,12 +305,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         "[QuantizedMatmul::eval_gpu] Failed to dispatch Vulkan matmul.");
   }
 
-  if (flatten_lhs_batches) {
+  if (vector_lhs || flatten_lhs_batches) {
     array::Flags flags = out.flags();
     flags.contiguous = true;
     flags.row_contiguous = true;
-    auto max_dim = std::max_element(out.shape().begin(), out.shape().end());
-    flags.col_contiguous = out.size() <= 1 || out.size() == *max_dim;
+    if (vector_lhs) {
+      flags.col_contiguous = true;
+    } else {
+      auto max_dim = std::max_element(out.shape().begin(), out.shape().end());
+      flags.col_contiguous = out.size() <= 1 || out.size() == *max_dim;
+    }
 
     if (out.dtype() == float32) {
       out.copy_shared_buffer(
@@ -256,7 +344,44 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 }
 
 void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
-  throw std::runtime_error("[QQMatmul::eval_gpu] Not implemented on Vulkan.");
+  bool w_quantized = inputs[1].dtype() == uint32;
+  if (!w_quantized) {
+    throw std::runtime_error("[QQMatmul::eval_gpu] Not implemented on Vulkan.");
+  }
+
+  auto& s = stream();
+  auto mode = quantization_mode_to_string(mode_);
+
+  std::optional<array> global_scale_x = std::nullopt;
+  std::optional<array> global_scale_w = std::nullopt;
+  if (mode_ == QuantizationMode::Nvfp4 && inputs.size() >= 5) {
+    global_scale_x = inputs[3];
+    global_scale_w = inputs[4];
+  }
+
+  if (mode_ != QuantizationMode::Nvfp4) {
+    throw std::runtime_error(
+        "[QQMatmul::eval_gpu] Only nvfp4 mode is implemented on Vulkan.");
+  }
+
+  array xhat = nvfp4_quantize_dequantize(inputs[0], s, global_scale_x);
+  array w_hat = dequantize(
+      inputs[1],
+      inputs[2],
+      std::nullopt,
+      group_size_,
+      bits_,
+      mode,
+      global_scale_w,
+      inputs[0].dtype(),
+      s);
+
+  array result = matmul(xhat, swapaxes(w_hat, -1, -2, s), s);
+  if (out.dtype() != result.dtype()) {
+    result = astype(result, out.dtype(), s);
+  }
+  eval(result);
+  out.copy_shared_buffer(result);
 }
 
 } // namespace mlx::core
