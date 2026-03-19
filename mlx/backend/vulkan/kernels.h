@@ -502,6 +502,10 @@ struct AffineQuantPushConstants {
   uint32_t group_size;
 };
 
+struct Nvfp4DequantPushConstants {
+  uint32_t ne;
+};
+
 enum class BinaryDispatchVariant {
   Standard,
   AddWithPartials,
@@ -747,6 +751,16 @@ void dispatch_affine_quant_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const AffineQuantPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid);
+
+void dispatch_nvfp4_dequant_op(
+    const array& w,
+    const array& scales,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const Nvfp4DequantPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid);
 
 // Get workgroup dimensions for element-wise operations.

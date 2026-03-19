@@ -22,4 +22,10 @@ bool affine_dequantize_to_float32(
     int group_size,
     int bits);
 
+bool nvfp4_dequantize_to_float32(
+    const array& w,
+    const array& scales,
+    array& out,
+    Stream s);
+
 } // namespace mlx::core::vulkan

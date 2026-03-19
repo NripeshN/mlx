@@ -1893,6 +1893,7 @@ void process_shaders() {
 
   string_to_spv("affine_dequantize_f32", "affine_dequantize.comp", {});
   string_to_spv("affine_quantize_f32", "affine_quantize.comp", {});
+  string_to_spv("dequant_nvfp4_f32", "dequant_nvfp4.comp", {});
 
   string_to_spv(
       "mul_f32",

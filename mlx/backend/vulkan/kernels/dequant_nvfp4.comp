@@ -1,0 +1,38 @@
+#version 450
+
+#include "types.glsl"
+
+layout(push_constant) uniform parameter {
+    uint ne;
+} p;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer W { uint data_w[]; };
+layout(binding = 1) readonly buffer S { uint8_t data_s[]; };
+layout(binding = 2) writeonly buffer D { float data_d[]; };
+
+float fp8_e4m3_to_fp32(uint8_t x) {
+    uint16_t v = uint16_t(x & uint8_t(127u)) << 7;
+    float val = unpackHalf2x16(uint(v)).x * 256.0;
+    return (x & uint8_t(128u)) != 0u ? -val : val;
+}
+
+float nvfp4_lut(uint q) {
+    const float lut[16] = float[16](
+        +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+    return lut[q];
+}
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const uint packed = data_w[idx >> 3u];
+    const uint q = (packed >> ((idx & 7u) * 4u)) & 0xFu;
+    const float scale = fp8_e4m3_to_fp32(data_s[idx >> 4u]);
+    data_d[idx] = nvfp4_lut(q) * scale;
+}

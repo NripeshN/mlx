@@ -90,6 +90,7 @@ if(Vulkan_FOUND)
   # Get all shader files
   file(
     GLOB SHADER_FILES
+    CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/kernels/*.comp"
   )
   set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")

@@ -317,6 +317,7 @@ enum class KernelSpecId {
   FlashAttentionMaskOpt,
   AffineDequant,
   AffineQuant,
+  Nvfp4Dequant,
 };
 
 struct KernelSpec {
@@ -342,7 +343,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 23> kKernelSpecs = {
+const std::array<KernelSpec, 24> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -434,6 +435,10 @@ const std::array<KernelSpec, 23> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2, 3},
         sizeof(AffineQuantPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2},
+        sizeof(Nvfp4DequantPushConstants),
         DispatchGridKind::Linear1D),
 };
 
@@ -2781,6 +2786,31 @@ void dispatch_affine_quant_op(
   dispatch_with_spec(
       shader_id,
       KernelSpecId::AffineQuant,
+      bound_arrays,
+      push_constants,
+      grid[0],
+      cmd_buffer,
+      s,
+      grid);
+}
+
+void dispatch_nvfp4_dequant_op(
+    const array& w,
+    const array& scales,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const Nvfp4DequantPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  const std::array<BoundArray, 3> bound_arrays = {{
+      {&w, "W"},
+      {&scales, "S"},
+      {&out, "D"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::Nvfp4Dequant,
       bound_arrays,
       push_constants,
       grid[0],
