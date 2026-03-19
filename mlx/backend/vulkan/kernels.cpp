@@ -315,6 +315,8 @@ enum class KernelSpecId {
   FlashAttention,
   FlashAttentionSplitKReduce,
   FlashAttentionMaskOpt,
+  AffineDequant,
+  AffineQuant,
 };
 
 struct KernelSpec {
@@ -340,7 +342,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 21> kKernelSpecs = {
+const std::array<KernelSpec, 23> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -424,6 +426,14 @@ const std::array<KernelSpec, 21> kKernelSpecs = {
     make_kernel_spec(
         {0, 1},
         sizeof(FlashAttentionMaskOptPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3},
+        sizeof(AffineDequantPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3},
+        sizeof(AffineQuantPushConstants),
         DispatchGridKind::Linear1D),
 };
 
@@ -2720,6 +2730,60 @@ void dispatch_rope_op(
       bound_arrays,
       push_constants,
       push_constants.nrows,
+      cmd_buffer,
+      s,
+      grid);
+}
+
+void dispatch_affine_dequant_op(
+    const array& w,
+    const array& scales,
+    const array& biases,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const AffineDequantPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  const std::array<BoundArray, 4> bound_arrays = {{
+      {&w, "W"},
+      {&scales, "S"},
+      {&biases, "B"},
+      {&out, "D"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::AffineDequant,
+      bound_arrays,
+      push_constants,
+      grid[0],
+      cmd_buffer,
+      s,
+      grid);
+}
+
+void dispatch_affine_quant_op(
+    const array& in,
+    array& w,
+    array& scales,
+    array& biases,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const AffineQuantPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  const std::array<BoundArray, 4> bound_arrays = {{
+      {&in, "A"},
+      {&w, "W"},
+      {&scales, "S"},
+      {&biases, "B"},
+  }};
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::AffineQuant,
+      bound_arrays,
+      push_constants,
+      grid[0],
       cmd_buffer,
       s,
       grid);

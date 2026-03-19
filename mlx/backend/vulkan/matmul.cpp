@@ -6,6 +6,7 @@
 #include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
+#include "mlx/backend/vulkan/matmul.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/primitives.h"
 
@@ -560,16 +561,22 @@ bool try_eval_mul_mm_vulkan(
 
 } // namespace
 
-void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+bool try_eval_matmul_vulkan(
+    const std::vector<array>& inputs,
+    array& out,
+    Stream s) {
   if (inputs.size() == 2 && (inputs[0].size() == 0 || inputs[1].size() == 0)) {
-    zero_initialize_output(out, stream());
-    return;
+    zero_initialize_output(out, s);
+    return true;
   }
-  if (matvec_enabled() && try_eval_matvec_vulkan(inputs, out, stream())) {
-    log_matmul_path(inputs, "mul_mat_vec");
-    return;
+  if (matvec_enabled() && try_eval_matvec_vulkan(inputs, out, s)) {
+    return true;
   }
-  if (try_eval_mul_mm_vulkan(inputs, out, stream())) {
+  return try_eval_mul_mm_vulkan(inputs, out, s);
+}
+
+void Matmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+  if (try_eval_matmul_vulkan(inputs, out, stream())) {
     log_matmul_path(inputs, "mul_mm");
     return;
   }

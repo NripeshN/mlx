@@ -1,0 +1,76 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(push_constant) uniform parameter {
+    uint ne;
+    uint bits;
+    uint group_size;
+} p;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer W { uint8_t data_w[]; };
+layout(binding = 1) readonly buffer S { float data_s[]; };
+layout(binding = 2) readonly buffer B { float data_b[]; };
+layout(binding = 3) writeonly buffer D { float data_d[]; };
+
+uint read_quant(const uint o) {
+    if (p.bits == 2u) {
+        const uint pack = o >> 2;
+        const uint shift = 2u * (o & 3u);
+        return (uint(data_w[pack]) >> shift) & 0x3u;
+    }
+    if (p.bits == 3u) {
+        const uint pack = o >> 3;
+        const uint lane = o & 7u;
+        const uint base = pack * 3u;
+        if (lane == 0u) return uint(data_w[base + 0u]) & 0x7u;
+        if (lane == 1u) return (uint(data_w[base + 0u]) >> 3u) & 0x7u;
+        if (lane == 2u) return ((uint(data_w[base + 0u]) >> 6u) & 0x3u) | ((uint(data_w[base + 1u]) & 0x1u) << 2u);
+        if (lane == 3u) return (uint(data_w[base + 1u]) >> 1u) & 0x7u;
+        if (lane == 4u) return (uint(data_w[base + 1u]) >> 4u) & 0x7u;
+        if (lane == 5u) return ((uint(data_w[base + 1u]) >> 7u) & 0x1u) | ((uint(data_w[base + 2u]) & 0x3u) << 1u);
+        if (lane == 6u) return (uint(data_w[base + 2u]) >> 2u) & 0x7u;
+        return (uint(data_w[base + 2u]) >> 5u) & 0x7u;
+    }
+    if (p.bits == 4u) {
+        const uint pack = o >> 1;
+        const uint shift = 4u * (o & 1u);
+        return (uint(data_w[pack]) >> shift) & 0xFu;
+    }
+    if (p.bits == 5u) {
+        const uint pack = o >> 3;
+        const uint lane = o & 7u;
+        const uint base = pack * 5u;
+        if (lane == 0u) return uint(data_w[base + 0u]) & 0x1Fu;
+        if (lane == 1u) return ((uint(data_w[base + 0u]) >> 5u) & 0x7u) | ((uint(data_w[base + 1u]) & 0x3u) << 3u);
+        if (lane == 2u) return (uint(data_w[base + 1u]) >> 2u) & 0x1Fu;
+        if (lane == 3u) return ((uint(data_w[base + 1u]) >> 7u) & 0x1u) | ((uint(data_w[base + 2u]) & 0xFu) << 1u);
+        if (lane == 4u) return ((uint(data_w[base + 2u]) >> 4u) & 0xFu) | ((uint(data_w[base + 3u]) & 0x1u) << 4u);
+        if (lane == 5u) return (uint(data_w[base + 3u]) >> 1u) & 0x1Fu;
+        if (lane == 6u) return ((uint(data_w[base + 3u]) >> 6u) & 0x3u) | ((uint(data_w[base + 4u]) & 0x7u) << 2u);
+        return (uint(data_w[base + 4u]) >> 3u) & 0x1Fu;
+    }
+    if (p.bits == 6u) {
+        const uint pack = o >> 2;
+        const uint lane = o & 3u;
+        const uint base = pack * 3u;
+        if (lane == 0u) return uint(data_w[base + 0u]) & 0x3Fu;
+        if (lane == 1u) return ((uint(data_w[base + 0u]) >> 6u) & 0x3u) | ((uint(data_w[base + 1u]) & 0xFu) << 2u);
+        if (lane == 2u) return ((uint(data_w[base + 1u]) >> 4u) & 0xFu) | ((uint(data_w[base + 2u]) & 0x3u) << 4u);
+        return (uint(data_w[base + 2u]) >> 2u) & 0x3Fu;
+    }
+    return uint(data_w[o]);
+}
+
+void main() {
+    const uint o = gl_GlobalInvocationID.x;
+    if (o >= p.ne) {
+        return;
+    }
+
+    const uint g = o / p.group_size;
+    data_d[o] = data_s[g] * float(read_quant(o)) + data_b[g];
+}

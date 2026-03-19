@@ -1,0 +1,85 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(push_constant) uniform parameter {
+    uint ne;
+    uint bits;
+    uint group_size;
+} p;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer A { float data_a[]; };
+layout(binding = 1) writeonly buffer W { uint data_w[]; };
+layout(binding = 2) writeonly buffer S { float data_s[]; };
+layout(binding = 3) writeonly buffer B { float data_b[]; };
+
+uint elements_per_pack() {
+    if (p.bits == 3u || p.bits == 5u) {
+        return 8u;
+    }
+    if (p.bits == 6u) {
+        return 4u;
+    }
+    return 32u / p.bits;
+}
+
+void write_word(const uint word_offset, const uint value) {
+    data_w[word_offset] = value;
+}
+
+void main() {
+    const uint g = gl_GlobalInvocationID.x;
+    const uint num_groups = p.ne / p.group_size;
+    if (g >= num_groups) {
+        return;
+    }
+
+    const uint base = g * p.group_size;
+    const float n_bins = float((1u << p.bits) - 1u);
+    const float eps = 1e-7;
+
+    float w_min = 3.402823466e+38;
+    float w_max = -3.402823466e+38;
+    for (uint i = 0u; i < p.group_size; ++i) {
+        const float v = data_a[base + i];
+        w_min = min(w_min, v);
+        w_max = max(w_max, v);
+    }
+
+    const bool mask = abs(w_min) > abs(w_max);
+    float scale = max((w_max - w_min) / n_bins, eps);
+    scale = mask ? scale : -scale;
+
+    const float edge = mask ? w_min : w_max;
+    const float q0 = roundEven(edge / scale);
+    float bias = 0.0;
+    if (q0 != 0.0) {
+        scale = edge / q0;
+        bias = edge;
+    }
+
+    data_s[g] = scale;
+    data_b[g] = bias;
+
+    const uint word_base = g * ((p.group_size * p.bits) / 32u);
+    uint64_t acc = 0ul;
+    uint acc_bits = 0u;
+    uint word_idx = 0u;
+    for (uint i = 0u; i < p.group_size; ++i) {
+        float q = roundEven((data_a[base + i] - bias) / scale);
+        q = clamp(q, 0.0, n_bins);
+        acc |= uint64_t(uint(q)) << acc_bits;
+        acc_bits += p.bits;
+        if (acc_bits >= 32u) {
+            write_word(word_base + word_idx, uint(acc & 0xFFFFFFFFul));
+            acc >>= 32u;
+            acc_bits -= 32u;
+            word_idx += 1u;
+        }
+    }
+    if (acc_bits != 0u) {
+        write_word(word_base + word_idx, uint(acc & 0xFFFFFFFFul));
+    }
+}

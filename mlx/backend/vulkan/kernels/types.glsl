@@ -209,6 +209,15 @@ struct block_q8_1_packed32
     int32_t qs[8];
 };
 
+#if defined(DATA_A_Q8_1)
+#define QUANT_K QUANT_K_Q8_1
+#define QUANT_R QUANT_R_Q8_1
+#define QUANT_AUXF 1
+#define A_TYPE block_q8_1
+#define A_TYPE_PACKED16 block_q8_1_packed16
+#define DATA_A_QUANT_LEGACY
+#endif
+
 // 4 blocks in one to allow 16-byte/128-bit alignment and loads
 struct block_q8_1_x4
 {

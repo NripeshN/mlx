@@ -1891,6 +1891,9 @@ void process_shaders() {
       "quantize_q8_1.comp",
       {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
 
+  string_to_spv("affine_dequantize_f32", "affine_dequantize.comp", {});
+  string_to_spv("affine_quantize_f32", "affine_quantize.comp", {});
+
   string_to_spv(
       "mul_f32",
       "mul.comp",
@@ -2512,6 +2515,14 @@ void process_shaders() {
   string_to_spv(
       "sum_rows_f32",
       "sum_rows.comp",
+      merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+  string_to_spv(
+      "max_rows_f32",
+      "max_rows.comp",
+      merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+  string_to_spv(
+      "min_rows_f32",
+      "min_rows.comp",
       merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
   string_to_spv("any_rows_u8", "any_rows.comp", base_dict);
   string_to_spv("all_rows_u8", "all_rows.comp", base_dict);

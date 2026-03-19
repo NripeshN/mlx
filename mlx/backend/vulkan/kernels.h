@@ -490,6 +490,18 @@ struct RopePushConstants {
   uint32_t nb13;
 };
 
+struct AffineDequantPushConstants {
+  uint32_t ne;
+  uint32_t bits;
+  uint32_t group_size;
+};
+
+struct AffineQuantPushConstants {
+  uint32_t ne;
+  uint32_t bits;
+  uint32_t group_size;
+};
+
 enum class BinaryDispatchVariant {
   Standard,
   AddWithPartials,
@@ -713,6 +725,28 @@ void dispatch_rope_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const RopePushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid);
+
+void dispatch_affine_dequant_op(
+    const array& w,
+    const array& scales,
+    const array& biases,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const AffineDequantPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid);
+
+void dispatch_affine_quant_op(
+    const array& in,
+    array& w,
+    array& scales,
+    array& biases,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const AffineQuantPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid);
 
 // Get workgroup dimensions for element-wise operations.

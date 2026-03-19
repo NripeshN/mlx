@@ -15,6 +15,7 @@
 #include "mlx/backend/vulkan/device.h"
 #include "mlx/backend/vulkan/kernels.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
+#include "mlx/backend/vulkan/quantized.h"
 #include "mlx/backend/vulkan/vulkan.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
@@ -161,20 +162,21 @@ uint32_t lowest_set_bit(uint32_t value) {
 }
 
 std::pair<uint32_t, uint32_t> vulkan_device_vendor_and_subgroup_size() {
-  vk::PhysicalDeviceProperties props = vulkan::VulkanContext::get().physical_device().getProperties();
+  vk::PhysicalDeviceProperties props =
+      vulkan::VulkanContext::get().physical_device().getProperties();
 
   VkPhysicalDeviceSubgroupProperties subgroup_props{};
   subgroup_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
   PhysicalDeviceProperties2 props2{};
   props2.pNext = &subgroup_props;
-  vulkan::VulkanContext::get().physical_device().getProperties2(
-      &props2);
+  vulkan::VulkanContext::get().physical_device().getProperties2(&props2);
 
   return {props.vendorID, subgroup_props.subgroupSize};
 }
 
 uint32_t max_compute_shared_memory_size() {
-  vk::PhysicalDeviceProperties props = vulkan::VulkanContext::get().physical_device().getProperties();
+  vk::PhysicalDeviceProperties props =
+      vulkan::VulkanContext::get().physical_device().getProperties();
   return props.limits.maxComputeSharedMemorySize;
 }
 
@@ -414,13 +416,16 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
 void insert_compute_barrier(VkCommandBuffer command_buffer) {
   VkMemoryBarrier barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  barrier.srcAccessMask = static_cast<VkAccessFlags>(vk::AccessFlagBits::eShaderWrite);
-  barrier.dstAccessMask =
-      static_cast<VkAccessFlags>(vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
+  barrier.srcAccessMask =
+      static_cast<VkAccessFlags>(vk::AccessFlagBits::eShaderWrite);
+  barrier.dstAccessMask = static_cast<VkAccessFlags>(
+      vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
   vkCmdPipelineBarrier(
       command_buffer,
-      static_cast<VkPipelineStageFlags>(vk::PipelineStageFlagBits::eComputeShader),
-      static_cast<VkPipelineStageFlags>(vk::PipelineStageFlagBits::eComputeShader),
+      static_cast<VkPipelineStageFlags>(
+          vk::PipelineStageFlagBits::eComputeShader),
+      static_cast<VkPipelineStageFlags>(
+          vk::PipelineStageFlagBits::eComputeShader),
       0,
       1,
       &barrier,
@@ -1253,7 +1258,76 @@ void ConvertFP8::eval_gpu(
 void Quantize::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  throw std::runtime_error("Quantize has no Vulkan implementation.");
+  if (dequantize_) {
+    if (mode_ != QuantizationMode::Affine || inputs.size() != 3) {
+      throw std::runtime_error(
+          "[Quantize::eval_gpu] Only affine dequantize is implemented on Vulkan.");
+    }
+
+    auto& wq = inputs[0];
+    auto& scales = inputs[1];
+    auto& biases = inputs[2];
+    auto& out = outputs[0];
+
+    auto& s = stream();
+
+    array scales_f32 = scales;
+    if (scales_f32.dtype() != float32) {
+      scales_f32 = array(scales.shape(), float32, nullptr, {});
+      scales_f32.set_data(allocator::malloc(scales_f32.nbytes()));
+      copy_gpu(scales, scales_f32, CopyType::General, s);
+    }
+
+    array biases_f32 = biases;
+    if (biases_f32.dtype() != float32) {
+      biases_f32 = array(biases.shape(), float32, nullptr, {});
+      biases_f32.set_data(allocator::malloc(biases_f32.nbytes()));
+      copy_gpu(biases, biases_f32, CopyType::General, s);
+    }
+
+    array out_f32(out.shape(), float32, nullptr, {});
+    if (!vulkan::affine_dequantize_to_float32(
+            wq, scales_f32, biases_f32, out_f32, s, group_size_, bits_)) {
+      throw std::runtime_error(
+          "[Quantize::eval_gpu] Affine dequantize failed on Vulkan.");
+    }
+
+    out.set_data(allocator::malloc(out.nbytes()));
+    copy_gpu(out_f32, out, CopyType::General, s);
+  } else {
+    if (mode_ != QuantizationMode::Affine || outputs.size() != 3 ||
+        inputs.size() != 1) {
+      throw std::runtime_error(
+          "[Quantize::eval_gpu] Only affine quantize is implemented on Vulkan.");
+    }
+
+    auto& s = stream();
+    array in_f32 = inputs[0];
+    if (in_f32.dtype() != float32) {
+      in_f32 = array(inputs[0].shape(), float32, nullptr, {});
+      in_f32.set_data(allocator::malloc(in_f32.nbytes()));
+      copy_gpu(inputs[0], in_f32, CopyType::General, s);
+    }
+
+    array scales_f32(outputs[1].shape(), float32, nullptr, {});
+    array biases_f32(outputs[2].shape(), float32, nullptr, {});
+    if (!vulkan::affine_quantize_from_float32(
+            in_f32,
+            outputs[0],
+            scales_f32,
+            biases_f32,
+            s,
+            group_size_,
+            bits_)) {
+      throw std::runtime_error(
+          "[Quantize::eval_gpu] Affine quantize failed on Vulkan.");
+    }
+
+    outputs[1].set_data(allocator::malloc(outputs[1].nbytes()));
+    outputs[2].set_data(allocator::malloc(outputs[2].nbytes()));
+    copy_gpu(scales_f32, outputs[1], CopyType::General, s);
+    copy_gpu(biases_f32, outputs[2], CopyType::General, s);
+  }
 }
 
 void CustomKernel::eval_gpu(

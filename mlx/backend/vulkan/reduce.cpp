@@ -29,9 +29,11 @@ bool try_eval_reduce_sum_rows_vulkan(
 
   array in = inputs[0];
   const bool sum_reduce = reduce_type == Reduce::Sum;
+  const bool max_reduce = reduce_type == Reduce::Max;
+  const bool min_reduce = reduce_type == Reduce::Min;
   const bool logic_reduce =
       reduce_type == Reduce::And || reduce_type == Reduce::Or;
-  if (!sum_reduce && !logic_reduce) {
+  if (!sum_reduce && !max_reduce && !min_reduce && !logic_reduce) {
     return false;
   }
 
@@ -39,14 +41,16 @@ bool try_eval_reduce_sum_rows_vulkan(
   const bool f16_io = in.dtype() == float16 && out.dtype() == float16;
   const bool bf16_io = in.dtype() == bfloat16 && out.dtype() == bfloat16;
   const bool bool_io = in.dtype() == bool_ && out.dtype() == bool_;
-  if (sum_reduce && !f32_io && !f16_io && !bf16_io) {
+  if ((sum_reduce || max_reduce || min_reduce) && !f32_io && !f16_io &&
+      !bf16_io) {
     return false;
   }
   if (logic_reduce && !bool_io) {
     return false;
   }
 
-  const bool use_f32_staging_io = sum_reduce && (f16_io || bf16_io);
+  const bool use_f32_staging_io =
+      (sum_reduce || max_reduce || min_reduce) && (f16_io || bf16_io);
   const bool use_u8_staging_io = logic_reduce;
   if (use_f32_staging_io) {
     if (in.offset() > 0xFFFF && in.flags().row_contiguous) {
@@ -137,11 +141,12 @@ bool try_eval_reduce_sum_rows_vulkan(
     } else {
       try {
         auto command_buffer = vulkan::begin_command_recording(s.index);
-        const auto shader_id = sum_reduce
-            ? vulkan::StaticShaderId::sum_rows_f32
-            : (reduce_type == Reduce::And
-                   ? vulkan::StaticShaderId::all_rows_u8
-                   : vulkan::StaticShaderId::any_rows_u8);
+        const auto shader_id = sum_reduce ? vulkan::StaticShaderId::sum_rows_f32
+            : max_reduce                  ? vulkan::StaticShaderId::max_rows_f32
+            : min_reduce                  ? vulkan::StaticShaderId::min_rows_f32
+                         : (reduce_type == Reduce::And
+                                ? vulkan::StaticShaderId::all_rows_u8
+                                : vulkan::StaticShaderId::any_rows_u8);
         vulkan::dispatch_sum_rows_op(
             in_kernel, out_work, shader_id, command_buffer, s, 1.0f);
         vulkan::end_command_recording(s.index);

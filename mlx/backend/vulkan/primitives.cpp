@@ -233,8 +233,8 @@ NO_GPU_MULTI_STATE(SVD)
 CPU_FALLBACK(NotEqual)
 CPU_FALLBACK_STATE(Partition)
 CPU_FALLBACK(Power)
-CPU_FALLBACK_STATE(QuantizedMatmul)
-CPU_FALLBACK_STATE(QQMatmul)
+// QuantizedMatmul and QQMatmul are implemented in quantized.cpp.
+
 CPU_FALLBACK(Real)
 CPU_FALLBACK(Sign)
 CPU_FALLBACK(Sinh)

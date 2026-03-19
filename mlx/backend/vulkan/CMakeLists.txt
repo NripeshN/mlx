@@ -146,6 +146,7 @@ if(Vulkan_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/arange.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/rope.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/fast.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/quantized.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/random.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/event.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/fence.cpp
