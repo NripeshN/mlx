@@ -25,8 +25,19 @@ const uint32_t cols_per_thread = Bc / cols_per_iter;
 const uint32_t num_subgroups = SubGroupSize == 0 ? 0 : WorkGroupSize / SubGroupSize;
 
 
+#if defined(DATA_Q_BF16)
+layout (binding = 0) readonly buffer Q {uint16_t data_q[];};
+layout (binding = 0) readonly buffer QV4 {u16vec4 data_qv4[];};
+#define LOAD_QV4(ptr) FLOAT_TYPEV4(bf16_to_fp32(uvec4(ptr)))
+#elif defined(DATA_Q_F16)
+layout (binding = 0) readonly buffer Q {float16_t data_q[];};
+layout (binding = 0) readonly buffer QV4 {f16vec4 data_qv4[];};
+#define LOAD_QV4(ptr) FLOAT_TYPEV4(vec4(ptr))
+#else
 layout (binding = 0) readonly buffer Q {float data_q[];};
 layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
+#define LOAD_QV4(ptr) FLOAT_TYPEV4(ptr)
+#endif
 #if defined(DATA_A_BF16)
 layout (binding = 1) readonly buffer K {uint16_t data_k[];};
 layout (binding = 1) readonly buffer KV4 {u16vec4 data_kv4[];};
@@ -97,7 +108,8 @@ void main() {
         uint32_t r = (idx + tid) / (HSK / 4);
         if (r < Br && d < HSK / 4 &&
             i * Br + r < N) {
-            Qf[r * qf_stride + d] = FLOAT_TYPEV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
+            Qf[r * qf_stride + d] = FLOAT_TYPEV4(
+                LOAD_QV4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d]) * p.scale);
         }
     }
     barrier();

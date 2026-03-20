@@ -120,29 +120,80 @@ struct FlashAttentionTuningParams {
 };
 
 vulkan::StaticShaderId flash_attention_main_shader(
+    Dtype q_dtype,
     FlashAttentionTuningParams::Path path) {
   if (const char* env = std::getenv("MLX_VULKAN_FLASH_ATTN_SHADER");
       env != nullptr) {
     const std::string value(env);
     if (value == "cm1") {
-      return vulkan::StaticShaderId::flash_attn_f32_f16_f16_cm1;
+      switch (q_dtype) {
+        case float16:
+          return vulkan::StaticShaderId::flash_attn_f16_f16_f16_cm1;
+        case bfloat16:
+          return vulkan::StaticShaderId::flash_attn_bf16_f16_f16_cm1;
+        default:
+          return vulkan::StaticShaderId::flash_attn_f32_f16_f16_cm1;
+      }
     }
     if (value == "fp32") {
-      return vulkan::StaticShaderId::flash_attn_f32_f16_f16_fp32;
+      switch (q_dtype) {
+        case float16:
+          return vulkan::StaticShaderId::flash_attn_f16_f16_f16_fp32;
+        case bfloat16:
+          return vulkan::StaticShaderId::flash_attn_bf16_f16_f16_fp32;
+        default:
+          return vulkan::StaticShaderId::flash_attn_f32_f16_f16_fp32;
+      }
     }
     if (value == "f16acc") {
-      return path == FlashAttentionTuningParams::Path::CoopMat1
-          ? vulkan::StaticShaderId::flash_attn_f32_f16_f16_f16acc_cm1
-          : vulkan::StaticShaderId::flash_attn_f32_f16_f16_f16acc;
+      if (path == FlashAttentionTuningParams::Path::CoopMat1) {
+        switch (q_dtype) {
+          case float16:
+            return vulkan::StaticShaderId::flash_attn_f16_f16_f16_f16acc_cm1;
+          case bfloat16:
+            return vulkan::StaticShaderId::flash_attn_bf16_f16_f16_f16acc_cm1;
+          default:
+            return vulkan::StaticShaderId::flash_attn_f32_f16_f16_f16acc_cm1;
+        }
+      }
+      switch (q_dtype) {
+        case float16:
+          return vulkan::StaticShaderId::flash_attn_f16_f16_f16_f16acc;
+        case bfloat16:
+          return vulkan::StaticShaderId::flash_attn_bf16_f16_f16_f16acc;
+        default:
+          return vulkan::StaticShaderId::flash_attn_f32_f16_f16_f16acc;
+      }
     }
   }
   if (path == FlashAttentionTuningParams::Path::CoopMat1) {
-    return vulkan::StaticShaderId::flash_attn_f32_f16_f16_cm1;
+    switch (q_dtype) {
+      case float16:
+        return vulkan::StaticShaderId::flash_attn_f16_f16_f16_cm1;
+      case bfloat16:
+        return vulkan::StaticShaderId::flash_attn_bf16_f16_f16_cm1;
+      default:
+        return vulkan::StaticShaderId::flash_attn_f32_f16_f16_cm1;
+    }
   }
   if (vulkan::VulkanContext::get().shader_float16_supported()) {
-    return vulkan::StaticShaderId::flash_attn_f32_f16_f16;
+    switch (q_dtype) {
+      case float16:
+        return vulkan::StaticShaderId::flash_attn_f16_f16_f16;
+      case bfloat16:
+        return vulkan::StaticShaderId::flash_attn_bf16_f16_f16;
+      default:
+        return vulkan::StaticShaderId::flash_attn_f32_f16_f16;
+    }
   }
-  return vulkan::StaticShaderId::flash_attn_f32_f16_f16_fp32;
+  switch (q_dtype) {
+    case float16:
+      return vulkan::StaticShaderId::flash_attn_f16_f16_f16_fp32;
+    case bfloat16:
+      return vulkan::StaticShaderId::flash_attn_bf16_f16_f16_fp32;
+    default:
+      return vulkan::StaticShaderId::flash_attn_f32_f16_f16_fp32;
+  }
 }
 
 struct FlashAttentionExecutionPlan {
@@ -507,7 +558,7 @@ bool try_dispatch_flash_attention_native_vulkan(
       k_stride,
       v_stride);
   const auto& tuning = plan.tuning;
-  const auto shader_id = flash_attention_main_shader(tuning.path);
+  const auto shader_id = flash_attention_main_shader(q.dtype(), tuning.path);
   if (tuning.d_split == 0 || tuning.block_rows == 0 || tuning.block_cols == 0 ||
       tuning.row_split == 0 || hsk % tuning.d_split != 0 ||
       hsv % tuning.d_split != 0 ||
@@ -754,7 +805,7 @@ bool try_eval_flash_attention_vulkan(
   }
 
   q = multiply(array(scale, q.dtype()), q, s);
-  if (q.dtype() != float32) {
+  if (q.dtype() == float16) {
     q = astype(q, float32, s);
   }
 
@@ -781,7 +832,8 @@ bool try_eval_flash_attention_vulkan(
   debug_eval(k, "k_ready");
   debug_eval(v, "v_ready");
 
-  if (q.dtype() != float32 || k.dtype() != float16 || v.dtype() != float16) {
+  const bool supported_q_dtype = q.dtype() == float32 || q.dtype() == bfloat16;
+  if (!supported_q_dtype || k.dtype() != float16 || v.dtype() != float16) {
     return false;
   }
 
