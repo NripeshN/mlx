@@ -14,6 +14,10 @@
 #define TO_FLOAT_TYPE float
 #endif
 
+#if !defined(FROM_FLOAT_TYPE)
+#define FROM_FLOAT_TYPE(x) (x)
+#endif
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer W {
@@ -121,5 +125,5 @@ void main() {
         }
     }
 
-    data_out[row * p.out_row_stride + col] = acc;
+    data_out[row * p.out_row_stride + col] = D_TYPE(FROM_FLOAT_TYPE(acc));
 }

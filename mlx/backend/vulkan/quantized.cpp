@@ -26,14 +26,24 @@ bool is_supported_quantized_output_dtype(Dtype dtype) {
 }
 
 std::optional<vulkan::StaticShaderId> fused_affine_matmul_shader_id(
-    Dtype dtype) {
-  switch (dtype) {
+    Dtype x_dtype,
+    Dtype out_dtype) {
+  switch (x_dtype) {
     case float32:
+      if (out_dtype != float32) {
+        return std::nullopt;
+      }
       return vulkan::StaticShaderId::fused_affine_matmul_f32_f32;
     case float16:
-      return vulkan::StaticShaderId::fused_affine_matmul_f16_f32;
+      if (out_dtype != float16) {
+        return std::nullopt;
+      }
+      return vulkan::StaticShaderId::fused_affine_matmul_f16_f16;
     case bfloat16:
-      return vulkan::StaticShaderId::fused_affine_matmul_bf16_f32;
+      if (out_dtype != bfloat16) {
+        return std::nullopt;
+      }
+      return vulkan::StaticShaderId::fused_affine_matmul_bf16_bf16;
     default:
       return std::nullopt;
   }
@@ -297,16 +307,18 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         x, make_contiguous_strides(flat_shape), x.flags(), x.size());
   }
 
+  auto fused_shader = fused_affine_matmul_shader_id(x_mat.dtype(), out.dtype());
+  const Dtype out_work_dtype = fused_shader.has_value() ? out.dtype() : float32;
+
   array out_work(
       (vector_lhs || flatten_lhs_batches)
           ? Shape{static_cast<int>(x_mat.shape(0)), out.shape(-1)}
           : out.shape(),
-      float32,
+      out_work_dtype,
       nullptr,
       {});
 
   bool fused_dispatched = false;
-  auto fused_shader = fused_affine_matmul_shader_id(x_mat.dtype());
   if (transpose_ && fused_shader.has_value() && x_mat.ndim() == 2 &&
       w.ndim() == 2 && scales.ndim() == 2 && biases.ndim() == 2 &&
       is_row_contiguous_zero_offset(x_mat) &&
@@ -317,8 +329,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     const uint32_t cols = static_cast<uint32_t>(out_work.shape(-1));
     const uint32_t k = static_cast<uint32_t>(x_mat.shape(-1));
     const uint32_t num_groups = static_cast<uint32_t>(scales.shape(-1));
+    const bool decode_like_rows = rows == 1;
 
-    if (rows == static_cast<uint32_t>(x_mat.shape(-2)) &&
+    if (decode_like_rows && rows == static_cast<uint32_t>(x_mat.shape(-2)) &&
         cols == static_cast<uint32_t>(w.shape(-2)) &&
         num_groups ==
             static_cast<uint32_t>((k + group_size_ - 1) / group_size_)) {
@@ -396,7 +409,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       flags.col_contiguous = out.size() <= 1 || out.size() == *max_dim;
     }
 
-    if (out.dtype() == float32) {
+    if (out_work.dtype() == out.dtype()) {
       out.copy_shared_buffer(
           out_work, make_contiguous_strides(out.shape()), flags, out.size());
       out.detach();
@@ -404,7 +417,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       return;
     }
 
-    array out_view(out.shape(), float32, nullptr, {});
+    array out_view(out.shape(), out_work.dtype(), nullptr, {});
     out_view.copy_shared_buffer(
         out_work, make_contiguous_strides(out.shape()), flags, out.size());
     out.set_data(allocator::malloc(out.nbytes()));
@@ -414,7 +427,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  if (out.dtype() == float32) {
+  if (out_work.dtype() == out.dtype()) {
     out.copy_shared_buffer(out_work);
     return;
   }

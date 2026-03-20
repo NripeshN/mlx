@@ -1898,17 +1898,19 @@ void process_shaders() {
   string_to_spv(
       "fused_affine_matmul_f32_f32",
       "mul_mm_affine.comp",
-      {{"B_TYPE", "float"}});
+      {{"B_TYPE", "float"}, {"D_TYPE", "float"}});
   string_to_spv(
-      "fused_affine_matmul_f16_f32",
+      "fused_affine_matmul_f16_f16",
       "mul_mm_affine.comp",
-      {{"FLOAT16", "1"}, {"B_TYPE", "float16_t"}});
+      {{"FLOAT16", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
   string_to_spv(
-      "fused_affine_matmul_bf16_f32",
+      "fused_affine_matmul_bf16_bf16",
       "mul_mm_affine.comp",
       {{"DATA_B_BF16", "1"},
        {"B_TYPE", "uint16_t"},
-       {"TO_FLOAT_TYPE", "bf16_to_fp32"}});
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"},
+       {"D_TYPE", "uint16_t"},
+       {"FROM_FLOAT_TYPE", "fp32_to_bf16"}});
 
   string_to_spv(
       "mul_f32",
