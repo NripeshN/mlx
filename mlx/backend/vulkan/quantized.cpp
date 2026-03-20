@@ -339,8 +339,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     return;
   }
 
-  array out_cast = astype(out_work, out.dtype(), s);
-  out.copy_shared_buffer(out_cast);
+  out.set_data(allocator::malloc(out.nbytes()));
+  copy_gpu(out_work, out, CopyType::General, s);
 }
 
 void QQMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
