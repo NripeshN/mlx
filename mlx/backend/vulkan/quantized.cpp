@@ -25,6 +25,20 @@ bool is_supported_quantized_output_dtype(Dtype dtype) {
   return dtype == float16 || dtype == bfloat16 || dtype == float32;
 }
 
+std::optional<vulkan::StaticShaderId> fused_affine_matmul_shader_id(
+    Dtype dtype) {
+  switch (dtype) {
+    case float32:
+      return vulkan::StaticShaderId::fused_affine_matmul_f32_f32;
+    case float16:
+      return vulkan::StaticShaderId::fused_affine_matmul_f16_f32;
+    case bfloat16:
+      return vulkan::StaticShaderId::fused_affine_matmul_bf16_f32;
+    default:
+      return std::nullopt;
+  }
+}
+
 bool is_row_contiguous_zero_offset(const array& arr) {
   return arr.flags().row_contiguous && arr.offset() == 0 &&
       arr.strides(-1) == 1;
@@ -263,7 +277,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   auto& s = stream();
-  array x = ensure_float32_row_contiguous(inputs[0], s);
+  array x = ensure_row_contiguous_zero_offset(inputs[0], s);
   array w = ensure_row_contiguous_zero_offset(inputs[1], s);
   array scales = ensure_float32_row_contiguous(inputs[2], s);
   array biases = ensure_float32_row_contiguous(inputs[3], s);
@@ -273,25 +287,15 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   array x_mat = x;
   if (vector_lhs) {
     Shape mat_shape = {1, x.shape(0)};
-    x_mat = array(mat_shape, float32, nullptr, {});
+    x_mat = array(mat_shape, x.dtype(), nullptr, {});
     x_mat.copy_shared_buffer(
         x, make_contiguous_strides(mat_shape), x.flags(), x.size());
   } else if (flatten_lhs_batches) {
     Shape flat_shape = {static_cast<int>(x.size() / x.shape(-1)), x.shape(-1)};
-    x_mat = array(flat_shape, float32, nullptr, {});
+    x_mat = array(flat_shape, x.dtype(), nullptr, {});
     x_mat.copy_shared_buffer(
         x, make_contiguous_strides(flat_shape), x.flags(), x.size());
   }
-
-  array w_deq(expanded_quantized_shape(w, bits_), float32, nullptr, {});
-  if (!vulkan::affine_dequantize_to_float32(
-          w, scales, biases, w_deq, s, group_size_, bits_)) {
-    throw std::runtime_error(
-        "[QuantizedMatmul::eval_gpu] Failed to dequantize weights on Vulkan.");
-  }
-
-  array rhs = transpose_ ? swapaxes_in_eval(w_deq, -1, -2) : w_deq;
-  rhs = ensure_row_contiguous_zero_offset(rhs, s);
 
   array out_work(
       (vector_lhs || flatten_lhs_batches)
@@ -300,9 +304,85 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       float32,
       nullptr,
       {});
-  if (!try_eval_matmul_vulkan({x_mat, rhs}, out_work, s)) {
-    throw std::runtime_error(
-        "[QuantizedMatmul::eval_gpu] Failed to dispatch Vulkan matmul.");
+
+  bool fused_dispatched = false;
+  auto fused_shader = fused_affine_matmul_shader_id(x_mat.dtype());
+  if (transpose_ && fused_shader.has_value() && x_mat.ndim() == 2 &&
+      w.ndim() == 2 && scales.ndim() == 2 && biases.ndim() == 2 &&
+      is_row_contiguous_zero_offset(x_mat) &&
+      is_row_contiguous_zero_offset(w) &&
+      is_row_contiguous_zero_offset(scales) &&
+      is_row_contiguous_zero_offset(biases)) {
+    const uint32_t rows = static_cast<uint32_t>(out_work.shape(-2));
+    const uint32_t cols = static_cast<uint32_t>(out_work.shape(-1));
+    const uint32_t k = static_cast<uint32_t>(x_mat.shape(-1));
+    const uint32_t num_groups = static_cast<uint32_t>(scales.shape(-1));
+
+    if (rows == static_cast<uint32_t>(x_mat.shape(-2)) &&
+        cols == static_cast<uint32_t>(w.shape(-2)) &&
+        num_groups ==
+            static_cast<uint32_t>((k + group_size_ - 1) / group_size_)) {
+      try {
+        out_work.set_data(allocator::malloc(out_work.nbytes()));
+        if (out_work.size() != 0) {
+          vulkan::FusedAffineMatmulPushConstants push_constants{};
+          push_constants.rows = rows;
+          push_constants.cols = cols;
+          push_constants.K = k;
+          push_constants.packed_row_bytes =
+              static_cast<uint32_t>(w.strides(-2) * sizeof(uint32_t));
+          push_constants.x_row_stride =
+              static_cast<uint32_t>(x_mat.strides(-2));
+          push_constants.out_row_stride =
+              static_cast<uint32_t>(out_work.strides(-2));
+          push_constants.scale_row_stride =
+              static_cast<uint32_t>(scales.strides(-2));
+          push_constants.bias_row_stride =
+              static_cast<uint32_t>(biases.strides(-2));
+          push_constants.bits = static_cast<uint32_t>(bits_);
+          push_constants.group_size = static_cast<uint32_t>(group_size_);
+          push_constants.num_groups = num_groups;
+
+          const std::array<uint32_t, 3> grid = {
+              (cols + 15u) / 16u, (rows + 15u) / 16u, 1u};
+
+          auto command_buffer = vulkan::begin_command_recording(s.index);
+          vulkan::dispatch_fused_affine_matmul_op(
+              w,
+              scales,
+              biases,
+              x_mat,
+              out_work,
+              *fused_shader,
+              command_buffer,
+              s,
+              push_constants,
+              grid);
+          vulkan::end_command_recording(s.index);
+        }
+        fused_dispatched = true;
+      } catch (const std::runtime_error&) {
+        fused_dispatched = false;
+      }
+    }
+  }
+
+  if (!fused_dispatched) {
+    array x_mat_f32 = ensure_float32_row_contiguous(x_mat, s);
+    array w_deq(expanded_quantized_shape(w, bits_), float32, nullptr, {});
+    if (!vulkan::affine_dequantize_to_float32(
+            w, scales, biases, w_deq, s, group_size_, bits_)) {
+      throw std::runtime_error(
+          "[QuantizedMatmul::eval_gpu] Failed to dequantize weights on Vulkan.");
+    }
+
+    array rhs = transpose_ ? swapaxes_in_eval(w_deq, -1, -2) : w_deq;
+    rhs = ensure_row_contiguous_zero_offset(rhs, s);
+
+    if (!try_eval_matmul_vulkan({x_mat_f32, rhs}, out_work, s)) {
+      throw std::runtime_error(
+          "[QuantizedMatmul::eval_gpu] Failed to dispatch Vulkan matmul.");
+    }
   }
 
   if (vector_lhs || flatten_lhs_batches) {

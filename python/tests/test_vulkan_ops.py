@@ -198,6 +198,51 @@ class TestVulkanOpsParity(mlx_tests.MLXTestCase):
             rtol=0.0,
         )
 
+    def test_quantized_matmul_fused_low_precision_regression(self):
+        for dtype, atol, rtol in (
+            (mx.float16, 2e-3, 2e-3),
+            (mx.bfloat16, 3e-3, 3e-3),
+        ):
+            with self.subTest(dtype=str(dtype)):
+                def fn(dtype=dtype):
+                    x = (
+                        mx.arange(1, 1 + 3 * 128, dtype=dtype).reshape(3, 128)
+                        / 64.0
+                    )
+                    w = (
+                        mx.arange(1, 1 + 96 * 128, dtype=mx.float32).reshape(96, 128)
+                        / 80.0
+                    )
+                    w_q, scales, biases = mx.quantize(w, group_size=64, bits=8)
+                    return mx.quantized_matmul(
+                        x, w_q, scales, biases, True, 64, 8
+                    ).astype(mx.float32)
+
+                self._assert_cpu_gpu_same(fn, atol=atol, rtol=rtol)
+
+    def test_quantized_matmul_fused_flatten_batches_regression(self):
+        for dtype, atol, rtol in (
+            (mx.float16, 2e-3, 2e-3),
+            (mx.bfloat16, 3e-3, 3e-3),
+        ):
+            with self.subTest(dtype=str(dtype)):
+                def fn(dtype=dtype):
+                    x = (
+                        mx.arange(1, 1 + 2 * 1 * 4 * 128, dtype=dtype)
+                        .reshape(2, 1, 4, 128)
+                        / 96.0
+                    )
+                    w = (
+                        mx.arange(1, 1 + 64 * 128, dtype=mx.float32).reshape(64, 128)
+                        / 72.0
+                    )
+                    w_q, scales, biases = mx.quantize(w, group_size=64, bits=8)
+                    return mx.quantized_matmul(
+                        x, w_q, scales, biases, True, 64, 8
+                    ).astype(mx.float32)
+
+                self._assert_cpu_gpu_same(fn, atol=atol, rtol=rtol)
+
 
 def _cases():
     return [

@@ -318,6 +318,7 @@ enum class KernelSpecId {
   AffineDequant,
   AffineQuant,
   Nvfp4Dequant,
+  FusedAffineMatmul,
 };
 
 struct KernelSpec {
@@ -343,7 +344,7 @@ KernelSpec make_kernel_spec(
       grid_kind};
 }
 
-const std::array<KernelSpec, 24> kKernelSpecs = {
+const std::array<KernelSpec, 25> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(BinaryPushConstants),
@@ -439,6 +440,10 @@ const std::array<KernelSpec, 24> kKernelSpecs = {
     make_kernel_spec(
         {0, 1, 2},
         sizeof(Nvfp4DequantPushConstants),
+        DispatchGridKind::Linear1D),
+    make_kernel_spec(
+        {0, 1, 2, 3, 4},
+        sizeof(FusedAffineMatmulPushConstants),
         DispatchGridKind::Linear1D),
 };
 
@@ -2817,6 +2822,64 @@ void dispatch_nvfp4_dequant_op(
       cmd_buffer,
       s,
       grid);
+}
+
+void dispatch_fused_affine_matmul_op(
+    const array& w,
+    const array& scales,
+    const array& biases,
+    const array& x,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const FusedAffineMatmulPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid) {
+  if (w.ndim() != 2 || scales.ndim() != 2 || biases.ndim() != 2 ||
+      x.ndim() != 2 || out.ndim() != 2) {
+    throw std::runtime_error(
+        "[vulkan::kernels] fused_affine_matmul dispatch requires 2D tensors.");
+  }
+
+  const uint32_t rows = checked_u32(out.shape(-2), "fused_affine_matmul rows");
+  const uint32_t cols = checked_u32(out.shape(-1), "fused_affine_matmul cols");
+  const uint32_t k = push_constants.K;
+  const uint32_t num_groups = push_constants.num_groups;
+
+  if (checked_u32(x.shape(-2), "fused_affine_matmul X rows") != rows ||
+      checked_u32(x.shape(-1), "fused_affine_matmul X K") != k ||
+      checked_u32(w.shape(-2), "fused_affine_matmul W rows") != cols ||
+      checked_u32(scales.shape(-2), "fused_affine_matmul scales rows") !=
+          cols ||
+      checked_u32(biases.shape(-2), "fused_affine_matmul biases rows") !=
+          cols ||
+      checked_u32(scales.shape(-1), "fused_affine_matmul scales groups") !=
+          num_groups ||
+      checked_u32(biases.shape(-1), "fused_affine_matmul biases groups") !=
+          num_groups) {
+    throw std::runtime_error(
+        "[vulkan::kernels] fused_affine_matmul dispatch received incompatible shapes.");
+  }
+
+  const std::array<BoundArray, 5> bound_arrays = {{
+      {&w, "W"},
+      {&scales, "SCALES"},
+      {&biases, "BIASES"},
+      {&x, "X"},
+      {&out, "OUT"},
+  }};
+  const uint32_t num_elements =
+      checked_mul_u32(rows, cols, "fused_affine_matmul output elements");
+  dispatch_with_spec(
+      shader_id,
+      KernelSpecId::FusedAffineMatmul,
+      bound_arrays,
+      push_constants,
+      num_elements,
+      cmd_buffer,
+      s,
+      grid,
+      matmul_specialization_constants());
 }
 
 } // namespace mlx::core::vulkan

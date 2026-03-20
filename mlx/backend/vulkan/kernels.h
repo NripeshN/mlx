@@ -506,6 +506,20 @@ struct Nvfp4DequantPushConstants {
   uint32_t ne;
 };
 
+struct FusedAffineMatmulPushConstants {
+  uint32_t rows;
+  uint32_t cols;
+  uint32_t K;
+  uint32_t packed_row_bytes;
+  uint32_t x_row_stride;
+  uint32_t out_row_stride;
+  uint32_t scale_row_stride;
+  uint32_t bias_row_stride;
+  uint32_t bits;
+  uint32_t group_size;
+  uint32_t num_groups;
+};
+
 enum class BinaryDispatchVariant {
   Standard,
   AddWithPartials,
@@ -761,6 +775,18 @@ void dispatch_nvfp4_dequant_op(
     vk::CommandBuffer cmd_buffer,
     const Stream& s,
     const Nvfp4DequantPushConstants& push_constants,
+    const std::array<uint32_t, 3>& grid);
+
+void dispatch_fused_affine_matmul_op(
+    const array& a,
+    const array& scales,
+    const array& biases,
+    const array& b,
+    array& out,
+    StaticShaderId shader_id,
+    vk::CommandBuffer cmd_buffer,
+    const Stream& s,
+    const FusedAffineMatmulPushConstants& push_constants,
     const std::array<uint32_t, 3>& grid);
 
 // Get workgroup dimensions for element-wise operations.

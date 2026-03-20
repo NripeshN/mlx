@@ -1896,6 +1896,21 @@ void process_shaders() {
   string_to_spv("dequant_nvfp4_f32", "dequant_nvfp4.comp", {});
 
   string_to_spv(
+      "fused_affine_matmul_f32_f32",
+      "mul_mm_affine.comp",
+      {{"B_TYPE", "float"}});
+  string_to_spv(
+      "fused_affine_matmul_f16_f32",
+      "mul_mm_affine.comp",
+      {{"FLOAT16", "1"}, {"B_TYPE", "float16_t"}});
+  string_to_spv(
+      "fused_affine_matmul_bf16_f32",
+      "mul_mm_affine.comp",
+      {{"DATA_B_BF16", "1"},
+       {"B_TYPE", "uint16_t"},
+       {"TO_FLOAT_TYPE", "bf16_to_fp32"}});
+
+  string_to_spv(
       "mul_f32",
       "mul.comp",
       {{"A_TYPE", "float"},

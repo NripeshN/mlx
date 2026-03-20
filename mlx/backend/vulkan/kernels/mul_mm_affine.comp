@@ -1,0 +1,125 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#ifdef FLOAT16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+#include "types.glsl"
+
+#if !defined(TO_FLOAT_TYPE)
+#define TO_FLOAT_TYPE float
+#endif
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer W {
+    uint8_t data_w[];
+};
+layout(binding = 1) readonly buffer SCALES {
+    float data_scales[];
+};
+layout(binding = 2) readonly buffer BIASES {
+    float data_biases[];
+};
+layout(binding = 3) readonly buffer X {
+    B_TYPE data_x[];
+};
+layout(binding = 4) writeonly buffer OUT {
+    float data_out[];
+};
+
+layout(push_constant) uniform parameter {
+    uint rows;
+    uint cols;
+    uint K;
+    uint packed_row_bytes;
+    uint x_row_stride;
+    uint out_row_stride;
+    uint scale_row_stride;
+    uint bias_row_stride;
+    uint bits;
+    uint group_size;
+    uint num_groups;
+} p;
+
+uint read_quant(const uint row_base, const uint index_in_row) {
+    if (p.bits == 2u) {
+        const uint pack = index_in_row >> 2;
+        const uint shift = 2u * (index_in_row & 3u);
+        return (uint(data_w[row_base + pack]) >> shift) & 0x3u;
+    }
+    if (p.bits == 3u) {
+        const uint pack = index_in_row >> 3;
+        const uint lane = index_in_row & 7u;
+        const uint base = row_base + pack * 3u;
+        if (lane == 0u) return uint(data_w[base + 0u]) & 0x7u;
+        if (lane == 1u) return (uint(data_w[base + 0u]) >> 3u) & 0x7u;
+        if (lane == 2u) return ((uint(data_w[base + 0u]) >> 6u) & 0x3u) | ((uint(data_w[base + 1u]) & 0x1u) << 2u);
+        if (lane == 3u) return (uint(data_w[base + 1u]) >> 1u) & 0x7u;
+        if (lane == 4u) return (uint(data_w[base + 1u]) >> 4u) & 0x7u;
+        if (lane == 5u) return ((uint(data_w[base + 1u]) >> 7u) & 0x1u) | ((uint(data_w[base + 2u]) & 0x3u) << 1u);
+        if (lane == 6u) return (uint(data_w[base + 2u]) >> 2u) & 0x7u;
+        return (uint(data_w[base + 2u]) >> 5u) & 0x7u;
+    }
+    if (p.bits == 4u) {
+        const uint pack = index_in_row >> 1;
+        const uint shift = 4u * (index_in_row & 1u);
+        return (uint(data_w[row_base + pack]) >> shift) & 0xFu;
+    }
+    if (p.bits == 5u) {
+        const uint pack = index_in_row >> 3;
+        const uint lane = index_in_row & 7u;
+        const uint base = row_base + pack * 5u;
+        if (lane == 0u) return uint(data_w[base + 0u]) & 0x1Fu;
+        if (lane == 1u) return ((uint(data_w[base + 0u]) >> 5u) & 0x7u) | ((uint(data_w[base + 1u]) & 0x3u) << 3u);
+        if (lane == 2u) return (uint(data_w[base + 1u]) >> 2u) & 0x1Fu;
+        if (lane == 3u) return ((uint(data_w[base + 1u]) >> 7u) & 0x1u) | ((uint(data_w[base + 2u]) & 0xFu) << 1u);
+        if (lane == 4u) return ((uint(data_w[base + 2u]) >> 4u) & 0xFu) | ((uint(data_w[base + 3u]) & 0x1u) << 4u);
+        if (lane == 5u) return (uint(data_w[base + 3u]) >> 1u) & 0x1Fu;
+        if (lane == 6u) return ((uint(data_w[base + 3u]) >> 6u) & 0x3u) | ((uint(data_w[base + 4u]) & 0x7u) << 2u);
+        return (uint(data_w[base + 4u]) >> 3u) & 0x1Fu;
+    }
+    if (p.bits == 6u) {
+        const uint pack = index_in_row >> 2;
+        const uint lane = index_in_row & 3u;
+        const uint base = row_base + pack * 3u;
+        if (lane == 0u) return uint(data_w[base + 0u]) & 0x3Fu;
+        if (lane == 1u) return ((uint(data_w[base + 0u]) >> 6u) & 0x3u) | ((uint(data_w[base + 1u]) & 0xFu) << 2u);
+        if (lane == 2u) return ((uint(data_w[base + 1u]) >> 4u) & 0xFu) | ((uint(data_w[base + 2u]) & 0x3u) << 4u);
+        return (uint(data_w[base + 2u]) >> 2u) & 0x3Fu;
+    }
+    return uint(data_w[row_base + index_in_row]);
+}
+
+void main() {
+    const uint col = gl_GlobalInvocationID.x;
+    const uint row = gl_GlobalInvocationID.y;
+
+    if (row >= p.rows || col >= p.cols) {
+        return;
+    }
+
+    const uint w_row_base = col * p.packed_row_bytes;
+    const uint scale_row_base = col * p.scale_row_stride;
+    const uint bias_row_base = col * p.bias_row_stride;
+    const uint x_row_base = row * p.x_row_stride;
+
+    float acc = 0.0f;
+    for (uint group = 0u; group < p.num_groups; ++group) {
+        const float scale = data_scales[scale_row_base + group];
+        const float bias = data_biases[bias_row_base + group];
+        const uint group_start = group * p.group_size;
+        const uint group_end = min(group_start + p.group_size, p.K);
+
+        for (uint k = group_start; k < group_end; ++k) {
+            const float w = scale * float(read_quant(w_row_base, k)) + bias;
+            acc = fma(TO_FLOAT_TYPE(data_x[x_row_base + k]), w, acc);
+        }
+    }
+
+    data_out[row * p.out_row_stride + col] = acc;
+}
