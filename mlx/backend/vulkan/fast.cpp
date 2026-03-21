@@ -33,6 +33,7 @@ constexpr char kFlashAttnMaskOptScratchLane[] = "flash_attn.mask_opt";
 constexpr char kFlashAttnSplitKScratchLane[] = "flash_attn.split_k";
 constexpr char kFlashAttnOutScratchLane[] = "flash_attn.out_storage";
 constexpr char kFlashAttnCausalMaskScratchLane[] = "flash_attn.causal_mask";
+constexpr char kFlashAttnQCastScratchLane[] = "flash_attn.q_cast";
 constexpr char kFlashAttnKCastScratchLane[] = "flash_attn.k_cast";
 constexpr char kFlashAttnVCastScratchLane[] = "flash_attn.v_cast";
 
@@ -99,6 +100,18 @@ array cast_flash_attention_kv_to_f16(
       vulkan::acquire_scratch_array(s, scratch_lane, x.shape(), float16);
   copy_gpu(x, out, CopyType::General, s);
   vulkan::mark_scratch_array_written(s, scratch_lane);
+  return out;
+}
+
+array cast_flash_attention_q_to_f32(const array& x, Stream s) {
+  if (x.dtype() == float32 && x.offset() == 0 && x.flags().row_contiguous &&
+      x.strides().back() == 1) {
+    return x;
+  }
+  array out = vulkan::acquire_scratch_array(
+      s, kFlashAttnQCastScratchLane, x.shape(), float32);
+  copy_gpu(x, out, CopyType::General, s);
+  vulkan::mark_scratch_array_written(s, kFlashAttnQCastScratchLane);
   return out;
 }
 
@@ -754,9 +767,7 @@ bool try_eval_flash_attention_vulkan(
   }
 
   q = multiply(array(scale, q.dtype()), q, s);
-  if (q.dtype() != float32) {
-    q = astype(q, float32, s);
-  }
+  q = cast_flash_attention_q_to_f32(q, s);
 
   auto make_contiguous_zero_offset = [&](array x) {
     if (!x.flags().row_contiguous || x.strides().back() != 1 ||
