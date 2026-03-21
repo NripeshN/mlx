@@ -1,6 +1,9 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/distributed/primitives.h"
+#include "mlx/backend/common/slicing.h"
+#include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/vulkan/allocator.h"
 #include "mlx/backend/vulkan/primitives_utils.h"
 
 namespace mlx::core {
@@ -243,8 +246,44 @@ CPU_FALLBACK(Tan)
 NO_GPU(MaskedScatter)
 // Scatter and ScatterAxis are implemented in scatter.cpp
 
-// SliceUpdate uses the generic GPU implementation in
-// mlx/backend/gpu/primitives.cpp
+void SliceUpdate::eval_gpu(const std::vector<array>& inputs, array& out) {
+  assert(inputs.size() == 2);
+  if (out.size() == 0) {
+    out.set_data(allocator::malloc(0));
+    return;
+  }
+
+  auto& in = inputs[0];
+  auto& upd = inputs[1];
+
+  if (upd.size() == 0) {
+    out.copy_shared_buffer(in);
+    return;
+  }
+
+  if (is_donatable(in, out) && in.dtype() == out.dtype()) {
+    out.copy_shared_buffer(in);
+  } else {
+    auto ctype = in.flags().contiguous && in.size() == in.data_size()
+        ? CopyType::Vector
+        : CopyType::General;
+    copy_gpu(in, out, in.data_size() == 1 ? CopyType::Scalar : ctype, stream());
+  }
+
+  auto [data_offset, out_strides] =
+      prepare_slice(out, start_indices_, strides_);
+  copy_gpu_inplace(
+      upd,
+      out,
+      upd.shape(),
+      upd.strides(),
+      out_strides,
+      0,
+      data_offset,
+      CopyType::GeneralGeneral,
+      stream());
+}
+
 CPU_FALLBACK(SegmentedMM)
 
 void Select::eval_gpu(const std::vector<array>& inputs, array& out) {
