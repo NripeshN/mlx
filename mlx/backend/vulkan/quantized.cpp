@@ -26,11 +26,7 @@ bool is_supported_quantized_output_dtype(Dtype dtype) {
 }
 
 std::optional<vulkan::StaticShaderId> fused_affine_matmul_shader_id(
-    Dtype x_dtype,
-    Dtype out_dtype) {
-  if (out_dtype != float32) {
-    return std::nullopt;
-  }
+    Dtype x_dtype) {
   switch (x_dtype) {
     case float32:
       return vulkan::StaticShaderId::fused_affine_matmul_f32_f32;
@@ -301,7 +297,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         x, make_contiguous_strides(flat_shape), x.flags(), x.size());
   }
 
-  auto fused_shader = fused_affine_matmul_shader_id(x_mat.dtype(), out.dtype());
+  auto fused_shader = fused_affine_matmul_shader_id(x_mat.dtype());
   const bool enable_fused_decode_qmm = []() {
     if (const char* env = std::getenv("MLX_VULKAN_FUSED_AFFINE_QMM");
         env != nullptr) {
@@ -309,9 +305,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
     }
     return true;
   }();
-  const Dtype out_work_dtype =
-      (enable_fused_decode_qmm && fused_shader.has_value()) ? out.dtype()
-                                                            : float32;
+  const Dtype out_work_dtype = float32;
 
   array out_work(
       (vector_lhs || flatten_lhs_batches)
