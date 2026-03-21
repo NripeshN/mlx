@@ -24,19 +24,8 @@ const uint32_t cols_per_iter = gl_WorkGroupSize.x / row_split;
 const uint32_t cols_per_thread = Bc / cols_per_iter;
 
 
-#if defined(DATA_Q_BF16)
-layout (binding = 0) readonly buffer Q {uint16_t data_q[];};
-layout (binding = 0) readonly buffer QV4 {u16vec4 data_qv4[];};
-#define LOAD_QV4_TO_F16(ptr) f16vec4(bf16_to_fp32(uvec4(ptr)) * p.scale)
-#elif defined(DATA_Q_F16)
-layout (binding = 0) readonly buffer Q {float16_t data_q[];};
-layout (binding = 0) readonly buffer QV4 {f16vec4 data_qv4[];};
-#define LOAD_QV4_TO_F16(ptr) f16vec4(vec4(ptr) * p.scale)
-#else
 layout (binding = 0) readonly buffer Q {float data_q[];};
 layout (binding = 0) readonly buffer QV4 {vec4 data_qv4[];};
-#define LOAD_QV4_TO_F16(ptr) f16vec4(ptr * p.scale)
-#endif
 layout (binding = 1) readonly buffer K {float16_t data_k[];};
 layout (binding = 1) readonly buffer KV4 {f16vec4 data_kv4[];};
 layout (binding = 2) readonly buffer V {float16_t data_v[];};
@@ -99,7 +88,7 @@ void main() {
         uint32_t r = (idx + tid) / (HSK / 4);
         if (r < Br && d < HSK / 4 &&
             i * Br + r < N) {
-            Qf[r * qstride + d] = LOAD_QV4_TO_F16(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d]);
+            Qf[r * qstride + d] = f16vec4(data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale);
         }
     }
     barrier();

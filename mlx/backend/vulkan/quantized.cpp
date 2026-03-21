@@ -28,22 +28,16 @@ bool is_supported_quantized_output_dtype(Dtype dtype) {
 std::optional<vulkan::StaticShaderId> fused_affine_matmul_shader_id(
     Dtype x_dtype,
     Dtype out_dtype) {
+  if (out_dtype != float32) {
+    return std::nullopt;
+  }
   switch (x_dtype) {
     case float32:
-      if (out_dtype != float32) {
-        return std::nullopt;
-      }
       return vulkan::StaticShaderId::fused_affine_matmul_f32_f32;
     case float16:
-      if (out_dtype != float16) {
-        return std::nullopt;
-      }
-      return vulkan::StaticShaderId::fused_affine_matmul_f16_f16;
+      return vulkan::StaticShaderId::fused_affine_matmul_f16_f32;
     case bfloat16:
-      if (out_dtype != bfloat16) {
-        return std::nullopt;
-      }
-      return vulkan::StaticShaderId::fused_affine_matmul_bf16_bf16;
+      return vulkan::StaticShaderId::fused_affine_matmul_bf16_f32;
     default:
       return std::nullopt;
   }
@@ -308,7 +302,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   }
 
   auto fused_shader = fused_affine_matmul_shader_id(x_mat.dtype(), out.dtype());
-  const Dtype out_work_dtype = fused_shader.has_value() ? out.dtype() : float32;
+  const bool enable_fused_decode_qmm = []() {
+    if (const char* env = std::getenv("MLX_VULKAN_FUSED_AFFINE_QMM");
+        env != nullptr) {
+      return std::string_view(env) != "0";
+    }
+    return true;
+  }();
+  const Dtype out_work_dtype =
+      (enable_fused_decode_qmm && fused_shader.has_value()) ? out.dtype()
+                                                            : float32;
 
   array out_work(
       (vector_lhs || flatten_lhs_batches)
@@ -319,9 +322,9 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
       {});
 
   bool fused_dispatched = false;
-  if (transpose_ && fused_shader.has_value() && x_mat.ndim() == 2 &&
-      w.ndim() == 2 && scales.ndim() == 2 && biases.ndim() == 2 &&
-      is_row_contiguous_zero_offset(x_mat) &&
+  if (enable_fused_decode_qmm && transpose_ && fused_shader.has_value() &&
+      x_mat.ndim() == 2 && w.ndim() == 2 && scales.ndim() == 2 &&
+      biases.ndim() == 2 && is_row_contiguous_zero_offset(x_mat) &&
       is_row_contiguous_zero_offset(w) &&
       is_row_contiguous_zero_offset(scales) &&
       is_row_contiguous_zero_offset(biases)) {

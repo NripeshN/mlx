@@ -798,129 +798,121 @@ void process_shaders() {
         fa_base_dict["ACC_TYPE_MAX"] = "float16_t(65504.0)";
       }
 
-      const std::
-          array<std::pair<std::string, std::map<std::string, std::string>>, 3>
-              q_variants = {{
-                  {"f32", {{"Q_TYPE", "float"}}},
-                  {"f16", {{"Q_TYPE", "float16_t"}, {"DATA_Q_F16", "1"}}},
-                  {"bf16", {{"Q_TYPE", "uint16_t"}, {"DATA_Q_BF16", "1"}}},
-              }};
-
-      for (const auto& [qname, qdict] : q_variants) {
-        for (const auto& tname : type_names) {
-          if (fp16 && tname != "bf16") {
+      for (const auto& tname : type_names) {
+        if (fp16 && tname != "bf16") {
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
-            if (qname == "f32" && tname == "f16") {
-              string_to_spv(
-                  "flash_attn_" + qname + "_f16_" + tname,
-                  "flash_attn_cm2.comp",
-                  merge_maps(
-                      merge_maps(fa_base_dict, qdict),
-                      {{"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}),
-                  fp16,
-                  false,
-                  true,
-                  f16acc);
-            } else if (qname == "f32") {
-              std::string data_a_key = "DATA_A_" + to_uppercase(tname);
-              string_to_spv(
-                  "flash_attn_" + qname + "_f16_" + tname,
-                  "flash_attn_cm2.comp",
-                  merge_maps(
-                      merge_maps(fa_base_dict, qdict),
-                      {{data_a_key, "1"},
-                       {"D_TYPE", "float"},
-                       {"D_TYPEV4", "vec4"},
-                       {"DEQUANTFUNC", "dequantFunc" + to_uppercase(tname)},
-                       {"BLOCK_SIZE", "QUANT_K_" + to_uppercase(tname)}}),
-                  fp16,
-                  false,
-                  true,
-                  f16acc);
-            }
-#endif
-#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-            if (tname == "f16") {
-              string_to_spv(
-                  "flash_attn_" + qname + "_f16_" + tname,
-                  "flash_attn_cm1.comp",
-                  merge_maps(
-                      merge_maps(fa_base_dict, qdict),
-                      {{"Q_TYPE", qdict.at("Q_TYPE")},
-                       {"D_TYPE", "float"},
-                       {"D_TYPEV4", "vec4"},
-                       {"COOPMAT", "1"}}),
-                  fp16,
-                  true,
-                  false,
-                  f16acc);
-            } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32") {
-              if (qname != "f32") {
-                continue;
-              }
-              std::string data_a_key = "DATA_A_" + to_uppercase(tname);
-              string_to_spv(
-                  "flash_attn_" + qname + "_f16_" + tname,
-                  "flash_attn_cm1.comp",
-                  merge_maps(
-                      merge_maps(fa_base_dict, qdict),
-                      {{data_a_key, "1"},
-                       {"D_TYPE", "float"},
-                       {"D_TYPEV4", "vec4"},
-                       {"BLOCK_SIZE", "QUANT_K_" + to_uppercase(tname)},
-                       {"COOPMAT", "1"}}),
-                  fp16,
-                  true,
-                  false,
-                  f16acc);
-            }
-#endif
-          }
-
           if (tname == "f16") {
             string_to_spv(
-                "flash_attn_" + qname + "_f16_" + tname,
-                "flash_attn.comp",
+                "flash_attn_f32_f16_" + tname,
+                "flash_attn_cm2.comp",
                 merge_maps(
-                    merge_maps(fa_base_dict, qdict),
-                    {{"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}),
-                fp16,
-                false,
-                false,
-                f16acc);
-          } else if (tname == "bf16") {
-            std::string data_a_key = "DATA_A_" + to_uppercase(tname);
-            string_to_spv(
-                "flash_attn_" + qname + "_f16_" + tname,
-                "flash_attn.comp",
-                merge_maps(
-                    merge_maps(fa_base_dict, qdict),
-                    {{data_a_key, "1"},
+                    fa_base_dict,
+                    {{"Q_TYPE", "float"},
                      {"D_TYPE", "float"},
                      {"D_TYPEV4", "vec4"}}),
                 fp16,
                 false,
-                false,
+                true,
                 f16acc);
-          } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32") {
-            if (qname != "f32") {
-              continue;
-            }
+          } else {
             std::string data_a_key = "DATA_A_" + to_uppercase(tname);
             string_to_spv(
-                "flash_attn_" + qname + "_f16_" + tname,
-                "flash_attn.comp",
+                "flash_attn_f32_f16_" + tname,
+                "flash_attn_cm2.comp",
                 merge_maps(
-                    merge_maps(fa_base_dict, qdict),
+                    fa_base_dict,
                     {{data_a_key, "1"},
+                     {"Q_TYPE", "float"},
                      {"D_TYPE", "float"},
                      {"D_TYPEV4", "vec4"},
+                     {"DEQUANTFUNC", "dequantFunc" + to_uppercase(tname)},
                      {"BLOCK_SIZE", "QUANT_K_" + to_uppercase(tname)}}),
                 fp16,
                 false,
+                true,
+                f16acc);
+          }
+#endif
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+          if (tname == "f16") {
+            string_to_spv(
+                "flash_attn_f32_f16_" + tname,
+                "flash_attn_cm1.comp",
+                merge_maps(
+                    fa_base_dict,
+                    {{"Q_TYPE", "float"},
+                     {"D_TYPE", "float"},
+                     {"D_TYPEV4", "vec4"},
+                     {"COOPMAT", "1"}}),
+                fp16,
+                true,
+                false,
+                f16acc);
+          } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32") {
+            std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+            string_to_spv(
+                "flash_attn_f32_f16_" + tname,
+                "flash_attn_cm1.comp",
+                merge_maps(
+                    fa_base_dict,
+                    {{data_a_key, "1"},
+                     {"Q_TYPE", "float"},
+                     {"D_TYPE", "float"},
+                     {"D_TYPEV4", "vec4"},
+                     {"BLOCK_SIZE", "QUANT_K_" + to_uppercase(tname)},
+                     {"COOPMAT", "1"}}),
+                fp16,
+                true,
                 false,
                 f16acc);
           }
+#endif
+        }
+
+        if (tname == "f16") {
+          string_to_spv(
+              "flash_attn_f32_f16_" + tname,
+              "flash_attn.comp",
+              merge_maps(
+                  fa_base_dict,
+                  {{"Q_TYPE", "float"},
+                   {"D_TYPE", "float"},
+                   {"D_TYPEV4", "vec4"}}),
+              fp16,
+              false,
+              false,
+              f16acc);
+        } else if (tname == "bf16") {
+          std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+          string_to_spv(
+              "flash_attn_f32_f16_" + tname,
+              "flash_attn.comp",
+              merge_maps(
+                  fa_base_dict,
+                  {{data_a_key, "1"},
+                   {"Q_TYPE", "float"},
+                   {"D_TYPE", "float"},
+                   {"D_TYPEV4", "vec4"}}),
+              fp16,
+              false,
+              false,
+              f16acc);
+        } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32") {
+          std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+          string_to_spv(
+              "flash_attn_f32_f16_" + tname,
+              "flash_attn.comp",
+              merge_maps(
+                  fa_base_dict,
+                  {{data_a_key, "1"},
+                   {"Q_TYPE", "float"},
+                   {"D_TYPE", "float"},
+                   {"D_TYPEV4", "vec4"},
+                   {"BLOCK_SIZE", "QUANT_K_" + to_uppercase(tname)}}),
+              fp16,
+              false,
+              false,
+              f16acc);
         }
       }
     }
@@ -1908,17 +1900,16 @@ void process_shaders() {
       "mul_mm_affine.comp",
       {{"B_TYPE", "float"}, {"D_TYPE", "float"}});
   string_to_spv(
-      "fused_affine_matmul_f16_f16",
+      "fused_affine_matmul_f16_f32",
       "mul_mm_affine.comp",
-      {{"FLOAT16", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+      {{"FLOAT16", "1"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float"}});
   string_to_spv(
-      "fused_affine_matmul_bf16_bf16",
+      "fused_affine_matmul_bf16_f32",
       "mul_mm_affine.comp",
       {{"DATA_B_BF16", "1"},
        {"B_TYPE", "uint16_t"},
        {"TO_FLOAT_TYPE", "bf16_to_fp32"},
-       {"D_TYPE", "uint16_t"},
-       {"FROM_FLOAT_TYPE", "fp32_to_bf16"}});
+       {"D_TYPE", "float"}});
 
   string_to_spv(
       "mul_f32",
@@ -2792,9 +2783,8 @@ void write_output_files() {
         continue;
       }
 
-      src << "extern const uint64_t " << name << "_len = " << data.size()
-          << ";\n";
-      src << "extern const unsigned char " << name << "_data[" << data.size()
+      src << "const uint64_t " << name << "_len = " << data.size() << ";\n";
+      src << "const unsigned char " << name << "_data[" << data.size()
           << "] = {\n"
           << std::hex;
       auto bytes = reinterpret_cast<const uint8_t*>(data.data());
