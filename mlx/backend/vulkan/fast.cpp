@@ -104,8 +104,10 @@ array cast_flash_attention_kv_to_f16(
 }
 
 array cast_flash_attention_q_to_f32(const array& x, Stream s) {
+  auto data = x.data_shared_ptr();
   if (x.dtype() == float32 && x.offset() == 0 && x.flags().row_contiguous &&
-      x.strides().back() == 1) {
+      x.strides().back() == 1 && data != nullptr &&
+      data->buffer.ptr() != nullptr) {
     return x;
   }
   array out = vulkan::acquire_scratch_array(
@@ -133,21 +135,38 @@ struct FlashAttentionTuningParams {
 };
 
 vulkan::StaticShaderId flash_attention_main_shader(
-    FlashAttentionTuningParams::Path path) {
+    FlashAttentionTuningParams::Path path,
+    bool use_native_bf16_kv) {
+  const bool kv_bf16 = use_native_bf16_kv;
   if (const char* env = std::getenv("MLX_VULKAN_FLASH_ATTN_SHADER");
       env != nullptr) {
     const std::string value(env);
     if (value == "cm1") {
+      if (kv_bf16) {
+        return vulkan::StaticShaderId::flash_attn_f32_f16_bf16;
+      }
       return vulkan::StaticShaderId::flash_attn_f32_f16_f16_cm1;
     }
     if (value == "fp32") {
+      if (kv_bf16) {
+        return vulkan::StaticShaderId::flash_attn_f32_f16_bf16_fp32;
+      }
       return vulkan::StaticShaderId::flash_attn_f32_f16_f16_fp32;
     }
     if (value == "f16acc") {
+      if (kv_bf16) {
+        return vulkan::StaticShaderId::flash_attn_f32_f16_bf16_f16acc;
+      }
       return path == FlashAttentionTuningParams::Path::CoopMat1
           ? vulkan::StaticShaderId::flash_attn_f32_f16_f16_f16acc_cm1
           : vulkan::StaticShaderId::flash_attn_f32_f16_f16_f16acc;
     }
+  }
+  if (kv_bf16) {
+    if (vulkan::VulkanContext::get().shader_float16_supported()) {
+      return vulkan::StaticShaderId::flash_attn_f32_f16_bf16;
+    }
+    return vulkan::StaticShaderId::flash_attn_f32_f16_bf16_fp32;
   }
   if (path == FlashAttentionTuningParams::Path::CoopMat1) {
     return vulkan::StaticShaderId::flash_attn_f32_f16_f16_cm1;
@@ -383,10 +402,13 @@ FlashAttentionExecutionPlan make_flash_attention_execution_plan(
     uint32_t batch,
     bool has_mask,
     bool do_causal,
+    bool use_native_bf16_kv,
     uint32_t q_stride,
     uint32_t k_stride,
     uint32_t v_stride) {
-  auto tuning = get_flash_attention_tuning_params(hsk, hsv, q_len, kv_len);
+  auto tuning = use_native_bf16_kv
+      ? get_flash_attention_tuning_params_scalar(hsk, hsv, q_len, kv_len)
+      : get_flash_attention_tuning_params(hsk, hsv, q_len, kv_len);
   const bool aligned = (kv_len % tuning.block_cols) == 0 &&
       (q_stride & 7u) == 0 && (k_stride & 7u) == 0 && (v_stride & 7u) == 0;
 
@@ -491,7 +513,8 @@ bool try_dispatch_flash_attention_native_vulkan(
     const array* mask,
     bool do_causal,
     array& out_storage,
-    Stream s) {
+    Stream s,
+    bool use_native_bf16_kv) {
   const uint32_t batch = checked_u32_size(q.shape(0), "flash_attn batch");
   const uint32_t q_heads = checked_u32_size(q.shape(1), "flash_attn q_heads");
   const uint32_t q_len = checked_u32_size(q.shape(2), "flash_attn q_len");
@@ -516,11 +539,13 @@ bool try_dispatch_flash_attention_native_vulkan(
       batch,
       has_mask,
       do_causal,
+      use_native_bf16_kv,
       q_stride,
       k_stride,
       v_stride);
   const auto& tuning = plan.tuning;
-  const auto shader_id = flash_attention_main_shader(tuning.path);
+  const auto shader_id =
+      flash_attention_main_shader(tuning.path, use_native_bf16_kv);
   if (tuning.d_split == 0 || tuning.block_rows == 0 || tuning.block_cols == 0 ||
       tuning.row_split == 0 || hsk % tuning.d_split != 0 ||
       hsv % tuning.d_split != 0 ||
@@ -759,6 +784,8 @@ bool try_eval_flash_attention_vulkan(
   const uint32_t kv_heads = checked_u32_size(k.shape(1), "flash_attn kv_heads");
   const uint32_t kv_len = checked_u32_size(k.shape(2), "flash_attn kv_len");
   const uint32_t hsv = checked_u32_size(v.shape(3), "flash_attn hsv");
+  const bool use_native_bf16_kv = do_causal && q_len > 1 && q_len == kv_len &&
+      k.dtype() == bfloat16 && v.dtype() == bfloat16;
 
   if (batch == 0 || q_heads == 0 || q_len == 0 || hsk == 0 || kv_heads == 0 ||
       kv_len == 0 || hsv == 0 || hsk % 4 != 0 || hsv % 4 != 0 ||
@@ -766,7 +793,8 @@ bool try_eval_flash_attention_vulkan(
     return false;
   }
 
-  q = multiply(array(scale, q.dtype()), q, s);
+  q = cast_flash_attention_q_to_f32(q, s);
+  q = multiply(array(scale, float32), q, s);
   q = cast_flash_attention_q_to_f32(q, s);
 
   auto make_contiguous_zero_offset = [&](array x) {
@@ -780,13 +808,22 @@ bool try_eval_flash_attention_vulkan(
   q = make_contiguous_zero_offset(q);
   k = make_contiguous_zero_offset(k);
   v = make_contiguous_zero_offset(v);
-  k = cast_flash_attention_kv_to_f16(k, kFlashAttnKCastScratchLane, s);
-  v = cast_flash_attention_kv_to_f16(v, kFlashAttnVCastScratchLane, s);
+  if (!use_native_bf16_kv) {
+    k = cast_flash_attention_kv_to_f16(k, kFlashAttnKCastScratchLane, s);
+    v = cast_flash_attention_kv_to_f16(v, kFlashAttnVCastScratchLane, s);
+  }
   trace_flash_attention_array("q_ready", q);
   trace_flash_attention_array("k_ready", k);
   trace_flash_attention_array("v_ready", v);
 
-  if (q.dtype() != float32 || k.dtype() != float16 || v.dtype() != float16) {
+  if (q.dtype() != float32) {
+    return false;
+  }
+  if (use_native_bf16_kv) {
+    if (k.dtype() != bfloat16 || v.dtype() != bfloat16) {
+      return false;
+    }
+  } else if (k.dtype() != float16 || v.dtype() != float16) {
     return false;
   }
 
@@ -797,10 +834,17 @@ bool try_eval_flash_attention_vulkan(
       float32);
 
   try {
-    const bool use_causal_shader = do_causal && q_len > 1;
+    const bool use_causal_shader = do_causal && q_len > 1 && q_len != kv_len;
 
     if (!try_dispatch_flash_attention_native_vulkan(
-            q, k, v, nullptr, use_causal_shader, out_storage, s)) {
+            q,
+            k,
+            v,
+            nullptr,
+            use_causal_shader,
+            out_storage,
+            s,
+            use_native_bf16_kv)) {
       return false;
     }
     vulkan::mark_scratch_array_written(s, kFlashAttnOutScratchLane);

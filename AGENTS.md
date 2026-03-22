@@ -208,3 +208,7 @@ tests/             # C++ unit tests
 - For Vulkan Reference implementation read ./llama.cpp/ggml/src/ggml-vulkan/
 - ALWAYS check for existing shaders in ./mlx/backend/vulkan/kernels/ before introducing new onces
 - Shaders should be compiled automatically by CMake; check build output if shaders fail
+- NEVER edit source files outside of mlx/backends/vulkan !! (test files are allowed)
+
+## Github instructions
+- Every PR that you create, should contain the results of qwen3 benchmark by running it @benchmark_qwen3.sh against bf16 anf 8bit quants. either as pr desc or as comment 

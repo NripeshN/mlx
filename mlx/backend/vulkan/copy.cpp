@@ -914,8 +914,11 @@ void copy_gpu_inplace(
     return;
   }
 
-  vk::CommandBuffer cmd_buffer =
-      vulkan::begin_transfer_command_recording(s.index);
+  const bool use_transfer_queue =
+      raw_buffer_copy || contiguous_large_rank_copy || segmented_buffer_copy;
+  vk::CommandBuffer cmd_buffer = use_transfer_queue
+      ? vulkan::begin_transfer_command_recording(s.index)
+      : vulkan::begin_command_recording(s.index);
 
   // Get buffer handles
   auto* in_buf = static_cast<vulkan::VulkanBuffer*>(
@@ -948,7 +951,11 @@ void copy_gpu_inplace(
   } else if (segmented_buffer_copy) {
     const auto copy_regions = make_strided_copy_regions(in_view, out_view);
     if (copy_regions.empty()) {
-      vulkan::end_transfer_command_recording(s.index);
+      if (use_transfer_queue) {
+        vulkan::end_transfer_command_recording(s.index);
+      } else {
+        vulkan::end_command_recording(s.index);
+      }
       throw std::runtime_error(
           "Copy operation failed on Vulkan: unsupported large-offset strided copy.");
     }
@@ -981,7 +988,11 @@ void copy_gpu_inplace(
 
       vulkan::dispatch_unary_op(in_view, out_view, *shader_id, cmd_buffer, s);
     } catch (const std::runtime_error& e) {
-      vulkan::end_transfer_command_recording(s.index);
+      if (use_transfer_queue) {
+        vulkan::end_transfer_command_recording(s.index);
+      } else {
+        vulkan::end_command_recording(s.index);
+      }
       throw std::runtime_error(
           std::string("Copy operation failed on Vulkan: ") + e.what());
     }
@@ -989,7 +1000,11 @@ void copy_gpu_inplace(
     throw std::runtime_error("Unsupported Vulkan copy type.");
   }
 
-  vulkan::end_transfer_command_recording(s.index);
+  if (use_transfer_queue) {
+    vulkan::end_transfer_command_recording(s.index);
+  } else {
+    vulkan::end_command_recording(s.index);
+  }
 }
 
 // Note: The simpler overload copy_gpu_inplace(in, out, ctype, s) is defined in
