@@ -1328,6 +1328,25 @@ class TestOps(mlx_tests.MLXTestCase):
         self.assertEqual(y.tolist(), [1, 2, 3, 4])
         self.assertEqual(z.tolist(), [5, 6, 7])
 
+    def test_split_invalid_num_splits(self):
+        """Regression: split with num_splits <= 0 should raise, not crash."""
+        a = mx.arange(6)
+
+        # num_splits = 0: should raise cleanly (was UB via divide-by-zero)
+        with self.assertRaises(ValueError):
+            mx.split(a, 0)
+
+        # num_splits = -1: should raise cleanly (was SIGBUS via huge allocation)
+        with self.assertRaises(ValueError):
+            mx.split(a, -1)
+
+        # Also check with explicit axis
+        b = mx.zeros((4, 6))
+        with self.assertRaises(ValueError):
+            mx.split(b, 0, axis=1)
+        with self.assertRaises(ValueError):
+            mx.split(b, -2, axis=0)
+
     def test_arange_overload_dispatch(self):
         with self.assertRaises(ValueError):
             a = mx.arange(float("nan"), 1, 5)
@@ -3292,10 +3311,22 @@ class TestOps(mlx_tests.MLXTestCase):
             mx.broadcast_shapes()
 
     def test_sort_nan(self):
-        x = mx.array([3.0, mx.nan, 2.0, 0.0])
-        expected = mx.array([0.0, 2.0, 3.0, mx.nan])
-        self.assertTrue(mx.array_equal(mx.sort(x), expected, equal_nan=True))
+        for dtype in [mx.float32, mx.float16, mx.bfloat16]:
+            with self.subTest(dtype=dtype):
+                x = mx.array([3.0, mx.nan, 2.0, 0.0], dtype=dtype)
+                expected = mx.array([0.0, 2.0, 3.0, mx.nan], dtype=dtype)
+                self.assertTrue(mx.array_equal(mx.sort(x), expected, equal_nan=True))
+
         x = mx.array([3.0, mx.nan, 2.0, 0.0]) + 1j * mx.array([1.0] * 4)
+
+    def test_argsort_nan(self):
+        for dtype in [mx.float32, mx.float16, mx.bfloat16]:
+            with self.subTest(dtype=dtype):
+                x = mx.array([3.0, mx.nan, 2.0, 0.0], dtype=dtype)
+                expected = mx.array([0.0, 2.0, 3.0, mx.nan], dtype=dtype)
+                indices = mx.argsort(x)
+                sorted_x = mx.take(x, indices)
+                self.assertTrue(mx.array_equal(sorted_x, expected, equal_nan=True))
 
     def test_to_from_fp8(self):
         vals = mx.array(
