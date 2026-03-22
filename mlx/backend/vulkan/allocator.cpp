@@ -3,6 +3,7 @@
 #include "mlx/backend/vulkan/allocator.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -68,7 +69,8 @@ uint32_t find_memory_type_index(
     try {
       // Convert vk::MemoryPropertyFlags to VkMemoryPropertyFlags
       // This is safe since they're the same underlying type
-      VkMemoryPropertyFlags vk_flags = static_cast<VkMemoryPropertyFlags>(flags);
+      VkMemoryPropertyFlags vk_flags =
+          static_cast<VkMemoryPropertyFlags>(flags);
       return ctx.find_memory_type(type_filter, vk_flags);
     } catch (const std::runtime_error&) {
     }
@@ -131,6 +133,16 @@ void VulkanAllocator::clear_cache() {
   // No cache in Vulkan allocator yet.
 }
 
+bool VulkanAllocator::owns(Buffer buffer) const {
+  auto* vk_buffer = static_cast<VulkanBuffer*>(buffer.ptr());
+  if (vk_buffer == nullptr) {
+    return false;
+  }
+
+  std::unique_lock lk(mutex_);
+  return live_buffers_.contains(vk_buffer);
+}
+
 Buffer VulkanAllocator::malloc(size_t size) {
   if (size == 0) {
     return Buffer{nullptr};
@@ -151,14 +163,24 @@ Buffer VulkanAllocator::malloc(size_t size) {
 
   // Use C++ Vulkan API for buffer creation
   vk::BufferCreateInfo buffer_info(vk::BufferCreateFlags(), size);
-  buffer_info.usage = vk::BufferUsageFlagBits::eStorageBuffer | 
-                      vk::BufferUsageFlagBits::eTransferSrc | 
-                      vk::BufferUsageFlagBits::eTransferDst;
-  buffer_info.sharingMode = vk::SharingMode::eExclusive;
+  buffer_info.usage = vk::BufferUsageFlagBits::eStorageBuffer |
+      vk::BufferUsageFlagBits::eTransferSrc |
+      vk::BufferUsageFlagBits::eTransferDst;
+  std::array<uint32_t, 2> queue_family_indices = {
+      ctx.compute_queue_family_index(), ctx.transfer_queue_family_index()};
+  if (ctx.has_separate_transfer_queue() &&
+      ctx.compute_queue_family_index() != ctx.transfer_queue_family_index()) {
+    buffer_info.sharingMode = vk::SharingMode::eConcurrent;
+    buffer_info.queueFamilyIndexCount = 2;
+    buffer_info.pQueueFamilyIndices = queue_family_indices.data();
+  } else {
+    buffer_info.sharingMode = vk::SharingMode::eExclusive;
+  }
 
   vk::Buffer vk_buffer = vk_device.createBuffer(buffer_info);
 
-  vk::MemoryRequirements mem_requirements = vk_device.getBufferMemoryRequirements(vk_buffer);
+  vk::MemoryRequirements mem_requirements =
+      vk_device.getBufferMemoryRequirements(vk_buffer);
   const size_t allocation_size = static_cast<size_t>(mem_requirements.size);
 
   {
@@ -239,7 +261,7 @@ Buffer VulkanAllocator::malloc(size_t size) {
 void VulkanAllocator::free(Buffer buffer) {
   // Use C-style function to get raw device handle
   auto vk_device = VulkanContext::get().device();
-  
+
   auto* buf = static_cast<VulkanBuffer*>(buffer.ptr());
   if (buf == nullptr) {
     return;
@@ -281,6 +303,10 @@ void VulkanAllocator::release(Buffer) {
 VulkanAllocator& allocator() {
   static auto* allocator_ = new VulkanAllocator();
   return *allocator_;
+}
+
+bool is_vulkan_buffer(Buffer buffer) {
+  return allocator().owns(buffer);
 }
 
 } // namespace vulkan

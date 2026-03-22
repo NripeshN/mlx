@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <unordered_set>
 
@@ -15,6 +16,12 @@ namespace mlx::core::vulkan {
 using allocator::Buffer;
 
 struct VulkanBuffer {
+  enum class QueueAffinity : uint32_t {
+    None = 0,
+    Compute = 1,
+    Transfer = 2,
+  };
+
   void* mapped_ptr{nullptr};
   // Use C++ Vulkan API types
   vk::Buffer buffer;
@@ -22,10 +29,18 @@ struct VulkanBuffer {
   size_t size{0};
   size_t allocation_size{0};
   vk::MemoryPropertyFlags memory_flags{};
+  std::mutex queue_affinity_mutex;
+  vk::Semaphore last_semaphore;
+  uint64_t last_timeline_value{0};
+  QueueAffinity queue_affinity{QueueAffinity::None};
 
   // Keep vk::Buffer and vk::DeviceMemory accessible
-  operator vk::Buffer() const { return buffer; }
-  operator vk::DeviceMemory() const { return memory; }
+  operator vk::Buffer() const {
+    return buffer;
+  }
+  operator vk::DeviceMemory() const {
+    return memory;
+  }
 };
 
 class VulkanAllocator : public allocator::Allocator {
@@ -54,6 +69,7 @@ class VulkanAllocator : public allocator::Allocator {
   size_t get_memory_limit() const;
   size_t set_wired_limit(size_t limit);
   void clear_cache();
+  bool owns(Buffer buffer) const;
 
  private:
   VulkanAllocator();
@@ -74,5 +90,6 @@ class VulkanAllocator : public allocator::Allocator {
 };
 
 VulkanAllocator& allocator();
+bool is_vulkan_buffer(Buffer buffer);
 
 } // namespace mlx::core::vulkan

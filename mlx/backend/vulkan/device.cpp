@@ -432,8 +432,6 @@ struct StreamData {
   uint64_t next_epoch{1};
   std::atomic<uint64_t> next_timeline_value{0};
   bool recording_transfer{false};
-  uint64_t last_compute_timeline_value{0};
-  uint64_t last_transfer_timeline_value{0};
   uint32_t recorded_ops{0};
   std::vector<std::shared_ptr<array::Data>> recording_refs;
   std::unordered_set<const array::Data*> recording_ref_ids;
@@ -545,6 +543,12 @@ class VulkanDevice {
       throw_if_vk_error(
           wait_for_queue_idle_with_retry(VulkanContext::get().compute_queue()),
           "[vulkan::synchronize] Failed waiting for compute queue idle");
+      if (VulkanContext::get().has_separate_transfer_queue()) {
+        throw_if_vk_error(
+            wait_for_queue_idle_with_retry(
+                VulkanContext::get().transfer_queue()),
+            "[vulkan::synchronize] Failed waiting for transfer queue idle");
+      }
     }
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& [_, stream] : streams_) {
@@ -1036,6 +1040,23 @@ class VulkanDevice {
     return oss.str();
   }
 
+  static VulkanBuffer::QueueAffinity queue_affinity_for_submission(
+      bool submit_to_transfer_queue) {
+    return submit_to_transfer_queue ? VulkanBuffer::QueueAffinity::Transfer
+                                    : VulkanBuffer::QueueAffinity::Compute;
+  }
+
+  static VulkanBuffer* referenced_vulkan_buffer(
+      const std::shared_ptr<array::Data>& data) {
+    if (!data) {
+      return nullptr;
+    }
+    if (!mlx::core::vulkan::is_vulkan_buffer(data->buffer)) {
+      return nullptr;
+    }
+    return static_cast<VulkanBuffer*>(data->buffer.ptr());
+  }
+
   static std::vector<BufferAccessRange> make_access_ranges(
       const std::vector<array>& arrays) {
     std::vector<BufferAccessRange> ranges;
@@ -1322,18 +1343,25 @@ class VulkanDevice {
 
   ~VulkanDevice() {
     vk::Device device;
-    vk::Queue queue;
+    vk::Queue compute_queue;
+    vk::Queue transfer_queue;
+    bool has_transfer_queue = false;
     try {
       auto& ctx = VulkanContext::get();
       device = ctx.device();
-      queue = ctx.compute_queue();
+      compute_queue = ctx.compute_queue();
+      transfer_queue = ctx.transfer_queue();
+      has_transfer_queue = ctx.has_separate_transfer_queue();
     } catch (...) {
       return;
     }
 
-    if (queue) {
+    if (compute_queue) {
       std::lock_guard<std::mutex> queue_lock(queue_mutex_);
-      wait_for_queue_idle_with_retry(queue);
+      wait_for_queue_idle_with_retry(compute_queue);
+      if (has_transfer_queue && transfer_queue) {
+        wait_for_queue_idle_with_retry(transfer_queue);
+      }
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1421,17 +1449,8 @@ class VulkanDevice {
     auto command_pool = submit_to_transfer_queue
         ? resources->transfer_command_pool
         : resources->compute_command_pool;
-
-    const uint64_t prior_queue_timeline = submit_to_transfer_queue
-        ? stream->last_compute_timeline_value
-        : stream->last_transfer_timeline_value;
-    const uint64_t this_queue_timeline = submit_to_transfer_queue
-        ? stream->last_transfer_timeline_value
-        : stream->last_compute_timeline_value;
-    if (prior_queue_timeline > this_queue_timeline) {
-      wait_semaphores.push_back(
-          {stream->timeline_semaphore, prior_queue_timeline});
-    }
+    const auto queue_affinity =
+        queue_affinity_for_submission(submit_to_transfer_queue);
 
     auto fail_submit = [&](VkResult result, const std::string& context) {
       VkPhysicalDeviceProperties props{};
@@ -1525,6 +1544,40 @@ class VulkanDevice {
       wait_semaphore_values.push_back(val);
       wait_stage_masks.push_back(vk::PipelineStageFlagBits::eAllCommands);
     }
+
+    std::unordered_map<VkSemaphore, size_t> wait_index_by_handle;
+    wait_index_by_handle.reserve(wait_semaphore_handles.size());
+    for (size_t i = 0; i < wait_semaphore_handles.size(); ++i) {
+      wait_index_by_handle[static_cast<VkSemaphore>(
+          wait_semaphore_handles[i])] = i;
+    }
+
+    for (const auto& data : stream->recording_refs) {
+      auto* buffer = referenced_vulkan_buffer(data);
+      if (!buffer) {
+        continue;
+      }
+
+      std::lock_guard<std::mutex> affinity_lock(buffer->queue_affinity_mutex);
+      if (!buffer->last_semaphore || buffer->last_timeline_value == 0 ||
+          buffer->queue_affinity == VulkanBuffer::QueueAffinity::None ||
+          buffer->queue_affinity == queue_affinity) {
+        continue;
+      }
+
+      const auto handle = static_cast<VkSemaphore>(buffer->last_semaphore);
+      auto it = wait_index_by_handle.find(handle);
+      if (it == wait_index_by_handle.end()) {
+        wait_index_by_handle[handle] = wait_semaphore_handles.size();
+        wait_semaphore_handles.push_back(buffer->last_semaphore);
+        wait_semaphore_values.push_back(buffer->last_timeline_value);
+        wait_stage_masks.push_back(vk::PipelineStageFlagBits::eAllCommands);
+      } else {
+        wait_semaphore_values[it->second] = std::max(
+            wait_semaphore_values[it->second], buffer->last_timeline_value);
+      }
+    }
+
     for (auto& [sem, val] : signal_semaphores) {
       signal_semaphore_handles.push_back(sem);
       signal_semaphore_values.push_back(val);
@@ -1630,10 +1683,15 @@ class VulkanDevice {
     stream->in_flight_submissions.push_back(std::move(submission));
     stream->recording_transfer = false;
 
-    if (submit_to_transfer_queue) {
-      stream->last_transfer_timeline_value = timeline_value;
-    } else {
-      stream->last_compute_timeline_value = timeline_value;
+    for (const auto& data : stream->in_flight_submissions.back().refs) {
+      auto* buffer = referenced_vulkan_buffer(data);
+      if (!buffer) {
+        continue;
+      }
+      std::lock_guard<std::mutex> affinity_lock(buffer->queue_affinity_mutex);
+      buffer->last_semaphore = stream->timeline_semaphore;
+      buffer->last_timeline_value = timeline_value;
+      buffer->queue_affinity = queue_affinity;
     }
 
     if (trace_sync_enabled()) {
