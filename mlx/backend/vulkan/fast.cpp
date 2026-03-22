@@ -777,20 +777,14 @@ bool try_eval_flash_attention_vulkan(
     return x;
   };
 
-  auto debug_eval = [&](array& x, const char* label) {
-    trace_flash_attention_array(label, x);
-    eval(x);
-    trace_flash_attention_array(label, x);
-  };
-
   q = make_contiguous_zero_offset(q);
   k = make_contiguous_zero_offset(k);
   v = make_contiguous_zero_offset(v);
   k = cast_flash_attention_kv_to_f16(k, kFlashAttnKCastScratchLane, s);
   v = cast_flash_attention_kv_to_f16(v, kFlashAttnVCastScratchLane, s);
-  debug_eval(q, "q_ready");
-  debug_eval(k, "k_ready");
-  debug_eval(v, "v_ready");
+  trace_flash_attention_array("q_ready", q);
+  trace_flash_attention_array("k_ready", k);
+  trace_flash_attention_array("v_ready", v);
 
   if (q.dtype() != float32 || k.dtype() != float16 || v.dtype() != float16) {
     return false;
@@ -821,9 +815,15 @@ bool try_eval_flash_attention_vulkan(
     }
 
     array out_final = astype(out_transposed, out.dtype(), s);
-    debug_eval(out_final, "out_final");
+    trace_flash_attention_array("out_final", out_final);
     if (out.shape() == out_final.shape()) {
-      out.copy_shared_buffer(out_final);
+      auto data = out_final.data_shared_ptr();
+      if (data != nullptr && data->buffer.ptr() != nullptr) {
+        out.copy_shared_buffer(out_final);
+      } else {
+        copy_gpu(out_final, out, CopyType::General, s);
+        out.set_status(array::Status::evaluated);
+      }
     } else {
       copy_gpu(out_final, out, CopyType::General, s);
       out.set_status(array::Status::evaluated);

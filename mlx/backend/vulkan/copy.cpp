@@ -291,8 +291,11 @@ bool try_host_vector_cast_copy(
     int64_t in_offset,
     int64_t out_offset,
     const mlx::core::Stream& s) {
-  auto* in_buf = static_cast<mlx::core::vulkan::VulkanBuffer*>(
-      const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
+  const bool in_is_vulkan = mlx::core::vulkan::is_vulkan_buffer(in.buffer());
+  auto* in_buf = in_is_vulkan
+      ? static_cast<mlx::core::vulkan::VulkanBuffer*>(
+            const_cast<void*>(static_cast<const void*>(in.buffer().ptr())))
+      : nullptr;
   auto* out_buf =
       static_cast<mlx::core::vulkan::VulkanBuffer*>(out.buffer().ptr());
 
@@ -318,6 +321,13 @@ bool try_host_vector_cast_copy(
     mlx::core::vulkan::retain_array_for_stream(s, in);
     mlx::core::vulkan::retain_array_for_stream(s, out);
   };
+
+  if (!in_is_vulkan) {
+    auto* src_ptr = static_cast<const char*>(in.data<void>()) +
+        in_offset * size_of(in.dtype());
+    convert_and_store(src_ptr);
+    return true;
+  }
 
   if (in_buf->mapped_ptr != nullptr) {
     auto* src_ptr = static_cast<const char*>(in_buf->mapped_ptr) +
@@ -727,6 +737,13 @@ void copy_gpu_inplace(
     materialized_in.emplace(in);
     materialized_in->eval();
     source = &*materialized_in;
+  } else {
+    auto data = in.data_shared_ptr();
+    if (data == nullptr || data->buffer.ptr() == nullptr) {
+      materialized_in.emplace(in);
+      materialized_in->wait();
+      source = &*materialized_in;
+    }
   }
 
   auto in_view = make_copy_view(
@@ -855,7 +872,30 @@ void copy_gpu_inplace(
     throw std::runtime_error(oss.str());
   }
 
-  const bool same_buffer = source->buffer().ptr() == out.buffer().ptr();
+  const bool source_is_vulkan = source->data_shared_ptr() != nullptr &&
+      mlx::core::vulkan::is_vulkan_buffer(source->buffer());
+  const bool out_is_vulkan = mlx::core::vulkan::is_vulkan_buffer(out.buffer());
+
+  if (!source_is_vulkan && out_is_vulkan && host_contiguous_copy &&
+      same_dtype) {
+    auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
+    const auto* src_ptr =
+        static_cast<const char*>(source->data<void>()) + in_view.offset();
+    if (out_buf->mapped_ptr != nullptr) {
+      auto* dst_ptr =
+          static_cast<char*>(out_buf->mapped_ptr) + out_view.offset();
+      std::memcpy(dst_ptr, src_ptr, in_view.nbytes());
+    } else {
+      vulkan::enqueue_owned_staging_upload(
+          s, src_ptr, in_view.nbytes(), out_buf->buffer, out_view.offset());
+      vulkan::retain_array_for_stream(s, *source);
+      vulkan::retain_array_for_stream(s, out);
+    }
+    return;
+  }
+
+  const bool same_buffer = source_is_vulkan && out_is_vulkan &&
+      source->buffer().ptr() == out.buffer().ptr();
   if (segmented_buffer_copy && same_buffer) {
     array staged(out_view.shape(), out_view.dtype(), nullptr, {});
     staged.set_data(mlx::core::allocator::malloc(staged.nbytes()));

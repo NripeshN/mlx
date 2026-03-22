@@ -211,7 +211,32 @@ bool is_row_contiguous_zero_offset(const array& arr) {
 }
 
 bool has_vulkan_buffer(const array& arr) {
-  return arr.buffer().ptr() != nullptr;
+  auto data = arr.data_shared_ptr();
+  return data != nullptr && data->buffer.ptr() != nullptr;
+}
+
+bool ensure_vulkan_buffer(array& arr, Stream s) {
+  if (has_vulkan_buffer(arr)) {
+    return true;
+  }
+
+  if (arr.has_primitive()) {
+    arr.eval();
+  } else {
+    arr.wait();
+  }
+
+  if (has_vulkan_buffer(arr)) {
+    return true;
+  }
+
+  auto data = arr.data_shared_ptr();
+  if (data == nullptr || data->buffer.ptr() == nullptr) {
+    return false;
+  }
+
+  arr = contiguous_copy_gpu(arr, s);
+  return has_vulkan_buffer(arr);
 }
 
 void zero_initialize_output(array& out, Stream s) {
@@ -411,12 +436,15 @@ bool try_eval_mul_mm_vulkan(
   array out_t = vulkan::acquire_scratch_array(
       s, kMulMmOutScratchLane, out_t_shape, float32);
 
-  if (!has_vulkan_buffer(a) || !has_vulkan_buffer(b_t) ||
-      !has_vulkan_buffer(out_t)) {
+  if (!ensure_vulkan_buffer(a, s) || !ensure_vulkan_buffer(b_t, s) ||
+      !ensure_vulkan_buffer(out_t, s)) {
     if (matmul_debug_enabled()) {
       std::cerr << "[vulkan::mul_mm] missing buffer"
-                << " a=" << has_vulkan_buffer(a)
+                << " a=" << has_vulkan_buffer(a) << " a_status=" << a.status()
+                << " a_has_primitive=" << a.has_primitive()
                 << " b_t=" << has_vulkan_buffer(b_t)
+                << " b_t_status=" << b_t.status()
+                << " b_t_has_primitive=" << b_t.has_primitive()
                 << " out_t=" << has_vulkan_buffer(out_t) << "\n";
     }
     return false;
