@@ -27,6 +27,8 @@ class ScopedSyncLabel {
 // Command buffer management - Use C++ API types
 vk::CommandBuffer begin_command_recording(int stream_index);
 void end_command_recording(int stream_index);
+vk::CommandBuffer begin_transfer_command_recording(int stream_index);
+void end_transfer_command_recording(int stream_index);
 bool deferred_submission_active();
 void retain_array_for_stream(const Stream& s, const array& arr);
 void retain_shared_for_stream(const Stream& s, std::shared_ptr<void> resource);

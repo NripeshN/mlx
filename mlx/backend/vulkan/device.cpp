@@ -431,6 +431,9 @@ struct StreamData {
   uint64_t recording_epoch{0};
   uint64_t next_epoch{1};
   std::atomic<uint64_t> next_timeline_value{0};
+  bool recording_transfer{false};
+  uint64_t last_compute_timeline_value{0};
+  uint64_t last_transfer_timeline_value{0};
   uint32_t recorded_ops{0};
   std::vector<std::shared_ptr<array::Data>> recording_refs;
   std::unordered_set<const array::Data*> recording_ref_ids;
@@ -547,6 +550,7 @@ class VulkanDevice {
     for (auto& [_, stream] : streams_) {
       retire_submissions(stream.get(), true);
       stream->recording = false;
+      stream->recording_transfer = false;
       stream->recording_epoch = 0;
       stream->recorded_ops = 0;
       stream->recording_refs.clear();
@@ -880,15 +884,39 @@ class VulkanDevice {
   VkCommandBuffer begin_recording(int stream_index) {
     auto* stream = get_stream(stream_index);
 
+    return begin_recording(stream, false);
+  }
+
+  VkCommandBuffer begin_transfer_recording(int stream_index) {
+    auto* stream = get_stream(stream_index);
+
+    return begin_recording(stream, true);
+  }
+
+  VkCommandBuffer begin_recording(StreamData* stream, bool transfer) {
+    auto stream_index = stream->stream_index;
+
+    if (stream->recording && stream->recording_transfer != transfer) {
+      submit_commands(
+          stream,
+          transfer ? "queue switch to transfer" : "queue switch to compute",
+          {},
+          {},
+          stream->recording_transfer);
+    }
+
     if (!stream->recording) {
       retire_submissions(stream, false);
 
       auto resources = acquire_submission_resources(stream);
       auto vk_device = VulkanContext::get().device();
+      auto command_pool = transfer ? resources->transfer_command_pool
+                                   : resources->compute_command_pool;
+      auto command_buffer = transfer ? resources->transfer_command_buffer
+                                     : resources->compute_command_buffer;
 
       // Reset command pool to allow reuse
-      vk_device.resetCommandPool(
-          resources->compute_command_pool, vk::CommandPoolResetFlags());
+      vk_device.resetCommandPool(command_pool, vk::CommandPoolResetFlags());
 
       // Begin recording
       VkCommandBufferBeginInfo beginInfo{};
@@ -896,10 +924,11 @@ class VulkanDevice {
       beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
       throw_if_vk_error(
-          vkBeginCommandBuffer(resources->compute_command_buffer, &beginInfo),
+          vkBeginCommandBuffer(command_buffer, &beginInfo),
           "[vulkan::begin_recording] Failed beginning command buffer");
       stream->recording_resources = std::move(resources);
       stream->recording = true;
+      stream->recording_transfer = transfer;
       stream->recording_epoch = stream->next_epoch++;
       stream->recorded_ops = 0;
       stream->recording_refs.clear();
@@ -915,6 +944,7 @@ class VulkanDevice {
       if (trace_sync_enabled()) {
         std::ostringstream oss;
         oss << "begin_recording(stream=" << stream_index
+            << ", queue=" << (transfer ? "transfer" : "compute")
             << ") rec_epoch=" << stream->recording_epoch
             << " inflight=" << stream->in_flight_submissions.size()
             << " next_epoch=" << stream->next_epoch;
@@ -922,27 +952,49 @@ class VulkanDevice {
       }
     }
 
-    return stream->recording_resources->compute_command_buffer;
+    return stream->recording_transfer
+        ? stream->recording_resources->transfer_command_buffer
+        : stream->recording_resources->compute_command_buffer;
   }
 
   void end_recording(int stream_index) {
     auto* stream = get_stream(stream_index);
+    end_recording(stream, false);
+  }
+
+  void end_transfer_recording(int stream_index) {
+    auto* stream = get_stream(stream_index);
+    end_recording(stream, true);
+  }
+
+  void end_recording(StreamData* stream, bool transfer) {
+    auto stream_index = stream->stream_index;
     if (!stream->recording) {
       return;
+    }
+    if (stream->recording_transfer != transfer) {
+      throw std::runtime_error(
+          "[vulkan::end_recording] Queue mismatch while ending recording.");
     }
 
     if (trace_sync_enabled()) {
       std::ostringstream oss;
       oss << "end_recording(stream=" << stream_index
+          << ", queue=" << (transfer ? "transfer" : "compute")
           << ") rec_epoch=" << stream->recording_epoch
           << " rec_ops=" << stream->recorded_ops
           << " deferred=" << deferred_submission_enabled();
       trace_sync(oss.str());
     }
 
-    if (!deferred_submission_enabled()) {
+    if (transfer || !deferred_submission_enabled()) {
       trace_sync("end_recording action=submit immediate");
-      submit_commands(stream, "immediate");
+      submit_commands(
+          stream,
+          transfer ? "immediate transfer" : "immediate",
+          {},
+          {},
+          transfer);
       return;
     }
 
@@ -1363,6 +1415,23 @@ class VulkanDevice {
     vk::Queue queue = submit_to_transfer_queue
         ? VulkanContext::get().transfer_queue()
         : VulkanContext::get().compute_queue();
+    auto command_buffer = submit_to_transfer_queue
+        ? resources->transfer_command_buffer
+        : resources->compute_command_buffer;
+    auto command_pool = submit_to_transfer_queue
+        ? resources->transfer_command_pool
+        : resources->compute_command_pool;
+
+    const uint64_t prior_queue_timeline = submit_to_transfer_queue
+        ? stream->last_compute_timeline_value
+        : stream->last_transfer_timeline_value;
+    const uint64_t this_queue_timeline = submit_to_transfer_queue
+        ? stream->last_transfer_timeline_value
+        : stream->last_compute_timeline_value;
+    if (prior_queue_timeline > this_queue_timeline) {
+      wait_semaphores.push_back(
+          {stream->timeline_semaphore, prior_queue_timeline});
+    }
 
     auto fail_submit = [&](VkResult result, const std::string& context) {
       VkPhysicalDeviceProperties props{};
@@ -1389,9 +1458,8 @@ class VulkanDevice {
           stream->stream_index, submit_rec_epoch);
 
       VkResult reset_pool_result = VK_SUCCESS;
-      if (resources && resources->compute_command_pool) {
-        vk_device.resetCommandPool(
-            resources->compute_command_pool, vk::CommandPoolResetFlags());
+      if (resources && command_pool) {
+        vk_device.resetCommandPool(command_pool, vk::CommandPoolResetFlags());
         reset_pool_result = VK_SUCCESS;
       }
       if (resources) {
@@ -1432,7 +1500,7 @@ class VulkanDevice {
 
     VkResult result;
     try {
-      resources->compute_command_buffer.end();
+      command_buffer.end();
       result = VK_SUCCESS;
     } catch (const vk::SystemError& e) {
       result = static_cast<VkResult>(e.code().value());
@@ -1479,7 +1547,7 @@ class VulkanDevice {
     submitInfo.pWaitSemaphores = wait_semaphore_handles.data();
     submitInfo.pWaitDstStageMask = wait_stage_masks.data();
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &resources->compute_command_buffer;
+    submitInfo.pCommandBuffers = &command_buffer;
     submitInfo.signalSemaphoreCount =
         static_cast<uint32_t>(signal_semaphore_handles.size());
     submitInfo.pSignalSemaphores = signal_semaphore_handles.data();
@@ -1560,6 +1628,13 @@ class VulkanDevice {
     clear_scratch_barriers(stream);
     stream->recent_primitives.clear();
     stream->in_flight_submissions.push_back(std::move(submission));
+    stream->recording_transfer = false;
+
+    if (submit_to_transfer_queue) {
+      stream->last_transfer_timeline_value = timeline_value;
+    } else {
+      stream->last_compute_timeline_value = timeline_value;
+    }
 
     if (trace_sync_enabled()) {
       std::ostringstream oss;
@@ -1614,6 +1689,14 @@ void end_command_recording(int stream_index) {
   VulkanDevice::get().end_recording(stream_index);
 }
 
+vk::CommandBuffer begin_transfer_command_recording(int stream_index) {
+  return VulkanDevice::get().begin_transfer_recording(stream_index);
+}
+
+void end_transfer_command_recording(int stream_index) {
+  VulkanDevice::get().end_transfer_recording(stream_index);
+}
+
 bool deferred_submission_active() {
   return deferred_submission_enabled();
 }
@@ -1657,7 +1740,7 @@ void enqueue_owned_staging_upload(
       src,
       static_cast<size_t>(size));
 
-  vk::CommandBuffer command_buffer = begin_command_recording(s.index);
+  vk::CommandBuffer command_buffer = begin_transfer_command_recording(s.index);
   vk::BufferCopy copy_region;
   copy_region.srcOffset = 0;
   copy_region.dstOffset = static_cast<VkDeviceSize>(dst_offset);
@@ -1665,7 +1748,7 @@ void enqueue_owned_staging_upload(
   command_buffer.copyBuffer(staging_buffer->buffer, dst_buffer, {copy_region});
 
   retain_shared_for_stream(s, std::static_pointer_cast<void>(staging));
-  end_command_recording(s.index);
+  end_transfer_command_recording(s.index);
 }
 
 void enqueue_owned_staging_readback(
@@ -1690,7 +1773,7 @@ void enqueue_owned_staging_readback(
   auto staging = make_owned_staging_allocation(size);
   auto* staging_buffer = get_vulkan_buffer(staging);
 
-  vk::CommandBuffer command_buffer = begin_command_recording(s.index);
+  vk::CommandBuffer command_buffer = begin_transfer_command_recording(s.index);
   vk::BufferCopy copy_region;
   copy_region.srcOffset = static_cast<VkDeviceSize>(src_offset);
   copy_region.dstOffset = 0;
@@ -1706,7 +1789,7 @@ void enqueue_owned_staging_readback(
         auto* completed_buffer = get_vulkan_buffer(staging);
         completion(completed_buffer->mapped_ptr, size);
       });
-  end_command_recording(s.index);
+  end_transfer_command_recording(s.index);
 }
 
 uint64_t descriptor_epoch_for_stream(const Stream& s) {

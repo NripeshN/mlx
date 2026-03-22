@@ -780,14 +780,14 @@ void copy_gpu_inplace(
       const bool can_use_fill_buffer =
           scalar_is_zero && (out.offset() % 4 == 0) && (out.nbytes() % 4 == 0);
       if (can_use_fill_buffer) {
-        auto cmd_buffer = vulkan::begin_command_recording(s.index);
+        auto cmd_buffer = vulkan::begin_transfer_command_recording(s.index);
         cmd_buffer.fillBuffer(
             out_buf->buffer,
             static_cast<VkDeviceSize>(out.offset()),
             static_cast<VkDeviceSize>(out.nbytes()),
             0u);
         vulkan::retain_array_for_stream(s, out);
-        vulkan::end_command_recording(s.index);
+        vulkan::end_transfer_command_recording(s.index);
       } else {
         std::vector<char> host_fill(out.nbytes());
         for (size_t offset = 0; offset < host_fill.size();
@@ -874,7 +874,8 @@ void copy_gpu_inplace(
     return;
   }
 
-  vk::CommandBuffer cmd_buffer = vulkan::begin_command_recording(s.index);
+  vk::CommandBuffer cmd_buffer =
+      vulkan::begin_transfer_command_recording(s.index);
 
   // Get buffer handles
   auto* in_buf = static_cast<vulkan::VulkanBuffer*>(
@@ -907,7 +908,7 @@ void copy_gpu_inplace(
   } else if (segmented_buffer_copy) {
     const auto copy_regions = make_strided_copy_regions(in_view, out_view);
     if (copy_regions.empty()) {
-      vulkan::end_command_recording(s.index);
+      vulkan::end_transfer_command_recording(s.index);
       throw std::runtime_error(
           "Copy operation failed on Vulkan: unsupported large-offset strided copy.");
     }
@@ -940,7 +941,7 @@ void copy_gpu_inplace(
 
       vulkan::dispatch_unary_op(in_view, out_view, *shader_id, cmd_buffer, s);
     } catch (const std::runtime_error& e) {
-      vulkan::end_command_recording(s.index);
+      vulkan::end_transfer_command_recording(s.index);
       throw std::runtime_error(
           std::string("Copy operation failed on Vulkan: ") + e.what());
     }
@@ -948,7 +949,7 @@ void copy_gpu_inplace(
     throw std::runtime_error("Unsupported Vulkan copy type.");
   }
 
-  vulkan::end_command_recording(s.index);
+  vulkan::end_transfer_command_recording(s.index);
 }
 
 // Note: The simpler overload copy_gpu_inplace(in, out, ctype, s) is defined in
