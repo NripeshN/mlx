@@ -4,6 +4,7 @@
 
 #include <vulkan/vulkan.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -345,8 +346,10 @@ struct BufferAccessRange {
 };
 
 struct SubmissionResources {
-  vk::CommandPool command_pool;
-  vk::CommandBuffer command_buffer;
+  vk::CommandPool compute_command_pool;
+  vk::CommandBuffer compute_command_buffer;
+  vk::CommandPool transfer_command_pool;
+  vk::CommandBuffer transfer_command_buffer;
   vk::Fence fence;
 };
 
@@ -354,6 +357,8 @@ struct SubmissionRecord {
   std::unique_ptr<SubmissionResources> resources;
   uint64_t epoch{0};
   uint32_t recorded_ops{0};
+  uint64_t timeline_value{0};
+  bool submitted_to_transfer_queue{false};
   std::vector<std::shared_ptr<array::Data>> refs;
   std::unordered_set<const array::Data*> ref_ids;
   std::vector<std::shared_ptr<void>> keepalive_resources;
@@ -417,6 +422,7 @@ array make_scratch_view(const array& owner, Shape shape, Dtype dtype) {
 }
 
 struct StreamData {
+  vk::Semaphore timeline_semaphore;
   std::unique_ptr<SubmissionResources> recording_resources;
   std::vector<std::unique_ptr<SubmissionResources>> available_resources;
   std::deque<SubmissionRecord> in_flight_submissions;
@@ -424,6 +430,7 @@ struct StreamData {
   int stream_index{0};
   uint64_t recording_epoch{0};
   uint64_t next_epoch{1};
+  std::atomic<uint64_t> next_timeline_value{0};
   uint32_t recorded_ops{0};
   std::vector<std::shared_ptr<array::Data>> recording_refs;
   std::unordered_set<const array::Data*> recording_ref_ids;
@@ -638,7 +645,8 @@ class VulkanDevice {
       trace_sync(
           "scratch barrier lane='" + lane +
           "' bytes=" + std::to_string(slot.bytes));
-      insert_memory_barrier(stream->recording_resources->command_buffer);
+      insert_memory_barrier(
+          stream->recording_resources->compute_command_buffer);
       stream->unsynced_reads.clear();
       stream->unsynced_writes.clear();
       slot.needs_barrier = false;
@@ -841,7 +849,7 @@ class VulkanDevice {
     trace_sync(
         "hazard boundary action=barrier reason=overlapping-buffer-range");
     trace_sync("barrier action=recording-tail reason=deferred-op-boundary");
-    insert_memory_barrier(stream->recording_resources->command_buffer);
+    insert_memory_barrier(stream->recording_resources->compute_command_buffer);
     stream->unsynced_reads.clear();
     stream->unsynced_writes.clear();
   }
@@ -880,7 +888,7 @@ class VulkanDevice {
 
       // Reset command pool to allow reuse
       vk_device.resetCommandPool(
-          resources->command_pool, vk::CommandPoolResetFlags());
+          resources->compute_command_pool, vk::CommandPoolResetFlags());
 
       // Begin recording
       VkCommandBufferBeginInfo beginInfo{};
@@ -888,7 +896,7 @@ class VulkanDevice {
       beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
       throw_if_vk_error(
-          vkBeginCommandBuffer(resources->command_buffer, &beginInfo),
+          vkBeginCommandBuffer(resources->compute_command_buffer, &beginInfo),
           "[vulkan::begin_recording] Failed beginning command buffer");
       stream->recording_resources = std::move(resources);
       stream->recording = true;
@@ -914,7 +922,7 @@ class VulkanDevice {
       }
     }
 
-    return stream->recording_resources->command_buffer;
+    return stream->recording_resources->compute_command_buffer;
   }
 
   void end_recording(int stream_index) {
@@ -960,7 +968,8 @@ class VulkanDevice {
 
     if (barrier_between_deferred_ops()) {
       trace_sync("barrier action=recording-tail reason=deferred-op-boundary");
-      insert_memory_barrier(stream->recording_resources->command_buffer);
+      insert_memory_barrier(
+          stream->recording_resources->compute_command_buffer);
     }
   }
 
@@ -1116,19 +1125,42 @@ class VulkanDevice {
 
   std::unique_ptr<SubmissionResources> create_submission_resources() {
     auto vk_device = VulkanContext::get().device();
-    uint32_t queue_family = VulkanContext::get().compute_queue_family_index();
+    uint32_t compute_queue_family =
+        VulkanContext::get().compute_queue_family_index();
+    uint32_t transfer_queue_family =
+        VulkanContext::get().transfer_queue_family_index();
+    bool has_separate_transfer =
+        VulkanContext::get().has_separate_transfer_queue();
 
     auto resources = std::make_unique<SubmissionResources>();
 
-    vk::CommandPoolCreateInfo pool_info(
-        vk::CommandPoolCreateFlagBits::eResetCommandBuffer, queue_family);
+    vk::CommandPoolCreateInfo compute_pool_info(
+        vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+        compute_queue_family);
+    resources->compute_command_pool =
+        vk_device.createCommandPool(compute_pool_info);
+    vk::CommandBufferAllocateInfo compute_alloc_info(
+        resources->compute_command_pool, vk::CommandBufferLevel::ePrimary, 1);
+    resources->compute_command_buffer =
+        vk_device.allocateCommandBuffers(compute_alloc_info)[0];
 
-    resources->command_pool = vk_device.createCommandPool(pool_info);
-
-    vk::CommandBufferAllocateInfo alloc_info(
-        resources->command_pool, vk::CommandBufferLevel::ePrimary, 1);
-
-    resources->command_buffer = vk_device.allocateCommandBuffers(alloc_info)[0];
+    if (has_separate_transfer &&
+        compute_queue_family != transfer_queue_family) {
+      vk::CommandPoolCreateInfo transfer_pool_info(
+          vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+          transfer_queue_family);
+      resources->transfer_command_pool =
+          vk_device.createCommandPool(transfer_pool_info);
+      vk::CommandBufferAllocateInfo transfer_alloc_info(
+          resources->transfer_command_pool,
+          vk::CommandBufferLevel::ePrimary,
+          1);
+      resources->transfer_command_buffer =
+          vk_device.allocateCommandBuffers(transfer_alloc_info)[0];
+    } else {
+      resources->transfer_command_pool = resources->compute_command_pool;
+      resources->transfer_command_buffer = resources->compute_command_buffer;
+    }
 
     vk::FenceCreateInfo fence_info;
     resources->fence = vk_device.createFence(fence_info);
@@ -1143,15 +1175,23 @@ class VulkanDevice {
       return;
     }
 
-    if (resources->command_buffer && resources->command_pool) {
+    if (resources->compute_command_buffer && resources->compute_command_pool) {
       device.freeCommandBuffers(
-          resources->command_pool, {resources->command_buffer});
+          resources->compute_command_pool, {resources->compute_command_buffer});
+    }
+    if (resources->transfer_command_buffer &&
+        resources->transfer_command_pool &&
+        resources->transfer_command_pool != resources->compute_command_pool) {
+      device.freeCommandBuffers(
+          resources->transfer_command_pool,
+          {resources->transfer_command_buffer});
+      device.destroyCommandPool(resources->transfer_command_pool);
     }
     if (resources->fence) {
       device.destroyFence(resources->fence);
     }
-    if (resources->command_pool) {
-      device.destroyCommandPool(resources->command_pool);
+    if (resources->compute_command_pool) {
+      device.destroyCommandPool(resources->compute_command_pool);
     }
     resources.reset();
   }
@@ -1168,31 +1208,44 @@ class VulkanDevice {
 
   void retire_submissions(StreamData* stream, bool wait_all) {
     auto vk_device = VulkanContext::get().device();
+    auto timeline_semaphore = stream->timeline_semaphore;
 
     while (!stream->in_flight_submissions.empty()) {
       auto& submission = stream->in_flight_submissions.front();
-      VkResult status = VK_SUCCESS;
+
       if (wait_all) {
         if (trace_sync_enabled()) {
           std::ostringstream oss;
           oss << "retire wait stream=" << stream->stream_index
-              << " epoch=" << submission.epoch << " reason='"
+              << " epoch=" << submission.epoch
+              << " timeline_value=" << submission.timeline_value << " reason='"
               << submission.submit_reason << "'";
           trace_sync(oss.str());
         }
-        status = static_cast<VkResult>(vk_device.waitForFences(
-            {submission.resources->fence}, VK_TRUE, UINT64_MAX));
+
+        vk::SemaphoreWaitInfo wait_info;
+        wait_info.semaphoreCount = 1;
+        wait_info.pSemaphores = &timeline_semaphore;
+        wait_info.pValues = &submission.timeline_value;
+
+        auto result = vk_device.waitSemaphores(wait_info, UINT64_MAX);
+        if (result != vk::Result::eSuccess) {
+          throw_if_vk_error(
+              static_cast<VkResult>(result),
+              "[vulkan::retire_submissions] Failed waiting for timeline");
+        }
       } else {
-        status = static_cast<VkResult>(
-            vk_device.getFenceStatus(submission.resources->fence));
-        if (status == VK_NOT_READY) {
+        uint64_t current_value = 0;
+        auto result = vk_device.getSemaphoreCounterValue(
+            timeline_semaphore, &current_value);
+        if (result != vk::Result::eSuccess) {
+          throw_if_vk_error(
+              static_cast<VkResult>(result),
+              "[vulkan::retire_submissions] Failed querying timeline");
+        }
+        if (current_value < submission.timeline_value) {
           break;
         }
-      }
-
-      if (status != VK_SUCCESS) {
-        throw_if_vk_error(
-            status, "[vulkan::retire_submissions] Failed waiting for fence");
       }
 
       SubmissionRecord completed = std::move(submission);
@@ -1216,8 +1269,8 @@ class VulkanDevice {
   }
 
   ~VulkanDevice() {
-    VkDevice device = VK_NULL_HANDLE;
-    VkQueue queue = VK_NULL_HANDLE;
+    vk::Device device;
+    vk::Queue queue;
     try {
       auto& ctx = VulkanContext::get();
       device = ctx.device();
@@ -1226,7 +1279,7 @@ class VulkanDevice {
       return;
     }
 
-    if (queue != VK_NULL_HANDLE) {
+    if (queue) {
       std::lock_guard<std::mutex> queue_lock(queue_mutex_);
       wait_for_queue_idle_with_retry(queue);
     }
@@ -1242,6 +1295,10 @@ class VulkanDevice {
         destroy_submission_resources(device, submission.resources);
       }
       stream->in_flight_submissions.clear();
+      if (stream->timeline_semaphore) {
+        device.destroySemaphore(stream->timeline_semaphore);
+        stream->timeline_semaphore = nullptr;
+      }
     }
   }
 
@@ -1249,10 +1306,25 @@ class VulkanDevice {
     auto stream = std::make_unique<StreamData>();
     stream->stream_index = index;
 
+    vk::SemaphoreTypeCreateInfo timeline_ci;
+    timeline_ci.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+    timeline_ci.semaphoreType = vk::SemaphoreType::eTimeline;
+    timeline_ci.pNext = nullptr;
+
+    vk::SemaphoreCreateInfo ci;
+    ci.pNext = &timeline_ci;
+    stream->timeline_semaphore =
+        VulkanContext::get().device().createSemaphore(ci);
+
     return stream;
   }
 
-  void submit_commands(StreamData* stream, std::string submit_reason) {
+  void submit_commands(
+      StreamData* stream,
+      std::string submit_reason,
+      std::vector<std::pair<vk::Semaphore, uint64_t>> wait_semaphores = {},
+      std::vector<std::pair<vk::Semaphore, uint64_t>> signal_semaphores = {},
+      bool submit_to_transfer_queue = false) {
     if (!stream->recording) {
       return;
     }
@@ -1265,7 +1337,6 @@ class VulkanDevice {
     const size_t submit_unsynced_writes = stream->unsynced_writes.size();
     int last_queue_submit_retry = -1;
     VkResult end_cmd_result = VK_SUCCESS;
-    VkResult reset_fence_result = VK_SUCCESS;
     VkResult last_queue_submit_result = VK_SUCCESS;
 
     if (trace_sync_enabled()) {
@@ -1289,12 +1360,11 @@ class VulkanDevice {
     }
 
     auto vk_device = VulkanContext::get().device();
-    vk::Queue queue = VulkanContext::get().compute_queue();
+    vk::Queue queue = submit_to_transfer_queue
+        ? VulkanContext::get().transfer_queue()
+        : VulkanContext::get().compute_queue();
 
     auto fail_submit = [&](VkResult result, const std::string& context) {
-      const VkResult fence_status = resources && resources->fence
-          ? static_cast<VkResult>(vk_device.getFenceStatus(resources->fence))
-          : VK_SUCCESS;
       VkPhysicalDeviceProperties props{};
       vkGetPhysicalDeviceProperties(
           VulkanContext::get().physical_device(), &props);
@@ -1319,9 +1389,9 @@ class VulkanDevice {
           stream->stream_index, submit_rec_epoch);
 
       VkResult reset_pool_result = VK_SUCCESS;
-      if (resources && resources->command_pool) {
+      if (resources && resources->compute_command_pool) {
         vk_device.resetCommandPool(
-            resources->command_pool, vk::CommandPoolResetFlags());
+            resources->compute_command_pool, vk::CommandPoolResetFlags());
         reset_pool_result = VK_SUCCESS;
       }
       if (resources) {
@@ -1335,9 +1405,7 @@ class VulkanDevice {
               << " recording_refs=" << submit_recording_refs
               << " unsynced_reads=" << submit_unsynced_reads
               << " unsynced_writes=" << submit_unsynced_writes
-              << " fence_status=" << format_vk_result(fence_status)
               << " end_cmd_result=" << format_vk_result(end_cmd_result)
-              << " reset_fence_result=" << format_vk_result(reset_fence_result)
               << " last_submit_retry=" << last_queue_submit_retry
               << " last_submit_result="
               << format_vk_result(last_queue_submit_result)
@@ -1364,7 +1432,7 @@ class VulkanDevice {
 
     VkResult result;
     try {
-      resources->command_buffer.end();
+      resources->compute_command_buffer.end();
       result = VK_SUCCESS;
     } catch (const vk::SystemError& e) {
       result = static_cast<VkResult>(e.code().value());
@@ -1376,22 +1444,46 @@ class VulkanDevice {
     }
     trace_sync("submit end_command_buffer success");
 
-    vk::SubmitInfo submitInfo;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &resources->command_buffer;
+    uint64_t timeline_value = stream->next_timeline_value.fetch_add(1) + 1;
 
-    try {
-      vk_device.resetFences({resources->fence});
-      result = VK_SUCCESS;
-    } catch (const vk::SystemError& e) {
-      result = static_cast<VkResult>(e.code().value());
+    std::vector<vk::Semaphore> wait_semaphore_handles;
+    std::vector<uint64_t> wait_semaphore_values;
+    std::vector<vk::PipelineStageFlags> wait_stage_masks;
+    std::vector<vk::Semaphore> signal_semaphore_handles;
+    std::vector<uint64_t> signal_semaphore_values;
+
+    for (auto& [sem, val] : wait_semaphores) {
+      wait_semaphore_handles.push_back(sem);
+      wait_semaphore_values.push_back(val);
+      wait_stage_masks.push_back(vk::PipelineStageFlagBits::eAllCommands);
     }
-    reset_fence_result = result;
-    if (result != VK_SUCCESS) {
-      fail_submit(
-          result, "[vulkan::submit_commands] Failed resetting stream fence");
+    for (auto& [sem, val] : signal_semaphores) {
+      signal_semaphore_handles.push_back(sem);
+      signal_semaphore_values.push_back(val);
     }
-    trace_sync("submit reset_fence success");
+
+    signal_semaphore_handles.push_back(stream->timeline_semaphore);
+    signal_semaphore_values.push_back(timeline_value);
+
+    vk::TimelineSemaphoreSubmitInfo timeline_info;
+    timeline_info.waitSemaphoreValueCount =
+        static_cast<uint32_t>(wait_semaphore_values.size());
+    timeline_info.pWaitSemaphoreValues = wait_semaphore_values.data();
+    timeline_info.signalSemaphoreValueCount =
+        static_cast<uint32_t>(signal_semaphore_values.size());
+    timeline_info.pSignalSemaphoreValues = signal_semaphore_values.data();
+
+    vk::SubmitInfo submitInfo;
+    submitInfo.waitSemaphoreCount =
+        static_cast<uint32_t>(wait_semaphore_handles.size());
+    submitInfo.pWaitSemaphores = wait_semaphore_handles.data();
+    submitInfo.pWaitDstStageMask = wait_stage_masks.data();
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &resources->compute_command_buffer;
+    submitInfo.signalSemaphoreCount =
+        static_cast<uint32_t>(signal_semaphore_handles.size());
+    submitInfo.pSignalSemaphores = signal_semaphore_handles.data();
+    submitInfo.setPNext(&timeline_info);
 
     constexpr int kSubmitRetryCount = 32;
     {
@@ -1399,7 +1491,7 @@ class VulkanDevice {
       for (int retry = 0; retry < kSubmitRetryCount; ++retry) {
         last_queue_submit_retry = retry;
         try {
-          queue.submit({submitInfo}, resources->fence);
+          queue.submit({submitInfo}, vk::Fence());
           result = VK_SUCCESS;
         } catch (const vk::SystemError& e) {
           result = static_cast<VkResult>(e.code().value());
@@ -1410,7 +1502,8 @@ class VulkanDevice {
             std::ostringstream oss;
             oss << "submit queue_submit success retry=" << retry
                 << " stream=" << stream->stream_index
-                << " rec_epoch=" << stream->recording_epoch;
+                << " rec_epoch=" << stream->recording_epoch
+                << " timeline_value=" << timeline_value;
             trace_sync(oss.str());
           }
           break;
@@ -1443,6 +1536,8 @@ class VulkanDevice {
     submission.resources = std::move(resources);
     submission.epoch = submit_rec_epoch;
     submission.recorded_ops = submit_rec_ops;
+    submission.timeline_value = timeline_value;
+    submission.submitted_to_transfer_queue = submit_to_transfer_queue;
     submission.refs = std::move(stream->recording_refs);
     submission.ref_ids = std::move(stream->recording_ref_ids);
     submission.keepalive_resources =
@@ -1465,12 +1560,12 @@ class VulkanDevice {
     clear_scratch_barriers(stream);
     stream->recent_primitives.clear();
     stream->in_flight_submissions.push_back(std::move(submission));
-    stream->submission_count += 1;
 
     if (trace_sync_enabled()) {
       std::ostringstream oss;
       oss << "submit done stream=" << stream->stream_index
           << " epoch=" << submit_rec_epoch
+          << " timeline_value=" << timeline_value
           << " inflight=" << stream->in_flight_submissions.size();
       trace_sync(oss.str());
     }
@@ -1511,7 +1606,6 @@ ScopedSyncLabel::~ScopedSyncLabel() {
   }
 }
 
-// Expose VulkanDevice methods to other files
 vk::CommandBuffer begin_command_recording(int stream_index) {
   return VulkanDevice::get().begin_recording(stream_index);
 }

@@ -721,16 +721,24 @@ void copy_gpu_inplace(
   }
 
   const auto dispatch_elements = num_elements(dispatch_shape);
-  auto in_view =
-      make_copy_view(in, dispatch_shape, dispatch_i_strides, resolved_i_offset);
+  std::optional<array> materialized_in;
+  const array* source = &in;
+  if (in.has_primitive()) {
+    materialized_in.emplace(in);
+    materialized_in->eval();
+    source = &*materialized_in;
+  }
+
+  auto in_view = make_copy_view(
+      *source, dispatch_shape, dispatch_i_strides, resolved_i_offset);
   auto out_view = make_copy_view(
       out, dispatch_shape, dispatch_o_strides, resolved_o_offset);
 
-  const bool same_dtype = in.dtype() == out.dtype();
+  const bool same_dtype = source->dtype() == out.dtype();
   const bool raw_buffer_copy = same_dtype && ctype == CopyType::Vector;
 
-  const bool full_tensor_copy = data_shape == in.shape() &&
-      data_shape == out.shape() && i_strides == in.strides() &&
+  const bool full_tensor_copy = data_shape == source->shape() &&
+      data_shape == out.shape() && i_strides == source->strides() &&
       o_strides == out.strides() && resolved_i_offset == 0 &&
       resolved_o_offset == 0;
 
@@ -750,8 +758,8 @@ void copy_gpu_inplace(
        out.flags().col_contiguous);
 
   if (staging_scalar_fill) {
-    const char* scalar_ptr = static_cast<const char*>(in.data<void>());
-    const size_t scalar_size = size_of(in.dtype());
+    const char* scalar_ptr = static_cast<const char*>(source->data<void>());
+    const size_t scalar_size = size_of(source->dtype());
     auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
     if (out_buf->mapped_ptr != nullptr) {
       char* dst = static_cast<char*>(out_buf->mapped_ptr) + out.offset();
@@ -792,7 +800,7 @@ void copy_gpu_inplace(
             host_fill.size(),
             out_buf->buffer,
             out.offset());
-        vulkan::retain_array_for_stream(s, in);
+        vulkan::retain_array_for_stream(s, *source);
         vulkan::retain_array_for_stream(s, out);
       }
     }
@@ -847,7 +855,7 @@ void copy_gpu_inplace(
     throw std::runtime_error(oss.str());
   }
 
-  const bool same_buffer = in.buffer().ptr() == out.buffer().ptr();
+  const bool same_buffer = source->buffer().ptr() == out.buffer().ptr();
   if (segmented_buffer_copy && same_buffer) {
     array staged(out_view.shape(), out_view.dtype(), nullptr, {});
     staged.set_data(mlx::core::allocator::malloc(staged.nbytes()));
@@ -870,7 +878,7 @@ void copy_gpu_inplace(
 
   // Get buffer handles
   auto* in_buf = static_cast<vulkan::VulkanBuffer*>(
-      const_cast<void*>(static_cast<const void*>(in.buffer().ptr())));
+      const_cast<void*>(static_cast<const void*>(source->buffer().ptr())));
   auto* out_buf = static_cast<vulkan::VulkanBuffer*>(out.buffer().ptr());
 
   if (raw_buffer_copy) {
@@ -881,10 +889,9 @@ void copy_gpu_inplace(
     copy_region.size =
         static_cast<VkDeviceSize>(dispatch_elements * size_of(out.dtype()));
 
-    cmd_buffer.copyBuffer(
-        in_buf->buffer, out_buf->buffer, {copy_region});
+    cmd_buffer.copyBuffer(in_buf->buffer, out_buf->buffer, {copy_region});
 
-    vulkan::retain_array_for_stream(s, in);
+    vulkan::retain_array_for_stream(s, *source);
     vulkan::retain_array_for_stream(s, out);
 
   } else if (contiguous_large_rank_copy) {
@@ -893,8 +900,7 @@ void copy_gpu_inplace(
     copy_region.dstOffset = static_cast<VkDeviceSize>(out_view.offset());
     copy_region.size = static_cast<VkDeviceSize>(in_view.nbytes());
 
-    cmd_buffer.copyBuffer(
-        in_buf->buffer, out_buf->buffer, {copy_region});
+    cmd_buffer.copyBuffer(in_buf->buffer, out_buf->buffer, {copy_region});
 
     vulkan::retain_array_for_stream(s, in_view);
     vulkan::retain_array_for_stream(s, out_view);
@@ -906,11 +912,9 @@ void copy_gpu_inplace(
           "Copy operation failed on Vulkan: unsupported large-offset strided copy.");
     }
 
-    std::vector<vk::BufferCopy> cpp_copy_regions(copy_regions.begin(), copy_regions.end());
-    cmd_buffer.copyBuffer(
-        in_buf->buffer,
-        out_buf->buffer,
-        cpp_copy_regions);
+    std::vector<vk::BufferCopy> cpp_copy_regions(
+        copy_regions.begin(), copy_regions.end());
+    cmd_buffer.copyBuffer(in_buf->buffer, out_buf->buffer, cpp_copy_regions);
 
     vulkan::retain_array_for_stream(s, in_view);
     vulkan::retain_array_for_stream(s, out_view);

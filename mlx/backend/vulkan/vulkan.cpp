@@ -12,19 +12,79 @@ namespace mlx::core::vulkan {
 
 namespace {
 
-bool find_compute_queue_family(
-    vk::PhysicalDevice physical_device,
-    uint32_t& queue_family_index) {
-  auto queue_families = physical_device.getQueueFamilyProperties();
+struct QueueFamilyIndices {
+  uint32_t compute_family{0};
+  uint32_t transfer_family{0};
+  bool has_separate_transfer{false};
+};
 
-  for (uint32_t i = 0; i < queue_families.size(); ++i) {
-    if ((queue_families[i].queueFlags & vk::QueueFlagBits::eCompute) !=
-        vk::QueueFlagBits{}) {
-      queue_family_index = i;
-      return true;
+uint32_t find_queue_family(
+    const std::vector<vk::QueueFamilyProperties>& queue_families,
+    const vk::QueueFlags& required,
+    const vk::QueueFlags& avoid,
+    int32_t compute_index,
+    uint32_t min_num_queues) {
+  const uint32_t qfsize = queue_families.size();
+
+  for (uint32_t i = 0; i < qfsize; ++i) {
+    if (queue_families[i].queueCount >= min_num_queues &&
+        (compute_index < 0 || i != static_cast<uint32_t>(compute_index)) &&
+        (queue_families[i].queueFlags & required) &&
+        !(queue_families[i].queueFlags & avoid)) {
+      return i;
     }
   }
-  return false;
+
+  for (uint32_t i = 0; i < qfsize; ++i) {
+    if (queue_families[i].queueCount >= min_num_queues &&
+        (compute_index < 0 || i != static_cast<uint32_t>(compute_index)) &&
+        (queue_families[i].queueFlags & required)) {
+      return i;
+    }
+  }
+
+  for (uint32_t i = 0; i < qfsize; ++i) {
+    if (queue_families[i].queueCount >= min_num_queues &&
+        (queue_families[i].queueFlags & required)) {
+      return i;
+    }
+  }
+
+  for (uint32_t i = 0; i < qfsize; ++i) {
+    if (queue_families[i].queueFlags & required) {
+      return i;
+    }
+  }
+
+  return 0;
+}
+
+QueueFamilyIndices find_queue_families(vk::PhysicalDevice physical_device) {
+  auto queue_families = physical_device.getQueueFamilyProperties();
+
+  const uint32_t compute_family = find_queue_family(
+      queue_families,
+      vk::QueueFlagBits::eCompute,
+      vk::QueueFlagBits::eGraphics,
+      -1,
+      1);
+
+  const uint32_t transfer_family = find_queue_family(
+      queue_families,
+      vk::QueueFlagBits::eTransfer,
+      vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eGraphics,
+      compute_family,
+      1);
+
+  QueueFamilyIndices indices;
+  indices.compute_family = compute_family;
+  indices.transfer_family = transfer_family;
+  indices.has_separate_transfer = (compute_family != transfer_family) ||
+      (queue_families[compute_family].queueCount == 1 &&
+       (queue_families[transfer_family].queueFlags &
+        vk::QueueFlagBits::eTransfer) != vk::QueueFlagBits{});
+
+  return indices;
 }
 
 bool has_device_extension(
@@ -81,7 +141,10 @@ void VulkanContext::init() {
   vk::PhysicalDevice physical_device;
   vk::Device device;
   vk::Queue compute_queue;
+  vk::Queue transfer_queue;
   uint32_t compute_queue_family_index = 0;
+  uint32_t transfer_queue_family_index = 0;
+  bool has_separate_transfer_queue = false;
   bool is_unified_memory = false;
   bool shader_float16_supported = false;
   bool subgroup_size_control_supported = false;
@@ -91,6 +154,8 @@ void VulkanContext::init() {
   bool pipeline_robustness_supported = false;
   bool coopmat_flash_attention_f32acc_supported = false;
   vk::PhysicalDeviceMemoryProperties mem_properties;
+  vk::Semaphore timeline_semaphore;
+  uint64_t timeline_value = 0;
 
   try {
     // 1. Create instance using C++ API
@@ -105,7 +170,7 @@ void VulkanContext::init() {
 
     instance = vk::createInstance(create_info);
 
-    // 2. Pick physical device with compute support
+    // 2. Pick physical device with compute support and find queue families
     auto available_devices = instance.enumeratePhysicalDevices();
     if (available_devices.empty()) {
       throw std::runtime_error(
@@ -114,10 +179,21 @@ void VulkanContext::init() {
 
     bool found_compute_device = false;
     for (auto candidate : available_devices) {
-      uint32_t queue_family = 0;
-      if (find_compute_queue_family(candidate, queue_family)) {
+      auto queue_families = candidate.getQueueFamilyProperties();
+      bool has_compute = false;
+      for (const auto& qf : queue_families) {
+        if ((qf.queueFlags & vk::QueueFlagBits::eCompute) !=
+            vk::QueueFlagBits{}) {
+          has_compute = true;
+          break;
+        }
+      }
+      if (has_compute) {
+        auto indices = find_queue_families(candidate);
         physical_device = candidate;
-        compute_queue_family_index = queue_family;
+        compute_queue_family_index = indices.compute_family;
+        transfer_queue_family_index = indices.transfer_family;
+        has_separate_transfer_queue = indices.has_separate_transfer;
         found_compute_device = true;
         break;
       }
@@ -158,11 +234,30 @@ void VulkanContext::init() {
 
     // 4. Create logical device using C++ API
     float queue_priority = 1.0f;
-    vk::DeviceQueueCreateInfo queue_create_info(
-        vk::DeviceQueueCreateFlags(),
-        compute_queue_family_index,
-        1,
-        &queue_priority);
+    float queue_priority_low = 0.5f;
+    std::vector<vk::DeviceQueueCreateInfo> queue_create_infos;
+
+    if (has_separate_transfer_queue) {
+      vk::DeviceQueueCreateInfo compute_queue_info(
+          vk::DeviceQueueCreateFlags(),
+          compute_queue_family_index,
+          1,
+          &queue_priority);
+      vk::DeviceQueueCreateInfo transfer_queue_info(
+          vk::DeviceQueueCreateFlags(),
+          transfer_queue_family_index,
+          1,
+          &queue_priority_low);
+      queue_create_infos.push_back(compute_queue_info);
+      queue_create_infos.push_back(transfer_queue_info);
+    } else {
+      vk::DeviceQueueCreateInfo queue_info(
+          vk::DeviceQueueCreateFlags(),
+          compute_queue_family_index,
+          1,
+          &queue_priority);
+      queue_create_infos.push_back(queue_info);
+    }
 
     // Build feature chain
     vk::PhysicalDeviceFeatures2 supported_features;
@@ -307,6 +402,7 @@ void VulkanContext::init() {
     }
 
     std::vector<const char*> device_extensions;
+    device_extensions.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
     if (subgroup_size_control_supported || subgroup_require_full_support) {
       device_extensions.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
     }
@@ -319,8 +415,9 @@ void VulkanContext::init() {
 
     vk::DeviceCreateInfo device_create_info;
     device_create_info.flags = vk::DeviceCreateFlags();
-    device_create_info.queueCreateInfoCount = 1;
-    device_create_info.pQueueCreateInfos = &queue_create_info;
+    device_create_info.queueCreateInfoCount =
+        static_cast<uint32_t>(queue_create_infos.size());
+    device_create_info.pQueueCreateInfos = queue_create_infos.data();
     device_create_info.enabledLayerCount = 0;
     device_create_info.ppEnabledLayerNames = nullptr;
     device_create_info.enabledExtensionCount =
@@ -333,15 +430,33 @@ void VulkanContext::init() {
 
     device = physical_device.createDevice(device_create_info);
 
-    // 5. Get compute queue
+    // 5. Get queues and create timeline semaphore
     compute_queue = device.getQueue(compute_queue_family_index, 0);
+    if (has_separate_transfer_queue) {
+      transfer_queue = device.getQueue(transfer_queue_family_index, 0);
+    } else {
+      transfer_queue = compute_queue;
+    }
+
+    vk::SemaphoreTypeCreateInfo timeline_ci;
+    timeline_ci.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+    timeline_ci.semaphoreType = vk::SemaphoreType::eTimeline;
+    timeline_ci.pNext = nullptr;
+    vk::SemaphoreCreateInfo ci;
+    ci.pNext = &timeline_ci;
+    timeline_semaphore = device.createSemaphore(ci);
 
     // Store in member variables (C++ API objects manage their own cleanup)
     instance_ = instance;
     physical_device_ = physical_device;
     device_ = device;
     compute_queue_ = compute_queue;
+    transfer_queue_ = transfer_queue;
     compute_queue_family_index_ = compute_queue_family_index;
+    transfer_queue_family_index_ = transfer_queue_family_index;
+    has_separate_transfer_queue_ = has_separate_transfer_queue;
+    timeline_semaphore_ = timeline_semaphore;
+    timeline_value_ = timeline_value;
     mem_properties_ = mem_properties;
     is_unified_memory_ = is_unified_memory;
     this->shader_float16_supported_ = shader_float16_supported;
@@ -378,6 +493,10 @@ void VulkanContext::cleanup() {
     if (initialized_) {
       device_.waitIdle();
     }
+    if (timeline_semaphore_) {
+      device_.destroySemaphore(timeline_semaphore_);
+      timeline_semaphore_ = nullptr;
+    }
     device_.destroy();
     device_ = nullptr;
   }
@@ -387,7 +506,12 @@ void VulkanContext::cleanup() {
   }
   physical_device_ = nullptr;
   compute_queue_ = nullptr;
+  transfer_queue_ = nullptr;
   compute_queue_family_index_ = 0;
+  transfer_queue_family_index_ = 0;
+  has_separate_transfer_queue_ = false;
+  timeline_semaphore_ = nullptr;
+  timeline_value_ = 0;
   is_unified_memory_ = false;
   shader_float16_supported_ = false;
   subgroup_size_control_supported_ = false;
@@ -402,6 +526,10 @@ void VulkanContext::cleanup() {
   mem_properties_ = empty_props;
 
   initialized_ = false;
+}
+
+uint64_t VulkanContext::increment_timeline() {
+  return timeline_value_.fetch_add(1) + 1;
 }
 
 uint32_t VulkanContext::find_memory_type(
