@@ -35,8 +35,9 @@ struct RocmBuffer {
   bool host_dirty;
   void* alloc_stream; // stream used for hipMallocAsync / hipFreeAsync
   // Allocation generation for phase-scoped freelist drop (prefill → decode).
-  // Default 0 keeps brace-inits that omit it safe.
-  uint32_t generation{0};
+  // No in-class initializer: RocmBuffer lives in a SmallSizePool union Block
+  // and must remain trivially default-constructible.
+  uint32_t generation;
 };
 
 // ---------------------------------------------------------------------------

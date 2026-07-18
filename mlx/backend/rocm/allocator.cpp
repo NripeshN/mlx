@@ -1133,35 +1133,20 @@ bool decode_arena_overflowed() {
 
 // Phase-scoped memory — thin wrappers for engine / train code (int phases
 // match rocm::MemoryPhase). Prefer mlx::core::rocm::set_memory_phase from
-// rocm.h when linking the ROCm backend.
+// rocm.h when linking the ROCm backend. Compiled only in the ROCm build.
 void set_memory_phase(int phase) {
-  if (!rocm::is_available()) {
-    return;
-  }
   rocm::allocator().set_memory_phase(phase);
 }
 int memory_phase() {
-  if (!rocm::is_available()) {
-    return 0;
-  }
   return rocm::allocator().memory_phase();
 }
 size_t memory_drop_generation(uint32_t gen) {
-  if (!rocm::is_available()) {
-    return 0;
-  }
   return rocm::allocator().drop_generation(gen);
 }
 size_t memory_end_prefill() {
-  if (!rocm::is_available()) {
-    return 0;
-  }
   return rocm::allocator().end_prefill();
 }
 uint32_t memory_generation() {
-  if (!rocm::is_available()) {
-    return 0;
-  }
   return rocm::allocator().memory_generation();
 }
 
