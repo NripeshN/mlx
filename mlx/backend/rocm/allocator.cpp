@@ -35,6 +35,13 @@ constexpr int page_size = 16384;
 // Any allocations smaller than this will try to use the small pool (CUDA).
 constexpr int small_block_size = 8;
 
+// Phase ints match rocm::MemoryPhase in rocm.h (Idle/Load/Prefill/Decode/Train).
+static constexpr int kPhaseIdle = 0;
+static constexpr int kPhaseLoad = 1;
+static constexpr int kPhasePrefill = 2;
+static constexpr int kPhaseDecode = 3;
+static constexpr int kPhaseTrain = 4;
+
 // The small pool size in bytes. Multiple of page_size and small_block_size.
 constexpr int small_pool_size = 4 * page_size;
 
@@ -504,12 +511,11 @@ Buffer RocmAllocator::malloc_async(size_t size, int device, void* stream_v) {
           gen};
     };
 
-    // Fixed-shape training reuses the same rounded sizes every step. Policy:
-    //   1) exact BufferCache hit — no HIP (100% fill of recycled blocks)
-    //   2) reclaim freelist if active+cache would exceed ~85% HBM (leave room
-    //      so hipMalloc never runs the device to 0 MB free — that hangs KFD)
-    //   3) hipMalloc / hipMallocAsync
-    //   4) on failure, hipFreeAsync-capable reclaim more and retry
+    // Allocation policy is phase-aware:
+    //   Train  — proactive reclaim at ~85% HBM so Adam never sees 0 free (OOR)
+    //   Decode — alloc-first; reclaim only on hipMalloc failure (decode is
+    //            latency-sensitive; freelist scans every miss cost tok/s)
+    //   Prefill/Load/Idle — same as train (safer under large intermediates)
     // Soft memory_limit_ is NOT used for reclaim (caused free/alloc storms).
     if (!buf) {
       // Leave ≥15% HBM free so the driver/TTM never hits 0 MB free (OOR hang).
@@ -524,8 +530,13 @@ Buffer RocmAllocator::malloc_async(size_t size, int device, void* stream_v) {
         }
       };
 
+      // Capture phase under lock (cheap) for policy.
       lock.lock();
-      reclaim(size);
+      const int phase_now = phase_;
+      const bool proactive_reclaim = (phase_now != kPhaseDecode);
+      if (proactive_reclaim) {
+        reclaim(size);
+      }
       lock.unlock();
 
       buf = try_device_alloc();
@@ -538,6 +549,9 @@ Buffer RocmAllocator::malloc_async(size_t size, int device, void* stream_v) {
         }
         if (size <= static_cast<size_t>(small_block_size)) {
           buf = scalar_pool_.malloc();
+          if (buf) {
+            buf->generation = stamp_generation();
+          }
         }
         lock.unlock();
         if (!buf) {
@@ -849,13 +863,6 @@ void RocmAllocator::decode_arena_end() {
 //                         prefill workspace does not poison HBM for decode
 // ---------------------------------------------------------------------------
 
-// Phase ints match rocm::MemoryPhase in rocm.h
-static constexpr int kPhaseIdle = 0;
-static constexpr int kPhaseLoad = 1;
-static constexpr int kPhasePrefill = 2;
-static constexpr int kPhaseDecode = 3;
-static constexpr int kPhaseTrain = 4;
-
 void RocmAllocator::apply_phase_policy_locked() {
   // Train keeps exact-size reuse (the path that fixed Adam hipFree storms).
   // Inference phases allow classic ~2x oversize hand-outs so L=1 decode can
@@ -898,6 +905,18 @@ void RocmAllocator::set_memory_phase(int phase) {
       generation_ = 1;
     }
   } else if (phase == kPhaseIdle && prev == kPhaseDecode) {
+    // Soft handoff: previous decode gen freelist entries are request-local
+    // workspace; drop them so the next prefill does not inherit a bloated
+    // freelist. Weights/KV are not freelist-backed, so this is safe.
+    if (generation_ != 0) {
+      const uint32_t drop_gen = generation_;
+      const size_t before = buffer_cache_.cache_size();
+      buffer_cache_.release_if(
+          [drop_gen](RocmBuffer* b) { return b && b->generation == drop_gen; });
+      last_drop_bytes_ =
+          before > buffer_cache_.cache_size() ? before - buffer_cache_.cache_size()
+                                              : 0;
+    }
     generation_ = generation_ + 1;
     if (generation_ == 0) {
       generation_ = 1;
