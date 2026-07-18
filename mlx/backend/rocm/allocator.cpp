@@ -15,6 +15,7 @@
 #include <hip/hip_runtime.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -227,6 +228,7 @@ RocmBuffer* SmallSizePool::malloc() {
   b->buf.host_shadow = nullptr;
   b->buf.host_dirty = false;
   b->buf.alloc_stream = nullptr;
+  b->buf.generation = 0;
   return &b->buf;
 }
 
@@ -416,7 +418,14 @@ Buffer RocmAllocator::malloc_async(size_t size, int device, void* stream_v) {
 
   if (size == 0) {
     return Buffer{new RocmBuffer{
-        nullptr, 0, /*is_managed=*/true, /*device=*/-1, nullptr, false, nullptr}};
+        nullptr,
+        0,
+        /*is_managed=*/true,
+        /*device=*/-1,
+        nullptr,
+        false,
+        nullptr,
+        stamp_generation()}};
   }
 
   hipStream_t stream = static_cast<hipStream_t>(stream_v);
@@ -443,16 +452,25 @@ Buffer RocmAllocator::malloc_async(size_t size, int device, void* stream_v) {
   // Find available buffer from cache.
   std::unique_lock lock(mutex_);
   RocmBuffer* buf = buffer_cache_.reuse_from_cache(size);
+  if (buf) {
+    // Re-stamp so a prefill-era slab reused in decode is not later swept by
+    // drop_generation(prefill_gen) after it has joined the decode freelist.
+    buf->generation = stamp_generation();
+  }
   if (!buf) {
     // Scalar pool first (CUDA).
     if (size <= static_cast<size_t>(small_block_size)) {
       buf = scalar_pool_.malloc();
+      if (buf) {
+        buf->generation = stamp_generation();
+      }
     }
     lock.unlock();
 
     auto try_device_alloc = [&]() -> RocmBuffer* {
       void* data = nullptr;
       bool is_managed = true;
+      const uint32_t gen = stamp_generation();
       if (device == -1) {
         try {
           data = unified_malloc(size, is_managed);
@@ -460,7 +478,14 @@ Buffer RocmAllocator::malloc_async(size_t size, int device, void* stream_v) {
           return nullptr;
         }
         return new RocmBuffer{
-            data, size, is_managed, /*device=*/-1, nullptr, false, nullptr};
+            data,
+            size,
+            is_managed,
+            /*device=*/-1,
+            nullptr,
+            false,
+            nullptr,
+            gen};
       }
       (void)hipSetDevice(device);
       hipError_t err = hipMallocAsync(&data, size, stream);
@@ -475,7 +500,8 @@ Buffer RocmAllocator::malloc_async(size_t size, int device, void* stream_v) {
           device,
           nullptr,
           false,
-          stream};
+          stream,
+          gen};
     };
 
     // Fixed-shape training reuses the same rounded sizes every step. Policy:
@@ -686,7 +712,8 @@ Buffer RocmAllocator::make_buffer(void* ptr, size_t size) {
       /*device=*/-1,
       nullptr,
       false,
-      reinterpret_cast<void*>(static_cast<uintptr_t>(1))}; // alien sentinel
+      reinterpret_cast<void*>(static_cast<uintptr_t>(1)), // alien sentinel
+      /*generation=*/0};
   std::lock_guard lock(mutex_);
   active_memory_ += size;
   peak_memory_ = std::max(active_memory_, peak_memory_);
@@ -747,6 +774,7 @@ RocmBuffer* RocmAllocator::arena_alloc(size_t size) {
   rb->host_shadow = nullptr;
   rb->host_dirty = false;
   rb->alloc_stream = nullptr;
+  rb->generation = stamp_generation();
   a.offset += aligned;
   a.high_water = std::max(a.high_water, a.offset);
   return rb;
@@ -809,6 +837,125 @@ void RocmAllocator::decode_arena_reset_to_floor() {
 void RocmAllocator::decode_arena_end() {
   std::lock_guard lock(mutex_);
   decode_arena_.active = false;
+}
+
+// ---------------------------------------------------------------------------
+// Phase-scoped memory policy
+//
+//   Train  → exact freelist (1.0): fixed B×T activations recycle every step
+//   Prefill/Decode/Load → classic 0.5 util: tolerate modest oversize so decode
+//                         after prefill does not hipMalloc every new shape
+//   Prefill gen stamp  → end_prefill() bulk-frees those freelist blocks so
+//                         prefill workspace does not poison HBM for decode
+// ---------------------------------------------------------------------------
+
+// Phase ints match rocm::MemoryPhase in rocm.h
+static constexpr int kPhaseIdle = 0;
+static constexpr int kPhaseLoad = 1;
+static constexpr int kPhasePrefill = 2;
+static constexpr int kPhaseDecode = 3;
+static constexpr int kPhaseTrain = 4;
+
+void RocmAllocator::apply_phase_policy_locked() {
+  // Train keeps exact-size reuse (the path that fixed Adam hipFree storms).
+  // Inference phases allow classic ~2x oversize hand-outs so L=1 decode can
+  // absorb residual freelist blocks without a driver malloc per op.
+  float util = 0.5f;
+  if (phase_ == kPhaseTrain) {
+    util = 1.0f;
+  }
+  // Allow override for A/B: MLX_FREELIST_UTIL=0.5|1.0
+  if (const char* e = std::getenv("MLX_FREELIST_UTIL")) {
+    util = std::clamp(std::strtof(e, nullptr), 0.f, 1.f);
+  }
+  buffer_cache_.set_min_utilization(util);
+}
+
+void RocmAllocator::set_memory_phase(int phase) {
+  std::lock_guard lock(mutex_);
+  if (phase == phase_ && phase != kPhasePrefill) {
+    // Re-entering Prefill always starts a new generation so each request's
+    // prefill workspace can be dropped independently.
+    apply_phase_policy_locked();
+    return;
+  }
+  const int prev = phase_;
+  phase_ = phase;
+
+  if (phase == kPhasePrefill) {
+    // New prefill generation; remember it for end_prefill().
+    generation_ = generation_ == 0 ? 1 : generation_ + 1;
+    if (generation_ == 0) {
+      generation_ = 1; // skip 0 (means "default / unstamped")
+    }
+    prefill_generation_ = generation_;
+  } else if (
+      phase == kPhaseDecode || phase == kPhaseTrain || phase == kPhaseLoad) {
+    // Advance so new workspace is distinct from the previous phase's freelist
+    // entries (which may still be recycled until an explicit drop).
+    generation_ = generation_ + 1;
+    if (generation_ == 0) {
+      generation_ = 1;
+    }
+  } else if (phase == kPhaseIdle && prev == kPhaseDecode) {
+    generation_ = generation_ + 1;
+    if (generation_ == 0) {
+      generation_ = 1;
+    }
+  }
+
+  apply_phase_policy_locked();
+
+  static const bool dbg = std::getenv("MLX_MEMORY_PHASE_DEBUG") != nullptr;
+  if (dbg) {
+    fprintf(
+        stderr,
+        "[mem-phase] %d -> %d gen=%u prefill_gen=%u freelist_util=%.2f cache=%zu\n",
+        prev,
+        phase_,
+        generation_,
+        prefill_generation_,
+        buffer_cache_.min_utilization(),
+        buffer_cache_.cache_size());
+  }
+}
+
+size_t RocmAllocator::drop_generation(uint32_t gen) {
+  std::lock_guard lock(mutex_);
+  if (gen == 0) {
+    gen = prefill_generation_;
+  }
+  if (gen == 0) {
+    last_drop_bytes_ = 0;
+    last_drop_buffers_ = 0;
+    return 0;
+  }
+  const size_t before = buffer_cache_.cache_size();
+  const int n = buffer_cache_.release_if(
+      [gen](RocmBuffer* b) { return b && b->generation == gen; });
+  const size_t after = buffer_cache_.cache_size();
+  last_drop_buffers_ = n;
+  last_drop_bytes_ = before > after ? before - after : 0;
+
+  static const bool dbg = std::getenv("MLX_MEMORY_PHASE_DEBUG") != nullptr;
+  if (dbg) {
+    fprintf(
+        stderr,
+        "[mem-phase] drop_generation gen=%u buffers=%d bytes=%zu cache_now=%zu\n",
+        gen,
+        n,
+        last_drop_bytes_,
+        after);
+  }
+  return last_drop_bytes_;
+}
+
+size_t RocmAllocator::end_prefill() {
+  // Drop freelist entries from the prefill generation, then enter Decode with
+  // looser freelist util so steady-state L=1 reuses cleanly.
+  size_t dropped = drop_generation(0);
+  set_memory_phase(kPhaseDecode);
+  return dropped;
 }
 
 void RocmAllocator::ensure_host_shadow(RocmBuffer& buf) {
@@ -982,6 +1129,40 @@ size_t decode_arena_high_water() {
 }
 bool decode_arena_overflowed() {
   return rocm::allocator().decode_arena_overflowed();
+}
+
+// Phase-scoped memory — thin wrappers for engine / train code (int phases
+// match rocm::MemoryPhase). Prefer mlx::core::rocm::set_memory_phase from
+// rocm.h when linking the ROCm backend.
+void set_memory_phase(int phase) {
+  if (!rocm::is_available()) {
+    return;
+  }
+  rocm::allocator().set_memory_phase(phase);
+}
+int memory_phase() {
+  if (!rocm::is_available()) {
+    return 0;
+  }
+  return rocm::allocator().memory_phase();
+}
+size_t memory_drop_generation(uint32_t gen) {
+  if (!rocm::is_available()) {
+    return 0;
+  }
+  return rocm::allocator().drop_generation(gen);
+}
+size_t memory_end_prefill() {
+  if (!rocm::is_available()) {
+    return 0;
+  }
+  return rocm::allocator().end_prefill();
+}
+uint32_t memory_generation() {
+  if (!rocm::is_available()) {
+    return 0;
+  }
+  return rocm::allocator().memory_generation();
 }
 
 } // namespace mlx::core

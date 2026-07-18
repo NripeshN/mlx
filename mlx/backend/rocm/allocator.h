@@ -11,6 +11,7 @@
 #include "mlx/allocator.h"
 #include "mlx/backend/common/buffer_cache.h"
 
+#include <cstdint>
 #include <deque>
 #include <mutex>
 #include <utility>
@@ -22,8 +23,9 @@ using allocator::Buffer;
 
 // Matches CudaBuffer + fields required for discrete-GPU host access and
 // stream-ordered free (CUDA uses move_to_unified_memory instead of shadow).
-// Field order is ABI-stable for brace-init sites outside this file
-// (e.g. gemms/naive_gemm.hip): data, size, is_managed, device, ...
+// Field order for the first 7 members is ABI-stable for brace-init sites
+// outside this file (e.g. gemms/naive_gemm.hip): data, size, is_managed,
+// device, host_shadow, host_dirty, alloc_stream. New fields append only.
 struct RocmBuffer {
   void* data;
   size_t size;
@@ -32,6 +34,9 @@ struct RocmBuffer {
   void* host_shadow;
   bool host_dirty;
   void* alloc_stream; // stream used for hipMallocAsync / hipFreeAsync
+  // Allocation generation for phase-scoped freelist drop (prefill → decode).
+  // Default 0 keeps brace-inits that omit it safe.
+  uint32_t generation{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -150,6 +155,22 @@ class RocmAllocator : public allocator::Allocator {
     return decode_arena_overflowed();
   }
 
+  // --- Phase-scoped memory (lifetime-aware freelist) ---
+  // Phase ints match rocm::MemoryPhase in rocm.h (avoid circular includes).
+  void set_memory_phase(int phase);
+  int memory_phase() const {
+    return phase_;
+  }
+  uint32_t memory_generation() const {
+    return generation_;
+  }
+  // Drop freelist blocks stamped with the given generation (or the last
+  // prefill generation if gen==0 and a prefill phase was recorded).
+  // Returns bytes returned to the driver via the cache free callback.
+  size_t drop_generation(uint32_t gen = 0);
+  // Prefill → Decode handoff: drop prefill-gen freelist + switch phase.
+  size_t end_prefill();
+
   size_t get_active_memory() const;
   size_t get_peak_memory() const;
   void reset_peak_memory();
@@ -164,6 +185,10 @@ class RocmAllocator : public allocator::Allocator {
   friend RocmAllocator& allocator();
 
   RocmBuffer* arena_alloc(size_t size);
+  void apply_phase_policy_locked();
+  uint32_t stamp_generation() const {
+    return generation_;
+  }
 
   std::mutex mutex_;
   size_t memory_limit_;
@@ -177,6 +202,12 @@ class RocmAllocator : public allocator::Allocator {
   std::vector<void*> mem_pools_;
   SmallSizePool scalar_pool_;
   DecodeArena decode_arena_;
+
+  int phase_{0}; // MemoryPhase::Idle
+  uint32_t generation_{1};
+  uint32_t prefill_generation_{0};
+  size_t last_drop_bytes_{0};
+  int last_drop_buffers_{0};
 };
 
 RocmAllocator& allocator();

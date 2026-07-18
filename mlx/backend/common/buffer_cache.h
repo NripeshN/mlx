@@ -6,6 +6,8 @@
 #include <cassert>
 #include <functional>
 #include <map>
+#include <utility>
+#include <vector>
 
 namespace mlx::core {
 
@@ -114,6 +116,51 @@ class BufferCache {
     return n_release;
   }
 
+  // Release every cached buffer for which pred(buf) is true. Used to drop a
+  // whole allocation generation (e.g. prefill workspace) without clearing the
+  // freelist of decode/train sizes we still want.
+  template <typename Pred>
+  int release_if(Pred pred) {
+    int n_release = 0;
+    size_t bytes_freed = 0;
+    // Collect first — free_ may re-enter; do not mutate while walking multimap.
+    std::vector<std::pair<size_t, BufferHolder*>> doomed;
+    doomed.reserve(buffer_pool_.size());
+    for (auto& [size, holder] : buffer_pool_) {
+      if (pred(holder->buf)) {
+        doomed.emplace_back(size, holder);
+      }
+    }
+    for (auto& [size, holder] : doomed) {
+      bytes_freed += size;
+      free_(holder->buf);
+      n_release++;
+      // Erase this (size, holder) pair from the multimap.
+      auto range = buffer_pool_.equal_range(size);
+      for (auto it = range.first; it != range.second; ++it) {
+        if (it->second == holder) {
+          buffer_pool_.erase(it);
+          break;
+        }
+      }
+      remove_from_list(holder);
+    }
+    if (bytes_freed > pool_size_) {
+      pool_size_ = 0;
+    } else {
+      pool_size_ -= bytes_freed;
+    }
+    return n_release;
+  }
+
+  void set_min_utilization(float u) {
+    min_utilization_ = std::clamp(u, 0.f, 1.f);
+  }
+
+  float min_utilization() const {
+    return min_utilization_;
+  }
+
   size_t cache_size() const {
     return pool_size_;
   }
@@ -177,7 +224,7 @@ class BufferCache {
   const size_t page_size_;
   std::function<size_t(T*)> get_size_;
   std::function<void(T*)> free_;
-  const float min_utilization_;
+  float min_utilization_;
 };
 
 } // namespace mlx::core

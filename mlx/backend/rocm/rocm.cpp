@@ -48,4 +48,39 @@ bool train_arena_overflowed() {
   return allocator().train_arena_overflowed();
 }
 
+void set_memory_phase(MemoryPhase phase) {
+  if (!is_available()) {
+    return;
+  }
+  allocator().set_memory_phase(static_cast<int>(phase));
+}
+
+MemoryPhase memory_phase() {
+  if (!is_available()) {
+    return MemoryPhase::Idle;
+  }
+  return static_cast<MemoryPhase>(allocator().memory_phase());
+}
+
+size_t memory_end_prefill() {
+  if (!is_available()) {
+    return 0;
+  }
+  return allocator().end_prefill();
+}
+
+size_t memory_drop_generation(uint32_t gen) {
+  if (!is_available()) {
+    return 0;
+  }
+  return allocator().drop_generation(gen);
+}
+
+uint32_t memory_generation() {
+  if (!is_available()) {
+    return 0;
+  }
+  return allocator().memory_generation();
+}
+
 } // namespace mlx::core::rocm

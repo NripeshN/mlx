@@ -29,6 +29,20 @@ bool train_arena_overflowed() {
   return false;
 }
 
+void set_memory_phase(MemoryPhase) {}
+MemoryPhase memory_phase() {
+  return MemoryPhase::Idle;
+}
+size_t memory_end_prefill() {
+  return 0;
+}
+size_t memory_drop_generation(uint32_t) {
+  return 0;
+}
+uint32_t memory_generation() {
+  return 0;
+}
+
 array moe_swiglu_sorted(
     const array&,
     const array&,

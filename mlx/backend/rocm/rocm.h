@@ -8,6 +8,7 @@
 #include "mlx/utils.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 namespace mlx::core::rocm {
@@ -24,6 +25,22 @@ MLX_API void train_arena_end();
 MLX_API bool train_arena_active();
 MLX_API size_t train_arena_high_water();
 MLX_API bool train_arena_overflowed();
+
+// Phase-scoped memory (lifetime-aware freelist). Values match
+// mlx::core::rocm::MemoryPhase in allocator.h — kept here so callers need
+// only rocm.h. Idle=0, Load=1, Prefill=2, Decode=3, Train=4.
+enum class MemoryPhase : int {
+  Idle = 0,
+  Load = 1,
+  Prefill = 2,
+  Decode = 3,
+  Train = 4,
+};
+MLX_API void set_memory_phase(MemoryPhase phase);
+MLX_API MemoryPhase memory_phase();
+MLX_API size_t memory_end_prefill();
+MLX_API size_t memory_drop_generation(uint32_t gen = 0);
+MLX_API uint32_t memory_generation();
 
 // Fused sorted-MoE SwiGLU (one D2H sync for the whole gate/up/silu/down).
 // x: [T,D] bf16
